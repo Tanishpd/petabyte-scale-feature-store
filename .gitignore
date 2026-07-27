@@ -1,0 +1,55 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Secrets / local config ---
+.env
+.env.local
+docker/.env
+# commit docker/.env.example instead
+
+# --- Feast generated state ---
+# The registry and local online store are build artifacts, not source.
+# The feature definitions in src/feast_repo/*.py ARE source and stay tracked.
+registry.db
+online_store.db
+.feast/
+src/feast_repo/data/*.parquet
+
+# --- Generated data / models ---
+data/
+*.parquet
+*.avro
+models/
+.cache/
+huggingface/
+
+# --- Flink ---
+# Connector JAR is downloaded during image build; ~5 MB binary, not source.
+jars/
+*.jar
+flink-checkpoints/
+flink-savepoints/
+log/
+*.log
+
+# --- Benchmarks output ---
+benchmarks/*.json
+benchmarks/*.csv
+
+# --- macOS ---
+.DS_Store
+.AppleDouble
+
+# --- Editors ---
+.idea/
+.vscode/
+*.swp
