@@ -25,7 +25,9 @@ online_store.db
 src/feast_repo/data/*.parquet
 
 # --- Generated data / models ---
-data/
+# Anchored to repo root: an unanchored "data/" would also swallow
+# src/feast_repo/data/, which is a real tracked location.
+/data/
 *.parquet
 *.avro
 models/

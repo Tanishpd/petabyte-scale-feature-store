@@ -3,6 +3,9 @@
 A real-time feature pipeline: high-velocity events in, model-ready numeric features **and vector
 embeddings** out, served from a feature store in single-digit milliseconds.
 
+> **Status: design phase — documentation only, no code yet.** The Quickstart below describes the target
+> interface, not something you can run today. Build progress is tracked in [PLAN.md](PLAN.md).
+
 ```
   producer            Kafka              Flink                      Redis            model
  ─────────────  →  ───────────  →  ────────────────────  →  ─────────────────  →  ──────────
@@ -18,8 +21,10 @@ being able to read it. Event → readable feature is one hop.
 
 ## Quickstart
 
-**Prerequisites:** Docker Desktop running, Python 3.11, ~10 GB free disk (the Flink image bundles PyTorch
-and the embedding model).
+**Prerequisites:** Docker Desktop running, Python 3.11, **~20 GB free disk**. The Flink image bundles
+PyTorch and the embedding model (~3–4 GB), and sustained producing adds Kafka log segments fast — at
+`EPS=20000` that's roughly 25 GB/hour, which is why the `transactions` topic gets retention caps at
+creation.
 
 ```bash
 make bootstrap     # python3.11 venv + pinned deps
@@ -83,7 +88,7 @@ store.get_online_features(
 
 **Embeddings are computed when a window closes, not per event.** A naive design embeds every transaction.
 At 1M events/s that's 1M embeddings/s — impossible on CPU, expensive on GPU. Embedding on window close
-instead means one vector per *active user per minute*: with 50k active users, ~800/s. Same freshness for
+instead means one vector per *active user per minute*: with 50k active users, ~830/s. Same freshness for
 the model, ~1200× less compute. This is the load-bearing idea in the whole design.
 
 **The online store is small; the offline store is the petabyte.** Raw events at 1M/s are ~30 TB/day and
@@ -111,5 +116,6 @@ cross a petabyte in about a month. But the *serving* layer only holds current st
 | Producer hangs, no error | Using `kafka:9092` from the host. Host scripts must use `localhost:29092`. |
 | `get_online_features` returns all `None` | Feature-view or feature name drift between the Flink sink and the Feast registry — the Redis field is a hash of both. Check `contracts/schema.py` is the only definition. |
 | Flink job fails on submit | Version skew between the cluster image and the `apache-flink` pip package. Both must be 2.2.1. |
-| First `make up` looks stuck | It's building a ~3 GB image with PyTorch and downloading the model. Once only. |
+| First `make up` looks stuck | It's building a ~3 GB image with PyTorch, downloading the model, and — on Apple Silicon — compiling PyFlink from source, since no Linux aarch64 wheel exists. Once only. |
+| Image build fails compiling PyFlink | Missing `build-essential` / `python3.12-dev` in the Flink Dockerfile. See [ADR-009](docs/DECISIONS.md). |
 | `Cannot connect to the Docker daemon` | Docker Desktop isn't running. |

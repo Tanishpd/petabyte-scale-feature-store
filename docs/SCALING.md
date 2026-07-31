@@ -63,6 +63,10 @@ Flink work. That design does not survive contact with production.
 50k active users ÷ 60 s slide  ≈  830 embeddings/s  ≈  well under one core
 ```
 
+The 50k is an assumption worth stating: **~0.1% of the 50M total users are active within any given
+10-minute window.** (Coincidentally the local mock stream also has a ~50k user population — that is a
+different 50k, and the two are unrelated.)
+
 A ~1200× reduction, and the consumer loses nothing — a model reading `user_txn_stats_10m` reads the
 window aggregate regardless. The embedding describes recent behaviour, which is the more useful semantic
 anyway.
@@ -82,7 +86,7 @@ without the embedding tier moving.
 |---|---|---|
 | **Kafka** | ⓔ 24 partitions, RF=3, ~12 brokers | ~10–40 MB/s sustained per partition; 350 MB/s ingress plus replication |
 | **Flink** | ⓔ parallelism 24 (= partitions), RocksDB state backend, incremental checkpoints to S3 | keyed state = active users × 10-min window contents |
-| **Flink state** | ⓔ ~50k users × ~10 KB window buffer ≈ 500 MB/slot-group | HOP windows retain 10 slide-panes per key |
+| **Flink state** | ⓔ ~50k users × ~10 KB window buffer ≈ 500 MB/slot-group | HOP windows retain 10 slide-panes per key; same 0.1%-active assumption as §3 |
 | **Redis** | ⓔ 6–10 shards | ~100k ops/s/shard; 1M feature reads/s needs ~10 |
 | **Embedding tier** | ⓔ 1–2 cores | see §3 |
 
