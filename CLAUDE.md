@@ -118,6 +118,11 @@ Invariant 4. Override with `REDIS_HOST_PORT=6379`.
   among them. The embedding is stored as an `Array(Float32)` feature and retrieved by key. True ANN needs
   a parallel RediSearch index we maintain ourselves. Do not go looking for a Feast Redis vector config —
   it isn't there.
+- **A long-lived `FeatureStore` gets slower.** `get_online_features()` drifts 2.7× over ~200 calls
+  (6.9 → 18.4 ms for 100 entities). Calling `store.get_feature_view(...)` periodically removes the drift
+  entirely (1.1×); so does constructing a new `FeatureStore`. Both touch the registry. Ruled out:
+  elapsed time, connection leak, object leak, Prometheus metrics, growing projection. Any benchmark that
+  reuses one store across thousands of calls is measuring this, not the read path. See SCALING §8.
 - **`TableEnvironment.create()` cannot reach the DataStream API.** It returns a plain
   `TableEnvironment` with no `to_data_stream`, so the sink hop is unreachable. Build
   `StreamTableEnvironment.create(StreamExecutionEnvironment.get_execution_environment())` instead, and

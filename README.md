@@ -101,9 +101,11 @@ Every number here comes from `make bench`, `make bench-embed` or `make verify-wi
 | `get_online_features`, 1 entity | **p99 2.17 ms** (0.19 ms Redis + 0.74 ms Feast) |
 | `get_online_features`, 100 entities | **p99 22.55 ms** — 6× cheaper per entity than one-at-a-time |
 | Redis footprint per user | 4,073 B → ~204 GB for 50M users |
+| Pipeline ceiling | **~8,500 eps** sustained (zero lag at 5k; 2.9M lag at 27k) |
 | Producer throughput | 4,998 eps against a 5,000 target; ceiling ~30k single-threaded |
 | Embedding, batched vs not | 450–475 vs 50–95 emb/s — **5–7× faster batched** |
 | Aggregate correctness | 4,433 (user, window) pairs match pandas to 3.6e-12 |
+| Read-path caveat | a long-lived `FeatureStore` drifts 2.7× over 200 calls — refresh the registry ([SCALING §8](docs/SCALING.md)) |
 
 ## Two design decisions worth knowing
 

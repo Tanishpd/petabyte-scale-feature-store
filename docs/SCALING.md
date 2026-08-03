@@ -101,24 +101,31 @@ Parallelism is capped by partition count — that's why partitions are the first
 
 Raise load 10× at a time and the failures arrive in this sequence:
 
-1. ⓜ **~30k events/s — the single-threaded Python producer**, not Kafka. Measured: one producer tracks its
-   target exactly to 5k, and tops out at 29.6k (74% of a 40k ask). Two producers in parallel each hold 20k
-   for an **aggregate of 39,972 eps**, which proves the broker was never the constraint — the limit is
-   CPU-bound event generation plus `kafka-python`'s pure-Python protocol. *Fix:* run N producers, or move
-   to `confluent-kafka` (librdkafka). An earlier draft of this section blamed single-broker Kafka at ~10k;
-   that was wrong, and measuring it is what corrected it.
-2. **Not yet reached.** ⓜ At a sustained 5,000 eps over 90 s against 20,000 users, the full pipeline
-   (Kafka → HOP window → MiniLM embedding → Feast-encoded Redis write, plus the ANN index) held
-   **zero consumer lag on all 6 partitions** — 1.6M events in the topic, every one consumed, ~441 window
-   rows/s emitted and 18,016 Redis keys written. Flink was never the constraint at the rate a single
-   Python producer can feed it (§5.1). The next thing expected to bend is checkpoint duration as keyed
-   state grows; *fix:* RocksDB backend, incremental and unaligned checkpoints. ⓔ until measured.
-3. **~100k reads/s** — single Redis node hits its ceiling. *Fix:* Redis Cluster; Feast supports
-   `redis_type: redis_cluster` natively.
-4. **Then, and only then, embeddings** — because §3 decoupled them from event rate. If they *did* appear
-   earlier, the window-close design was silently reverted.
+1. ⓜ **~8,500 events/s — the Flink pipeline**, on 2 task slots sharing 8 cores. Measured by saturating
+   it and timing the recovery: 3 producers at 9k each sustained **26,995 eps aggregate** for 120 s, which
+   built **2.9M events of consumer lag**; with producers stopped, the backlog drained at
+   **8,526 events/s**, with TaskManager CPU pinned at 590% of the 800% available. At 5,000 eps the same
+   pipeline holds **zero lag on all 6 partitions**, so the ceiling sits between the two.
+   *What saturates:* the embedding UDF — §3 measures MiniLM at 450–475 emb/s per process and it is
+   memory-bandwidth bound, so more slots (or a GPU, or fewer embeddings via a longer slide) is the fix.
+2. ⓜ **~30k events/s — a single Python producer.** One producer tracks its target exactly to 5k and tops
+   out at 29.6k (74% of a 40k ask); two in parallel each hold 20k for an aggregate of 39,972 eps, so the
+   broker was never the constraint — the limit is CPU-bound generation plus `kafka-python`'s pure-Python
+   protocol. *Fix:* run N producers, or move to `confluent-kafka` (librdkafka).
 
-Notably, the naive design's first bottleneck is #4 at ~3k events/s — before Kafka even breathes hard.
+   **This ordering is a correction.** An earlier draft of this section put the producer first, at ~30k,
+   with Flink "not yet reached" — true only because nothing had pushed past the producer's ceiling. Once
+   three producers ran together, Flink turned out to bend more than 3× earlier. Before that, this list
+   blamed single-broker Kafka at ~10k, which was wrong too. Both corrections came from measuring.
+3. **Checkpoint duration** as keyed state grows. ⓔ — not reached; the embedding tier saturates first.
+   *Fix:* RocksDB backend, incremental and unaligned checkpoints.
+4. **~100k reads/s** — single Redis node hits its ceiling. *Fix:* Redis Cluster; Feast supports
+   `redis_type: redis_cluster` natively.
+
+Note what this does *not* contradict. Embedding on window close is still what makes the design viable:
+the ~8.5k ceiling is set by embedding **windows** at this laptop's 2-slot capacity, not by embedding
+events. A per-event design would have to embed 8,500 vectors/s at the same point instead of ~441 — about
+19× more work for identical output. §3's argument holds; this section just says how far two slots get.
 
 ## 6. Hot keys
 
@@ -185,20 +192,38 @@ estimate. The 384-float embedding is 1,536 B of it; the rest is Redis hash overh
 encoded values. Revised: 50M users ≈ **204 GB**, not 90 GB. Still small next to the offline petabyte, and
 still the point of §1 — but the estimate was optimistic by 2.3×.
 
-### An unresolved degradation
+### A read-path degradation, and how to avoid it
 
-Reads through a **single long-lived `FeatureStore` slow down as calls accumulate**: ⓜ 8.1 ms → 21.3 ms
-p50 over 240 calls on a 100-entity read, a 2.6× drift. What is ruled out:
+Reads through a **single long-lived `FeatureStore` slow down as calls accumulate**: ⓜ 6.9 ms → 18.4 ms
+p50 over 200 calls on a 100-entity read, a 2.7× drift.
+
+**Mitigation — touch the registry periodically.** Calling `store.get_feature_view(...)` between batches
+removes the drift entirely: ⓜ 1.1× over the same 200 calls, versus 2.7× without. A long-lived model
+server should refresh the registry on an interval rather than only at startup.
+
+| | 40 | 80 | 120 | 160 | 200 calls |
+|---|---|---|---|---|---|
+| reads only | 6.91 | 9.99 | 14.08 | 16.10 | **18.38 ms** |
+| + `get_feature_view()` between blocks | 6.41 | 6.95 | 6.64 | 6.65 | **7.09 ms** |
+
+What the profile shows: `feast/utils.py:_populate_response_from_feature_data` self-time grows 8.7×
+(0.061 s → 0.530 s for the same 40 calls) and total Python calls per batch go 798k → 2,005k, so real work
+is increasing rather than the process merely being descheduled. What is ruled out:
 
 - not elapsed time — 30 s idle changes nothing
 - not a connection leak — Redis stays at 2 `connected_clients`
 - not a Python object leak — no growth in `gc.get_objects()` counts
-- not per-instance — constructing *any* new `FeatureStore` restores speed for existing ones too, so
-  whatever resets is process-global
+- not Prometheus metrics — `online_features` tracking is disabled by default and the multiprocess mmap
+  files stay a constant 196,608 B
+- not a growing feature projection — `n_features` and `output_len` stay 9 and 100
+- not per-instance — constructing any new `FeatureStore` restores speed for *existing* instances too
 
-Cause unidentified. It matters for a long-running model server, and it silently corrupted this
-benchmark before it was noticed: an early run reported a 107 ms p99 that was mostly drift. `make bench`
-now uses a fresh store per batch size and reports the drift separately as section 5.
+The common factor between the two things that fix it — a new `FeatureStore` and `get_feature_view()` — is
+that both touch the registry. Exact mechanism inside Feast unidentified.
+
+It silently corrupted this benchmark before it was noticed: an early run reported a 107 ms p99 that was
+mostly drift plus contention with a running Flink job. `make bench` now uses a fresh store per batch size
+and reports the drift separately as section 5.
 
 Replace every ⓔ above with a measurement:
 
