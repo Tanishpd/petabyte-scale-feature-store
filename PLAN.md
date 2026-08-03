@@ -21,7 +21,7 @@ them back in single-digit milliseconds via `feast.get_online_features()` — wit
 | 1 | Infrastructure | `docker-compose.yml`: Kafka (KRaft), Flink JM+TM (custom image), Redis Stack, Kafka UI | `make up` → 4 services healthy, TM registered with 2 slots, Invariant-4 round-trip on `localhost:29092` | ☑ |
 | 2 | Mock stream | `producer/generate_stream.py` — Zipf users, anomalies, late events, tunable EPS | 4,998 eps vs 5,000 target (100.0%); anomalies 0.51%, late 7.85%; 15 tests green | ☑ |
 | 3 | Feature contract + Feast repo | `contracts/schema.py` (single source of truth), Feast entity/FV, seeded offline parquet | `feast apply` clean; registry shows `user_txn_stats_10m`; **Feast's field hashes byte-match `qualified()`** for all 9 features | ☑ |
-| 4 | Flink aggregation | PyFlink job: Kafka → watermarks → HOP(10min/1min) → print | Printed rolling avg matches a pandas recomputation of the same window (±1e-6) | ☐ |
+| 4 | Flink aggregation | PyFlink job: Kafka → watermarks → HOP(10min/1min) → print | `make verify-windows`: 4,433 (user, window) pairs match an independent pandas recomputation; rolling avg agrees to 3.6e-12 | ☑ |
 | 5 | Embedding UDF | Pandas UDF (`func_type="pandas"`), model baked into image, offline mode | Job emits `ARRAY<FLOAT>` len 384; ≥500 embeddings/s/slot measured | ☐ |
 | 6 | **Feast-compatible Redis sink** | `sinks/feast_redis_sink.py` using Feast's own key codec | **Round-trip test**: Flink writes → `get_online_features()` returns identical values | ☐ |
 | 7 | Serving | `serving/online_read.py` + `serving/benchmark.py` | p99 single-entity read < 10 ms local; 100-entity batch < 25 ms | ☐ |
@@ -58,7 +58,7 @@ them back in single-digit milliseconds via `feast.get_online_features()` — wit
 - **Kafka UI** (`ghcr.io/kafbat/kafka-ui`, the maintained fork of the abandoned `provectuslabs` image)
   for eyeballing the topic. Nice for demos, zero production meaning.
 - Set `retention.bytes` / `retention.ms` on the `transactions` topic at creation. Without caps, the
-  load tests in Phase 8 fill the disk — at `EPS=20000` and ~350 B/event that is ~25 GB/hour.
+  load tests in Phase 8 fill the disk — at `EPS=20000` and ~258 B/event that is ~19 GB/hour.
 - Health checks on every service; `depends_on: condition: service_healthy` so `make up` is deterministic.
 
 ### Phase 2 — Mock stream
@@ -80,17 +80,24 @@ contract makes that class of bug unrepresentable.
 ### Phase 4 — Aggregation
 Table API, `HOP` window TVF: 10-minute size, 1-minute slide, keyed by `user_id`. Emits
 `txn_count_10m`, `txn_amount_sum_10m`, `txn_amount_avg_10m`, `txn_amount_max_10m`,
-`txn_amount_stddev_10m`, `distinct_merchants_10m`, and `behavior_summary` — a plain
-`LISTAGG(merchant_category)` that is **deduplicated and sorted in Python**, not with SQL `DISTINCT`.
+`txn_amount_stddev_10m`, `distinct_merchants_10m`, and `behavior_summary` — from
+`COLLECT(merchant_category)`, a `MULTISET` that is **sorted in Python**, not `LISTAGG(DISTINCT ...)`.
 
 That last point is load-bearing: `LISTAGG(DISTINCT ...)` under a HOP window fails at plan time on Flink
 2.2.1 (`TableException: This function does not support retraction`). `COUNT(DISTINCT)` in the same query
 works, and `LISTAGG(DISTINCT)` works under `TUMBLE` — so the failure is specific enough to invite being
-"fixed" back. Normalising in Python also makes the embedding input deterministic, which `LISTAGG`'s
-arrival-order output otherwise is not. The normalised string is what gets stored *and* embedded.
+"fixed" back. Plain `LISTAGG` works but emits one entry per *transaction*; `COLLECT` returns a bounded
+multiset with counts instead. See [ADR-010](docs/DECISIONS.md). Sorting in Python also makes the embedding
+input deterministic, which neither `LISTAGG`'s arrival order nor a dict's key order is.
 
 HOP output is **append-only**, which is what lets us convert to a DataStream and write from a plain map
 operator in Phase 6 without dealing with retractions.
+
+Two settings fail *silently* if wrong, and both cost time to find: the rowtime must be
+`TIMESTAMP_LTZ(3)` (not `TIMESTAMP(3)`, which rejects the producer's trailing `Z`), and
+`json.timestamp-format.standard` must be `ISO-8601`. Either mistake yields NULL rowtimes, a watermark
+that never advances, and zero rows with no error. `json.ignore-parse-errors` therefore defaults to
+**false** here, so a schema mismatch is loud.
 
 ### Phase 5 — Embedding
 Two decisions carry this phase:
