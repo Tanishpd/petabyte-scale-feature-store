@@ -1,0 +1,84 @@
+name: tests
+
+# The round-trip test (ADR-005) is the ONLY thing standing between us and a
+# silent break when Feast changes its private Redis codec, which ADR-003
+# knowingly depends on. Until this workflow existed, that mitigation was a test
+# nobody ran. Flink is not needed here — Redis plus an applied registry covers
+# all 61 tests.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      redis:
+        # Stack, not plain redis: 8 of the tests exercise the RediSearch HNSW
+        # index. Mapped to 6380 so feature_store.yaml needs no CI-specific edit.
+        image: redis/redis-stack-server:7.4.0-v8
+        ports:
+          - 6380:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+
+    env:
+      REDIS_HOST_PORT: 6380
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Must match docs/DECISIONS.md ADR-001. The container runs 3.12; this
+          # is the host side, which never runs PyFlink.
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-host.txt
+
+      - name: Install host dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-host.txt
+
+      - name: Verify the pinned versions the design depends on
+        run: |
+          python - <<'PY'
+          import feast, redis, kafka
+          # ADR-003 pins feast exactly because we import its private helpers.
+          assert feast.__version__ == "0.65.0", f"feast {feast.__version__} != 0.65.0"
+          # feast[redis] constrains redis-py to <8; 8.x changes client behaviour.
+          assert int(redis.__version__.split(".")[0]) < 8, f"redis-py {redis.__version__} >= 8"
+          print("pins OK:", feast.__version__, redis.__version__, kafka.__version__)
+          PY
+
+      - name: Seed the offline store and apply the registry
+        run: |
+          python scripts/seed_offline.py --hours 0.2 --users 300 --eps 20
+          cd src/feast_repo && feast apply
+
+      - name: Run tests
+        run: |
+          set -o pipefail
+          pytest -q -rs tests/ | tee /tmp/pytest.out
+
+      - name: Fail if any test was skipped
+        # Every test in this suite has an infra guard that turns into a skip when
+        # Redis or the registry is missing. Without this check a broken service
+        # container yields a green run that asserted nothing — the exact silent
+        # pass this project keeps guarding against elsewhere.
+        run: |
+          if grep -qE '[0-9]+ skipped' /tmp/pytest.out; then
+            echo "::error::Tests were SKIPPED — infra guards tripped, so this run proved nothing."
+            grep -E 'SKIPPED|skipped' /tmp/pytest.out
+            exit 1
+          fi
+          echo "no skips — every test actually executed"

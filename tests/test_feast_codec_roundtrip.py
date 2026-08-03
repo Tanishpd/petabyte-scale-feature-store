@@ -14,6 +14,7 @@ Needs the stack up (`make up`) and the registry applied (`make seed && make appl
 from __future__ import annotations
 
 import math
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -40,7 +41,7 @@ from src.flink.sinks.feast_codec import (  # noqa: E402
     redis_key,
 )
 
-REDIS_PORT = 6380          # host mapping; inside the network it is redis:6379
+REDIS_PORT = int(os.environ.get("REDIS_HOST_PORT", "6380"))          # host mapping; inside the network it is redis:6379
 TEST_USER_BASE = 990_000   # far outside the generator's id range
 
 

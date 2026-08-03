@@ -9,6 +9,7 @@ slot, leaving only part of the keyspace searchable.
 from __future__ import annotations
 
 import struct
+import os
 import sys
 from pathlib import Path
 
@@ -29,7 +30,7 @@ from src.flink.sinks.ann_index import (  # noqa: E402
     vec_key,
 )
 
-REDIS_PORT = 6380
+REDIS_PORT = int(os.environ.get("REDIS_HOST_PORT", "6380"))
 TEST_PREFIX_USER = 980_000
 
 

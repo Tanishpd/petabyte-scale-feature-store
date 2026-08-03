@@ -37,6 +37,17 @@ redis-cli -p "$REDIS_PORT" flushdb >/dev/null
 echo "  cleared $BEFORE keys (this is OUR redis on :$REDIS_PORT, not a system one)"
 
 step "4/6 backfill $TOPIC"
+# Create the topic first. Auto-creation is disabled on the broker, so on a
+# clean stack the producer would otherwise die with
+# "KafkaTimeoutError: Failed to update metadata after 15.0 secs" — which reads
+# like a connectivity problem rather than a missing topic. This step only
+# worked before because the topic happened to survive from an earlier run.
+$COMPOSE exec -T kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --create --if-not-exists \
+  --topic "$TOPIC" --partitions 3 --replication-factor 1 \
+  --config retention.ms=86400000 >/dev/null
+echo "  topic ready"
+
 $VENV src/producer/generate_stream.py --topic "$TOPIC" \
   --backfill "${SPAN:-1200}" --eps "${VEPS:-40}" --users "${VUSERS:-150}" \
   --late-rate 0 --seed 42 2>&1 | tail -1

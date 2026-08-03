@@ -122,6 +122,37 @@ of 1.8 KB was 2.3× optimistic.) The full argument is in [docs/SCALING.md](docs/
 
 ---
 
+## Is this production ready?
+
+**No** — and the gaps are listed rather than glossed, because a demo that claims otherwise is worse than
+one that doesn't.
+
+Addressed, and verified rather than configured:
+
+| | |
+|---|---|
+| Flink state survives a restart | Checkpoints to a shared volume; verified by `docker kill` + restore from `chk-16` ([ADR-011](docs/DECISIONS.md)) |
+| Kafka + Redis survive container recreate | Named volumes; verified by `compose down` then checking the data is still there |
+| Services come back on their own | `restart: unless-stopped` on all four |
+| The Feast private-API risk has a live tripwire | CI runs all 61 tests on every push, and **fails if any test is skipped** — a skipped round-trip test is the same as no test |
+| One bad record needn't kill the job | `--on-bad-record skip` tolerates and counts; default stays `fail` so schema drift is loud in dev |
+
+Still missing, in rough order of how much it would hurt:
+
+- **Single node everywhere.** One Kafka broker with RF=1, one Redis, one TaskManager. Any loss is
+  unrecoverable for whatever that node held.
+- **No auth or TLS.** Kafka PLAINTEXT, Redis unauthenticated, Flink UI open.
+- **Depends on Feast internals.** `_redis_key` / `_mmh3` are private ([ADR-003](docs/DECISIONS.md)). CI
+  now catches breakage, but a supported path would be `write_to_online_store` at the cost of a hop.
+- **`file://` checkpoints.** Correct for one node, wrong for a cluster — becomes `s3://`, one line.
+- **No alerting** on consumer lag, backpressure or feature staleness.
+- **Schema evolution is manual.** Versioning must stay off ([Invariant 8](CLAUDE.md)), so adding a
+  feature changes hashes and cold-starts the cache.
+- **One unexplained behaviour**: a long-lived `FeatureStore` drifts 2.7× over 200 calls. Mitigated by
+  refreshing the registry; root cause unknown ([SCALING §8](docs/SCALING.md)).
+
+---
+
 ## Documentation
 
 | Doc | What's in it |

@@ -11,6 +11,9 @@ services:
   kafka:
     image: apache/kafka:4.3.1
     container_name: petafs-kafka
+    restart: unless-stopped
+    volumes:
+      - kafka-data:/var/lib/kafka/data
     ports:
       - "29092:29092"
     environment:
@@ -29,6 +32,10 @@ services:
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
       KAFKA_LOG_RETENTION_HOURS: 2
+      # Without this the broker writes to /tmp/kafka-logs — container-local, so
+      # every topic dies with the container while the image's own
+      # /var/lib/kafka/data volume sits empty. Point it at the named volume.
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
       CLUSTER_ID: ${CLUSTER_ID:-petafs-local-cluster-01}
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
@@ -40,6 +47,14 @@ services:
   redis:
     image: redis/redis-stack-server:7.4.0-v8
     container_name: petafs-redis
+    restart: unless-stopped
+    volumes:
+      # Redis ships RDB snapshotting on by default (save 3600 1 300 100 60
+      # 10000) but /data is container-local, so it was snapshotting into
+      # nothing. Features are derived and TTL'd at 30 min, so losing them costs
+      # a cold cache rather than data — but "configured yet not durable" is the
+      # same lie the checkpoint gap was (ADR-011), so make it true.
+      - redis-data:/data
     ports:
       # Host port is 6380, not 6379, to coexist with a system/Homebrew redis.
       # Only the HOST side moves: inside the compose network this is still
@@ -61,6 +76,7 @@ services:
       dockerfile: docker/flink/Dockerfile
     image: petafs/flink:2.2.1
     container_name: petafs-jobmanager
+    restart: unless-stopped
     ports:
       - "8081:8081"
     command: jobmanager
@@ -107,6 +123,7 @@ services:
   taskmanager:
     image: petafs/flink:2.2.1
     container_name: petafs-taskmanager
+    restart: unless-stopped
     command: taskmanager
     environment:
       # See the jobmanager note: the UDF worker process needs this to unpickle
@@ -151,3 +168,5 @@ volumes:
   # Checkpoint/savepoint storage shared by the JobManager and TaskManager.
   # Survives `make down`; removed by `make clean` (down -v).
   flink-state:
+  kafka-data:
+  redis-data:

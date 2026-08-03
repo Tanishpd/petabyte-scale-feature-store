@@ -61,10 +61,16 @@ def build_source_ddl(
     Either mistake yields NULL rowtimes, a watermark that never advances, and
     zero output rows with no error anywhere.
 
-    `ignore_parse_errors` therefore defaults to **False**. Tolerating malformed
-    records is the right production posture, but as a default it converts a
-    schema mismatch into silent data loss — which is exactly how the
-    TIMESTAMP_LTZ bug above hid.
+    `ignore_parse_errors` therefore defaults to **False** in development: a
+    schema mismatch should be loud, and tolerating it as a default is exactly
+    how the TIMESTAMP_LTZ bug above hid.
+
+    In production the trade-off inverts — one malformed record must not stop the
+    pipeline — so `--on-bad-record skip` flips it on. That is a real choice with
+    a real cost: skipped records are silently dropped, so the job also enables
+    a periodic count of them (see `_log_dropped_records`). "Tolerate but count"
+    is the only version of this that is safe; "tolerate" alone is data loss you
+    cannot see.
     """
     bounded_opt = (
         "  'scan.bounded.mode' = 'latest-offset',\n" if bounded else ""
@@ -212,6 +218,10 @@ def main() -> int:
     ap.add_argument("--startup-mode", default="latest-offset",
                     choices=["earliest-offset", "latest-offset", "group-offsets"])
     ap.add_argument("--parallelism", type=int, default=None)
+    ap.add_argument("--on-bad-record", default="fail", choices=["fail", "skip"],
+                    help="fail (default, dev): a malformed record stops the job, "
+                         "so schema drift is loud. skip (prod): tolerate it and "
+                         "count the drops instead of dying on one bad message.")
     ap.add_argument("--sink", default="redis", choices=["redis", "print"],
                     help="redis writes Feast-encoded hashes (the real path); "
                          "print dumps rows to the TaskManager stdout")
@@ -223,9 +233,15 @@ def main() -> int:
     args = ap.parse_args()
 
     stream_env, t_env = build_stream_env(args.parallelism)
+    tolerate_bad = args.on_bad_record == "skip"
+    if tolerate_bad:
+        print("WARNING: --on-bad-record skip — malformed records are DROPPED. "
+              "Watch numRecordsIn on the source vs the producer's send count; "
+              "a growing gap means schema drift, not a quiet pipeline.")
     t_env.execute_sql(
         build_source_ddl(args.bootstrap, args.topic, args.group_id,
-                         args.startup_mode, bounded=False)
+                         args.startup_mode, bounded=False,
+                         ignore_parse_errors=tolerate_bad)
     )
 
     register_embedding_udfs(t_env)

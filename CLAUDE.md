@@ -86,6 +86,14 @@ Makefile
 - Prefer Table API for the SQL-shaped work, DataStream only for the sink hop.
 - Every doc claim about performance must come from a measurement in this repo, not from memory.
 
+## CI
+
+`.github/workflows/tests.yml` runs all 61 tests on push/PR with a Redis Stack service and an applied
+registry — no Flink needed. It **fails the build if any test is skipped**: every test here has an infra
+guard that degrades to a skip, so a broken service container would otherwise produce a green run that
+asserted nothing. That matters most for the codec round-trip, which is the only tripwire on the Feast
+private-API dependency (ADR-003).
+
 ## Verify commands
 
 ```bash

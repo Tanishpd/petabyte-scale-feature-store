@@ -17,6 +17,7 @@ Two retrieval paths, deliberately shown side by side:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -27,7 +28,7 @@ sys.path.insert(0, str(ROOT))
 from contracts.schema import ENTITY_JOIN_KEY  # noqa: E402
 from src.flink.sinks.ann_index import INDEX_NAME, knn, unpack, vec_key  # noqa: E402
 
-REDIS_PORT = 6380
+REDIS_PORT = int(os.environ.get("REDIS_HOST_PORT", "6380"))
 
 
 def main() -> int:

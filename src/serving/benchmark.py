@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import statistics
+import os
 import sys
 import time
 from pathlib import Path
@@ -30,7 +31,7 @@ from contracts.schema import EMBEDDING_DIM, ENTITY_JOIN_KEY, FEATURES  # noqa: E
 from src.flink.sinks.feast_codec import feature_refs, redis_key  # noqa: E402
 
 REPO = ROOT / "src" / "feast_repo"
-REDIS_PORT = 6380
+REDIS_PORT = int(os.environ.get("REDIS_HOST_PORT", "6380"))
 
 
 def pct(xs: list[float], p: float) -> float:
