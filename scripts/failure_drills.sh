@@ -35,8 +35,16 @@ kafka_records() {
     | awk -F: '{s+=$3} END {print s+0}'
 }
 sentinel_master() {
-  docker exec petafs-prod-redis-sentinel redis-cli -p 26379 -a "$PW" \
+  docker exec petafs-prod-redis-sentinel-1 redis-cli -p 26379 -a "$PW" \
     SENTINEL get-master-addr-by-name mymaster 2>/dev/null | head -1
+}
+count_masters() {
+  n=0
+  for c in primary replica; do
+    docker exec "petafs-prod-redis-$c" redis-cli -a "$PW" INFO replication 2>/dev/null \
+      | grep -q "^role:master" && n=$((n+1))
+  done
+  echo "$n"
 }
 
 # ---------------------------------------------------------------------------
@@ -105,8 +113,22 @@ else
   [ "${SURV:-0}" -gt 0 ] && ok "features survived the failover ($SURV keys)" \
                          || bad "no keys after failover"
 
+  # The promotion must SURVIVE the old primary coming back. With a
+  # command-line --replicaof the argument reasserts on restart and fights
+  # Sentinel; enough failovers and both nodes end up replicas with no master.
+  # Redis persists a promotion via CONFIG REWRITE, which needs a config FILE.
   $P up -d redis-primary redis-replica >/dev/null 2>&1
-  sleep 10
+  sleep 25
+  M=$(count_masters)
+  [ "$M" -eq 1 ] && ok "exactly one master after the old primary rejoined (no split brain)" \
+                 || bad "$M masters after restart — split brain"
+
+  AGREE=$(for n in 1 2 3; do
+            docker exec "petafs-prod-redis-sentinel-$n" redis-cli -p 26379 -a "$PW" \
+              SENTINEL get-master-addr-by-name mymaster 2>/dev/null | head -1
+          done | sort -u | wc -l | tr -d " ")
+  [ "${AGREE:-0}" -eq 1 ] && ok "all three sentinels agree on the master" \
+                          || bad "sentinels disagree ($AGREE distinct answers)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -138,7 +160,7 @@ fi
 
 # ---------------------------------------------------------------------------
 step "Drill 4 — authentication is actually enforced"
-if docker exec petafs-prod-redis-sentinel redis-cli -p 26379 PING 2>&1 | grep -q NOAUTH; then
+if docker exec petafs-prod-redis-sentinel-1 redis-cli -p 26379 PING 2>&1 | grep -q NOAUTH; then
   ok "sentinel rejects unauthenticated clients"
 else
   bad "sentinel answered without credentials"

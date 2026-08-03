@@ -138,13 +138,11 @@ the claims below.
 | Nothing authenticated | SASL/PLAIN on Kafka; `requirepass` on Redis nodes *and* Sentinel | Authenticated clients work, unauthenticated are refused — on both |
 | Nothing watched it | Prometheus + 5 alerts on lag, checkpoints, restarts, backpressure, feature staleness | 2/2 scrape targets up, rules loaded |
 | Tests never ran | CI on every push, **fails on any skip** | A skipped round-trip test is the same as no test |
-| Nothing proved any of it | `make prod-drill` — 10 assertions | **10/10 passing** against the live topology |
+| Sentinel could split-brain | 3 sentinels, quorum 2, config-file Redis so promotions persist | Killed the master, restarted the old one: it rejoins as a replica, exactly one master, all 3 sentinels agree |
+| Nothing proved any of it | `make prod-drill` — 12 assertions | **12/12 passing** against the live topology |
 
 **Still open, honestly:**
 
-- **One sentinel, not three.** Enough to demonstrate failover, not enough for
-  quorum. The drills exposed why that matters — see the split-brain trap in
-  [RUNBOOK §4](docs/RUNBOOK.md).
 - **Single-host.** Three brokers on one machine survive a *process* failure, not
   a *host* failure. Real fault tolerance needs separate failure domains.
 - **No TLS anywhere**, and secrets are compose env vars with dev defaults, not a
@@ -157,7 +155,7 @@ the claims below.
 
 So: **durability, availability and authentication are real and tested; the
 deployment story is still single-host and there is no TLS.** Operationally it is
-a credible reference topology — 10/10 failure drills — but three brokers on one
+a credible reference topology — 12/12 failure drills — but three brokers on one
 machine survive a process failure, not a datacentre one.
 
 ## Documentation

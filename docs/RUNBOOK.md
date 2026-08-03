@@ -38,7 +38,7 @@ laptop for the drills. Real deployment:
 | Kafka broker heap | 512 MB | 6+ GB, dedicated disks, 3+ AZs |
 | Kafka replication | RF=3, min.insync=2 | same, but across availability zones |
 | TaskManager | 2 GB, 2 slots | sized from §5 below; the embedding tier is the constraint |
-| Sentinels | **1** | **3** — see §4, one sentinel cannot form quorum |
+| Sentinels | **3, quorum 2** | same — plus separate failure domains |
 | Object storage | MinIO, single node | S3/GCS with versioning and lifecycle rules |
 | Retention | 2 h | driven by how far back you may need to replay |
 
@@ -59,14 +59,23 @@ slots past the partition count buys nothing.
 
 ## 4. Known operational traps
 
-**Redis: one sentinel with a static `replicaof` can deadlock into all-replicas.**
-Hit during the drills. With quorum 1, Sentinel promotes the replica; then the old
-primary restarts, its baked-in config reasserts `replicaof`, and after enough
-failovers *both* nodes end up slaves with no master. Sentinel then reports
-`s_down,o_down` and clients fail with `MasterNotFoundError` — which reads like a
-connectivity problem rather than a topology one.
-→ Production runs **three sentinels** (real quorum) and does not bake `replicaof`
-into a node that Sentinel is allowed to promote.
+**Redis promotion must survive a restart — FIXED, and worth understanding.**
+Originally: one sentinel (quorum 1) and `--replicaof` as a command-line argument.
+Sentinel would promote the replica; the old primary would restart, its argument
+would reassert the old role, and after enough failovers *both* nodes ended up
+slaves with no master, reporting `s_down,o_down` while clients failed with
+`MasterNotFoundError` — which reads as a connectivity problem, not a topology one.
+
+Two changes fixed it, and both are necessary:
+- **Three sentinels, quorum 2.** One sentinel cannot form a quorum, so a single
+  node's opinion was enough to trigger — and mis-trigger — failover.
+- **A config file, not command-line args.** Redis persists a Sentinel-driven
+  promotion with `CONFIG REWRITE`, which only works against a file. With
+  `--replicaof` as an argument there is nothing to rewrite.
+
+Verified: kill the primary, wait for promotion, restart the old primary — it
+rejoins as a *replica*, exactly one master remains, and all three sentinels
+agree.
 
 **The sentinel needs its own `requirepass`,** not just `auth-pass` for the master.
 An open sentinel plus a password-sending client fails the AUTH, and discovery
