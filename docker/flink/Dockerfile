@@ -63,6 +63,19 @@ print('baked', '${EMBEDDING_MODEL}', 'dim=', v.shape[-1])"
 ENV HF_HUB_OFFLINE=1
 ENV TRANSFORMERS_OFFLINE=1
 
+# --- optional plugins ------------------------------------------------------
+# Flink ships these in /opt/flink/opt/ but only LOADS plugins from
+# /opt/flink/plugins/<name>/. Copying is the documented activation step; without
+# it `s3://` checkpoint paths fail with "Could not find a file system
+# implementation for scheme 's3'".
+#
+# Only the presto S3 filesystem, not hadoop: both register the `s3://` scheme
+# and installing both makes the resolution ambiguous. Presto is the one Flink
+# recommends for checkpointing.
+RUN mkdir -p /opt/flink/plugins/s3-fs-presto \
+    && cp /opt/flink/opt/flink-s3-fs-presto-*.jar /opt/flink/plugins/s3-fs-presto/ \
+    && ls /opt/flink/plugins/s3-fs-presto/
+
 # --- checkpoint storage ----------------------------------------------------
 # The compose file mounts a named volume here. Docker seeds a fresh named
 # volume's ownership from the image's directory, so this mkdir+chown is what

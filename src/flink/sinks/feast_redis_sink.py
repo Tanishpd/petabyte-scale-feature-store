@@ -37,6 +37,14 @@ from src.flink.sinks.feast_codec import decode_ts, encode_row  # noqa: E402
 # Only the *host* mapping moved to 6380 to coexist with a system redis.
 REDIS_HOST = os.environ.get("REDIS_HOST", "redis")
 REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
+REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD") or None
+
+#: Sentinel discovery for the production topology. Writing to a fixed host would
+#: undo the failover the topology exists to provide: after a promotion the old
+#: primary is gone (or demoted to a read-only replica) and every write fails
+#: with READONLY. Empty means "connect directly", which is the dev stack.
+REDIS_SENTINELS = os.environ.get("REDIS_SENTINELS", "").strip()
+REDIS_SENTINEL_MASTER = os.environ.get("REDIS_SENTINEL_MASTER", "mymaster")
 
 FLUSH_ROWS = int(os.environ.get("SINK_FLUSH_ROWS", "500"))
 FLUSH_MS = int(os.environ.get("SINK_FLUSH_MS", "100"))
@@ -58,11 +66,34 @@ class FeastRedisWriter(MapFunction):
     def open(self, runtime_context):
         import redis
 
-        self._client = redis.Redis(
-            host=REDIS_HOST, port=REDIS_PORT,
-            socket_timeout=5, socket_connect_timeout=5,
-            health_check_interval=30,
-        )
+        if REDIS_SENTINELS:
+            from redis.sentinel import Sentinel
+
+            nodes = []
+            for hp in REDIS_SENTINELS.split(","):
+                host, _, port = hp.strip().partition(":")
+                nodes.append((host, int(port or 26379)))
+            sentinel = Sentinel(
+                nodes,
+                socket_timeout=5,
+                password=REDIS_PASSWORD,
+                sentinel_kwargs={"password": REDIS_PASSWORD} if REDIS_PASSWORD else {},
+            )
+            # master_for() re-resolves on every failover, so a promotion costs a
+            # reconnect rather than a stream of READONLY errors.
+            self._client = sentinel.master_for(
+                REDIS_SENTINEL_MASTER,
+                socket_timeout=5,
+                password=REDIS_PASSWORD,
+                health_check_interval=30,
+            )
+        else:
+            self._client = redis.Redis(
+                host=REDIS_HOST, port=REDIS_PORT,
+                password=REDIS_PASSWORD,
+                socket_timeout=5, socket_connect_timeout=5,
+                health_check_interval=30,
+            )
         self._client.ping()          # fail at open(), not on the first row
 
         self._ann = WRITE_ANN_INDEX

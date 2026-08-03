@@ -1,0 +1,29 @@
+# Production Feast config. The dev equivalent is feature_store.yaml.
+#
+# The only material difference is the online store: Sentinel instead of a fixed
+# host, so a primary failure is a client-side re-discovery rather than an outage.
+# Feast speaks Sentinel natively, so this is configuration, not code.
+
+project: petafs
+provider: local
+
+registry:
+  path: data/registry.db
+  # Invariant 8 — versioning changes the hashed feature-view name, and our sink
+  # hashes the raw name. Must stay false.
+  enable_online_feature_view_versioning: false
+
+online_store:
+  type: redis
+  redis_type: redis_sentinel
+  sentinel_master: mymaster
+  # Sentinel addresses, not the data nodes: the client asks Sentinel who the
+  # current master is. Production lists three sentinels so they have quorum.
+  connection_string: "localhost:26379"
+  password: ${REDIS_PASSWORD}
+  key_ttl_seconds: 1800
+
+offline_store:
+  type: file
+
+entity_key_serialization_version: 3

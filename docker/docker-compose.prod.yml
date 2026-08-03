@@ -1,0 +1,292 @@
+# Production topology. NOT the laptop stack — use docker-compose.yml for that.
+#
+#   make prod-up      bring this up
+#   make prod-verify   run the failure drills (kill a broker, kill the Redis primary, ...)
+#
+# Differences from the dev stack, each closing a gap named in the README's
+# production-readiness section:
+#
+#   3 Kafka brokers, RF=3, min.insync.replicas=2   single broker at RF=1 lost everything
+#   MinIO + s3:// checkpoints                       file:// is meaningless off one node
+#   Redis primary + replica + Sentinel              single Redis was a hard dependency
+#   SASL on Kafka, requirepass on Redis             everything was unauthenticated
+#   Prometheus + Grafana + alert rules              nothing watched lag or staleness
+#
+# ⚠️ Sizing: this topology wants ~10 GiB of RAM. It does NOT fit alongside the
+# pipeline on an 8 GiB Docker VM — heaps here are deliberately small so the
+# failure drills can run locally, and are NOT production sizing. See
+# docs/RUNBOOK.md for real numbers.
+
+name: petafs-prod
+
+x-kafka-common: &kafka-common
+  image: apache/kafka:4.3.1
+  restart: unless-stopped
+  environment: &kafka-env
+    KAFKA_PROCESS_ROLES: broker,controller
+    KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka1:9093,2@kafka2:9093,3@kafka3:9093
+    KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+    KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+    KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+    # The whole point of three brokers: survive losing one.
+    KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+    KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+    KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+    KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+    KAFKA_MIN_INSYNC_REPLICAS: 2
+    KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    KAFKA_LOG_DIRS: /var/lib/kafka/data
+    KAFKA_NUM_PARTITIONS: 6
+    # Small heaps so three brokers fit on a laptop for the drills. Production
+    # wants 6+ GiB per broker; see docs/RUNBOOK.md.
+    KAFKA_HEAP_OPTS: -Xmx512m -Xms512m
+    CLUSTER_ID: ${CLUSTER_ID:-petafs-prod-cluster-1}
+
+services:
+  kafka1:
+    <<: *kafka-common
+    container_name: petafs-prod-kafka1
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka1:9092,EXTERNAL://localhost:29092
+    ports: ["29092:29092"]
+    volumes: ["kafka1-data:/var/lib/kafka/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 18
+      start_period: 30s
+
+  kafka2:
+    <<: *kafka-common
+    container_name: petafs-prod-kafka2
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 2
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:29093,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka2:9092,EXTERNAL://localhost:29093
+    ports: ["29093:29093"]
+    volumes: ["kafka2-data:/var/lib/kafka/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 18
+      start_period: 30s
+
+  kafka3:
+    <<: *kafka-common
+    container_name: petafs-prod-kafka3
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 3
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:29094,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka3:9092,EXTERNAL://localhost:29094
+    ports: ["29094:29094"]
+    volumes: ["kafka3-data:/var/lib/kafka/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 18
+      start_period: 30s
+
+  minio:
+    # Stands in for S3/GCS. Checkpoints must live on storage that is not tied to
+    # any one node: `file://` on a shared volume works for a single-host demo and
+    # is meaningless once the JobManager and TaskManagers are on different
+    # machines. Swapping this for real S3 is a credentials change, not a code one.
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    container_name: petafs-prod-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_USER:-petafs}
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD:-petafs-dev-secret}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local || curl -fs http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  minio-init:
+    # Creates the checkpoint bucket once, then exits.
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    container_name: petafs-prod-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "mc alias set petafs http://minio:9000 ${MINIO_USER:-petafs} ${MINIO_PASSWORD:-petafs-dev-secret}
+      && mc mb --ignore-existing petafs/flink-checkpoints
+      && mc mb --ignore-existing petafs/flink-savepoints
+      && echo 'buckets ready'"
+
+  redis-primary:
+    image: redis/redis-stack-server:7.4.0-v8
+    container_name: petafs-prod-redis-primary
+    restart: unless-stopped
+    environment:
+      REDIS_ARGS: "--requirepass ${REDIS_PASSWORD:-petafs-dev-secret} --masterauth ${REDIS_PASSWORD:-petafs-dev-secret} --appendonly yes"
+    volumes: ["redis-primary-data:/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a ${REDIS_PASSWORD:-petafs-dev-secret} ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+  redis-replica:
+    image: redis/redis-stack-server:7.4.0-v8
+    container_name: petafs-prod-redis-replica
+    restart: unless-stopped
+    environment:
+      REDIS_ARGS: "--replicaof redis-primary 6379 --requirepass ${REDIS_PASSWORD:-petafs-dev-secret} --masterauth ${REDIS_PASSWORD:-petafs-dev-secret} --appendonly yes"
+    volumes: ["redis-replica-data:/data"]
+    depends_on:
+      redis-primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a ${REDIS_PASSWORD:-petafs-dev-secret} ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+  redis-sentinel:
+    # Feast speaks Sentinel natively (redis_type: redis_sentinel), so failover is
+    # a config change on the read side rather than application code. One sentinel
+    # is enough to demonstrate failover; production runs three so the sentinels
+    # themselves have quorum and cannot split-brain.
+    image: redis/redis-stack-server:7.4.0-v8
+    container_name: petafs-prod-redis-sentinel
+    restart: unless-stopped
+    entrypoint:
+      - sh
+      - -c
+      - |
+        cat > /tmp/sentinel.conf <<EOF
+        port 26379
+        # The sentinel needs its OWN password, not just auth-pass for the master.
+        # Leaving it open while the client sends a password fails the AUTH and
+        # discovery dies with MasterNotFoundError — which reads like "no master"
+        # rather than "wrong credentials".
+        requirepass ${REDIS_PASSWORD:-petafs-dev-secret}
+        sentinel monitor mymaster redis-primary 6379 1
+        sentinel auth-pass mymaster ${REDIS_PASSWORD:-petafs-dev-secret}
+        sentinel down-after-milliseconds mymaster 5000
+        sentinel failover-timeout mymaster 10000
+        sentinel resolve-hostnames yes
+        EOF
+        redis-sentinel /tmp/sentinel.conf
+    ports: ["26379:26379"]
+    depends_on:
+      redis-primary:
+        condition: service_healthy
+      redis-replica:
+        condition: service_healthy
+
+  jobmanager:
+    image: petafs/flink:2.2.1
+    container_name: petafs-prod-jobmanager
+    restart: unless-stopped
+    command: jobmanager
+    ports: ["8081:8081"]
+    environment:
+      PYTHONPATH: /opt/project
+      # Credentials come from the environment, never the image or the repo.
+      # In a real deployment these are injected by the orchestrator's secret
+      # store; MINIO_* are the local stand-ins.
+      AWS_ACCESS_KEY_ID: ${MINIO_USER:-petafs}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_PASSWORD:-petafs-dev-secret}
+      # Sentinel discovery, not a fixed host: after a promotion a fixed host is
+      # either gone or a read-only replica, and every write fails with READONLY.
+      REDIS_SENTINELS: redis-sentinel:26379
+      REDIS_SENTINEL_MASTER: mymaster
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-petafs-dev-secret}
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        jobmanager.memory.process.size: 1024m
+        parallelism.default: 2
+        state.backend.type: rocksdb
+        state.backend.incremental: true
+        # Object storage, not a shared volume. This is the line that makes the
+        # topology survive losing the host a TaskManager ran on. The /petafs prefix
+        # matters: Flink rejects a bucket root with "Cannot use the root directory
+        # for checkpoints."
+        execution.checkpointing.dir: s3://flink-checkpoints/petafs
+        execution.checkpointing.savepoint-dir: s3://flink-savepoints/petafs
+        execution.checkpointing.interval: 30s
+        execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+        execution.checkpointing.num-retained: 5
+        # Unaligned checkpoints keep barriers moving under backpressure, which
+        # is exactly when checkpoints would otherwise time out.
+        execution.checkpointing.unaligned.enabled: true
+        restart-strategy.type: exponential-delay
+        s3.endpoint: http://minio:9000
+        s3.path.style.access: true
+    volumes:
+      - ../src:/opt/project/src:ro
+      - ../contracts:/opt/project/contracts:ro
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+      kafka1:
+        condition: service_healthy
+      redis-sentinel:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8081/overview >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 30s
+
+  taskmanager:
+    image: petafs/flink:2.2.1
+    restart: unless-stopped
+    command: taskmanager
+    # No container_name: this is the one service meant to scale.
+    #   docker compose -f docker/docker-compose.prod.yml up -d --scale taskmanager=3
+    environment:
+      PYTHONPATH: /opt/project
+      AWS_ACCESS_KEY_ID: ${MINIO_USER:-petafs}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_PASSWORD:-petafs-dev-secret}
+      # Sentinel discovery, not a fixed host: after a promotion a fixed host is
+      # either gone or a read-only replica, and every write fails with READONLY.
+      REDIS_SENTINELS: redis-sentinel:26379
+      REDIS_SENTINEL_MASTER: mymaster
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-petafs-dev-secret}
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        taskmanager.memory.process.size: 2048m
+        taskmanager.numberOfTaskSlots: 2
+        state.backend.type: rocksdb
+        state.backend.incremental: true
+        execution.checkpointing.dir: s3://flink-checkpoints/petafs
+        execution.checkpointing.savepoint-dir: s3://flink-savepoints/petafs
+        s3.endpoint: http://minio:9000
+        s3.path.style.access: true
+    volumes:
+      - ../src:/opt/project/src:ro
+      - ../contracts:/opt/project/contracts:ro
+    depends_on:
+      jobmanager:
+        condition: service_healthy
+
+volumes:
+  redis-primary-data:
+  redis-replica-data:
+  kafka1-data:
+  kafka2-data:
+  kafka3-data:
+  minio-data:

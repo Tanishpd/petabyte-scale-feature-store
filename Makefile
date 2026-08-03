@@ -31,7 +31,8 @@ endif
 .DEFAULT_GOAL := help
 .PHONY: help bootstrap build up down restart ps logs health topics sample tail-topic topic-count \
         produce submit apply seed registry read bench test smoke clean nuke \
-        verify-seed verify-windows bench-embed similar
+        verify-seed verify-windows bench-embed similar \
+        prod-up prod-down prod-clean prod-ps prod-submit prod-drill
 
 help:  ## Show this help
 	@echo "Petabyte-Scale Feature Store — available targets:"
@@ -183,3 +184,31 @@ bench-embed:  ## Measure embedding throughput and prove batching pays
 
 similar:  ## Find behaviourally similar users (USER=1 K=5) — RediSearch KNN
 	$(PY) src/serving/similar_users.py $(if $(USER),--user $(USER),) $(if $(K),--k $(K),)
+
+# ---------------------------------------------------- production topology ---
+# Separate from the dev stack. See docs/RUNBOOK.md.
+
+PROD_COMPOSE := docker compose -f docker/docker-compose.prod.yml
+PROD_KAFKA   := kafka1:9092,kafka2:9092,kafka3:9092
+
+prod-up:  ## Start the production topology (3 brokers, MinIO, Redis HA)
+	@echo ">>> ~10 GiB of RAM. Stop the dev stack first: make down"
+	$(PROD_COMPOSE) up -d
+	@echo ">>> Flink UI http://localhost:8081   MinIO console http://localhost:9001"
+
+prod-down:  ## Stop the production topology (volumes kept)
+	$(PROD_COMPOSE) down
+
+prod-clean:  ## Stop it and drop the volumes
+	$(PROD_COMPOSE) down -v
+
+prod-ps:  ## Production container status
+	$(PROD_COMPOSE) ps
+
+prod-submit:  ## Submit the pipeline against the production topology
+	$(PROD_COMPOSE) exec -T jobmanager flink run -d -py /opt/project/src/flink/streaming_job.py \
+	  --no-wait --sink redis --bootstrap $(PROD_KAFKA) --topic $(TOPIC) \
+	  $(if $(FROM_START),--startup-mode earliest-offset,)
+
+prod-drill:  ## Run the failure drills (kill a broker, kill the redis master)
+	bash scripts/failure_drills.sh
