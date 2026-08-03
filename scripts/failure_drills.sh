@@ -18,9 +18,20 @@ step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 ok()   { printf '  \033[32mPASS\033[0m %s\n' "$*"; pass=$((pass+1)); }
 bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$*"; fail=$((fail+1)); }
 
+# Every kafka CLI call needs credentials now that SASL is on. Without them the
+# call returns nothing, which reads as "no data" rather than "not authenticated"
+# — that silently skipped Drill 1 the first time.
+kafka_client_config() {
+  $P exec -T kafka1 sh -c "cat > /tmp/drill.properties <<'EOF'
+security.protocol=SASL_PLAINTEXT
+sasl.mechanism=PLAIN
+sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username=\"${KAFKA_USER:-petafs}\" password=\"${KAFKA_PASSWORD:-petafs-dev-secret}\";
+EOF" >/dev/null 2>&1
+}
 kafka_records() {
   $P exec -T kafka1 /opt/kafka/bin/kafka-get-offsets.sh \
-    --bootstrap-server kafka1:9092 --topic "${1:-transactions}" 2>/dev/null \
+    --bootstrap-server kafka1:9092 --topic "${1:-transactions}" \
+    --command-config /tmp/drill.properties 2>/dev/null \
     | awk -F: '{s+=$3} END {print s+0}'
 }
 sentinel_master() {
@@ -29,6 +40,7 @@ sentinel_master() {
 }
 
 # ---------------------------------------------------------------------------
+kafka_client_config
 step "Drill 1 — lose a Kafka broker"
 # RF=3 with min.insync.replicas=2 should ride this out: leadership moves, ISR
 # shrinks to 2, and nothing is lost. At RF=1 the same kill loses a third of the
@@ -45,7 +57,7 @@ else
   # Count partitions whose ISR has exactly 2 members. Anchoring with `$` fails:
   # the describe line continues with Elr: / LastKnownElr: columns.
   UNDER=$($P exec -T kafka1 /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka1:9092 \
-          --describe --topic transactions 2>/dev/null \
+          --describe --topic transactions --command-config /tmp/drill.properties 2>/dev/null \
           | grep -oE "Isr: [0-9]+(,[0-9]+)*" | awk -F, 'NF==2' | wc -l | tr -d " ")
   [ "${UNDER:-0}" -gt 0 ] && ok "ISR shrank to 2 but stayed at min.insync.replicas" \
                           || bad "unexpected ISR state"
@@ -53,7 +65,7 @@ else
   $P up -d kafka2 >/dev/null 2>&1
   for _ in $(seq 1 20); do
     FULL=$($P exec -T kafka1 /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka1:9092 \
-           --describe --topic transactions 2>/dev/null \
+           --describe --topic transactions --command-config /tmp/drill.properties 2>/dev/null \
            | grep -oE "Isr: [0-9]+(,[0-9]+)*" | awk -F, 'NF==3' | wc -l | tr -d " ")
     [ "${FULL:-0}" -ge 6 ] && break
     sleep 5
@@ -135,6 +147,22 @@ if docker exec petafs-prod-redis-primary redis-cli PING 2>&1 | grep -q NOAUTH; t
   ok "redis rejects unauthenticated clients"
 else
   bad "redis answered without credentials"
+fi
+
+# Kafka: an authenticated client must work and an unauthenticated one must not.
+$P exec -T kafka1 sh -c 'printf "security.protocol=SASL_PLAINTEXT\nsasl.mechanism=PLAIN\nsasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username=\"'"${KAFKA_USER:-petafs}"'\" password=\"'"${KAFKA_PASSWORD:-petafs-dev-secret}"'\";\n" > /tmp/d.properties' >/dev/null 2>&1
+if $P exec -T kafka1 /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka1:9092 \
+     --command-config /tmp/d.properties --list >/dev/null 2>&1; then
+  ok "kafka accepts an authenticated client"
+else
+  bad "kafka refused a correctly authenticated client"
+fi
+if $P exec -T kafka1 sh -c '/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka1:9092 --list --command-config /dev/null 2>&1 | head -1' 2>/dev/null | grep -qiE "list|^$"; then
+  # An unauthenticated client cannot list topics; anything non-empty here is a
+  # timeout/error string rather than a topic list.
+  UNAUTH=$($P exec -T kafka1 sh -c 'timeout 25 /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka1:9092 --list 2>/dev/null | wc -l' 2>/dev/null | tr -d " ")
+  [ "${UNAUTH:-0}" -eq 0 ] && ok "kafka rejects unauthenticated clients" \
+                           || bad "kafka listed $UNAUTH topics without credentials"
 fi
 
 printf '\n\033[1m== %d passed, %d failed ==\033[0m\n' "$pass" "$fail"

@@ -135,18 +135,13 @@ the claims below.
 | Single broker, RF=1 | 3 brokers, RF=3, `min.insync.replicas=2` | Killed a broker: ISR 3→2, **zero data loss**, writes continued at `acks=all`, broker rejoined |
 | State lost on restart | Checkpoints to object storage (MinIO → S3) | Killed the TaskManager: restored from `s3://.../chk-N`, Kafka offsets recovered with it |
 | Single Redis | primary + replica + Sentinel; the sink discovers the master | Killed the master: promotion in ~9 s, 8,018 keys intact, writes resumed |
-| Redis unauthenticated | `requirepass` on nodes *and* Sentinel | `NOAUTH Authentication required` without credentials |
+| Nothing authenticated | SASL/PLAIN on Kafka; `requirepass` on Redis nodes *and* Sentinel | Authenticated clients work, unauthenticated are refused — on both |
 | Nothing watched it | Prometheus + 5 alerts on lag, checkpoints, restarts, backpressure, feature staleness | 2/2 scrape targets up, rules loaded |
 | Tests never ran | CI on every push, **fails on any skip** | A skipped round-trip test is the same as no test |
+| Nothing proved any of it | `make prod-drill` — 10 assertions | **10/10 passing** against the live topology |
 
 **Still open, honestly:**
 
-- **Kafka SASL is written but not working end to end.** `docker-compose.sasl.yml`
-  is an opt-in overlay. Broker-side it is verified — authenticated clients work,
-  unauthenticated ones are refused, authenticated healthchecks pass — but
-  `flink run` hangs during submission against SASL brokers and the cause was not
-  found. It is deliberately kept OUT of the base topology so the verified stack
-  stays verified. Treat it as unfinished, not as a feature.
 - **One sentinel, not three.** Enough to demonstrate failover, not enough for
   quorum. The drills exposed why that matters — see the split-brain trap in
   [RUNBOOK §4](docs/RUNBOOK.md).
@@ -160,10 +155,10 @@ the claims below.
   calls. Mitigated by refreshing the registry, root cause unknown
   ([SCALING §8](docs/SCALING.md)).
 
-So: **the durability and availability story is real and tested; the security
-story is half-done and the deployment story is single-host.** Operationally it is
-a credible reference topology, not something to put on a revenue path without
-finishing the list above.
+So: **durability, availability and authentication are real and tested; the
+deployment story is still single-host and there is no TLS.** Operationally it is
+a credible reference topology — 10/10 failure drills — but three brokers on one
+machine survive a process failure, not a datacentre one.
 
 ## Documentation
 

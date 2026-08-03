@@ -49,12 +49,25 @@ KAFKA_USER = os.environ.get("KAFKA_USER", "")
 KAFKA_PASSWORD = os.environ.get("KAFKA_PASSWORD", "")
 
 
+#: The Kafka connector is a SHADED fat jar, so its login modules live under a
+#: relocated package. `flink-sql-connector-kafka-5.0.0-2.2.jar` contains
+#: org/apache/flink/kafka/shaded/org/apache/kafka/common/security/plain/PlainLoginModule
+#: and NOT the plain org.apache.kafka one. Naming the unshaded class in
+#: sasl.jaas.config produces a LoginException that surfaces as `flink run`
+#: HANGING during submission rather than failing — there is no "class not found"
+#: anywhere obvious. The broker config and the kafka-python producer use the
+#: unshaded name; only this connector needs the relocated one.
+SHADED_PLAIN_LOGIN_MODULE = (
+    "org.apache.flink.kafka.shaded.org.apache.kafka.common.security.plain.PlainLoginModule"
+)
+
+
 def _kafka_security_options() -> str:
     """DDL options for an authenticated broker, or nothing for PLAINTEXT."""
     if not KAFKA_SECURITY_PROTOCOL:
         return ""
     jaas = (
-        "org.apache.kafka.common.security.plain.PlainLoginModule required "
+        f"{SHADED_PLAIN_LOGIN_MODULE} required "
         f'username="{KAFKA_USER}" password="{KAFKA_PASSWORD}";'
     )
     return (

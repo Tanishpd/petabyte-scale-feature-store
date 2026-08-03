@@ -10,7 +10,7 @@
 #   MinIO + s3:// checkpoints                       file:// is meaningless off one node
 #   Redis primary + replica + Sentinel              single Redis was a hard dependency
 #   requirepass on Redis and Sentinel               everything was unauthenticated
-#   (Kafka SASL is an opt-in overlay: docker-compose.sasl.yml — see its header)
+#   SASL/PLAIN on Kafka                             everything was unauthenticated
 #   Prometheus + Grafana + alert rules              nothing watched lag or staleness
 #
 # ⚠️ Sizing: this topology wants ~10 GiB of RAM. It does NOT fit alongside the
@@ -26,7 +26,17 @@ x-kafka-common: &kafka-common
   environment: &kafka-env
     KAFKA_PROCESS_ROLES: broker,controller
     KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka1:9093,2@kafka2:9093,3@kafka3:9093
-    KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+    KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:SASL_PLAINTEXT,EXTERNAL:SASL_PLAINTEXT,CONTROLLER:PLAINTEXT
+    # SASL/PLAIN on both client-facing listeners. CONTROLLER stays PLAINTEXT: it
+    # is never exposed outside the compose network, and securing the KRaft
+    # quorum has a bootstrap-ordering problem (SCRAM credentials live in the
+    # metadata log the quorum is forming). Production uses mTLS between brokers.
+    KAFKA_SASL_ENABLED_MECHANISMS: PLAIN
+    KAFKA_SASL_MECHANISM_INTER_BROKER_PROTOCOL: PLAIN
+    KAFKA_LISTENER_NAME_INTERNAL_PLAIN_SASL_JAAS_CONFIG: |
+      org.apache.kafka.common.security.plain.PlainLoginModule required username="${KAFKA_USER:-petafs}" password="${KAFKA_PASSWORD:-petafs-dev-secret}" user_${KAFKA_USER:-petafs}="${KAFKA_PASSWORD:-petafs-dev-secret}";
+    KAFKA_LISTENER_NAME_EXTERNAL_PLAIN_SASL_JAAS_CONFIG: |
+      org.apache.kafka.common.security.plain.PlainLoginModule required username="${KAFKA_USER:-petafs}" password="${KAFKA_PASSWORD:-petafs-dev-secret}" user_${KAFKA_USER:-petafs}="${KAFKA_PASSWORD:-petafs-dev-secret}";
     KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
     KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
     # The whole point of three brokers: survive losing one.
@@ -55,7 +65,15 @@ services:
     ports: ["29092:29092"]
     volumes: ["kafka1-data:/var/lib/kafka/data"]
     healthcheck:
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      # Must authenticate. An unauthenticated healthcheck against a SASL broker
+      # fails forever: every broker reports unhealthy and anything gated on
+      # `depends_on: service_healthy` silently never starts. The symptom reads
+      # as "Flink won't come up", not "auth is misconfigured".
+      test:
+        - CMD-SHELL
+        - |
+          printf 'security.protocol=SASL_PLAINTEXT\nsasl.mechanism=PLAIN\nsasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="${KAFKA_USER:-petafs}" password="${KAFKA_PASSWORD:-petafs-dev-secret}";\n' > /tmp/hc.properties
+          /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 --command-config /tmp/hc.properties >/dev/null 2>&1
       interval: 10s
       timeout: 10s
       retries: 18
@@ -72,7 +90,15 @@ services:
     ports: ["29093:29093"]
     volumes: ["kafka2-data:/var/lib/kafka/data"]
     healthcheck:
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      # Must authenticate. An unauthenticated healthcheck against a SASL broker
+      # fails forever: every broker reports unhealthy and anything gated on
+      # `depends_on: service_healthy` silently never starts. The symptom reads
+      # as "Flink won't come up", not "auth is misconfigured".
+      test:
+        - CMD-SHELL
+        - |
+          printf 'security.protocol=SASL_PLAINTEXT\nsasl.mechanism=PLAIN\nsasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="${KAFKA_USER:-petafs}" password="${KAFKA_PASSWORD:-petafs-dev-secret}";\n' > /tmp/hc.properties
+          /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 --command-config /tmp/hc.properties >/dev/null 2>&1
       interval: 10s
       timeout: 10s
       retries: 18
@@ -89,7 +115,15 @@ services:
     ports: ["29094:29094"]
     volumes: ["kafka3-data:/var/lib/kafka/data"]
     healthcheck:
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      # Must authenticate. An unauthenticated healthcheck against a SASL broker
+      # fails forever: every broker reports unhealthy and anything gated on
+      # `depends_on: service_healthy` silently never starts. The symptom reads
+      # as "Flink won't come up", not "auth is misconfigured".
+      test:
+        - CMD-SHELL
+        - |
+          printf 'security.protocol=SASL_PLAINTEXT\nsasl.mechanism=PLAIN\nsasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="${KAFKA_USER:-petafs}" password="${KAFKA_PASSWORD:-petafs-dev-secret}";\n' > /tmp/hc.properties
+          /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 --command-config /tmp/hc.properties >/dev/null 2>&1
       interval: 10s
       timeout: 10s
       retries: 18
@@ -214,6 +248,10 @@ services:
       REDIS_SENTINELS: redis-sentinel:26379
       REDIS_SENTINEL_MASTER: mymaster
       REDIS_PASSWORD: ${REDIS_PASSWORD:-petafs-dev-secret}
+      KAFKA_SECURITY_PROTOCOL: SASL_PLAINTEXT
+      KAFKA_SASL_MECHANISM: PLAIN
+      KAFKA_USER: ${KAFKA_USER:-petafs}
+      KAFKA_PASSWORD: ${KAFKA_PASSWORD:-petafs-dev-secret}
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: jobmanager
         jobmanager.memory.process.size: 1024m
@@ -270,6 +308,10 @@ services:
       REDIS_SENTINELS: redis-sentinel:26379
       REDIS_SENTINEL_MASTER: mymaster
       REDIS_PASSWORD: ${REDIS_PASSWORD:-petafs-dev-secret}
+      KAFKA_SECURITY_PROTOCOL: SASL_PLAINTEXT
+      KAFKA_SASL_MECHANISM: PLAIN
+      KAFKA_USER: ${KAFKA_USER:-petafs}
+      KAFKA_PASSWORD: ${KAFKA_PASSWORD:-petafs-dev-secret}
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: jobmanager
         taskmanager.memory.process.size: 2048m

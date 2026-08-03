@@ -26,20 +26,7 @@ live in `scripts/failure_drills.sh`.
 | Redis master dies | Sentinel promotes the replica; the sink re-discovers and keeps writing | promotion in ~9 s; 8,018 keys replicated |
 | Unauthenticated client | Rejected | `NOAUTH Authentication required` on both Redis and Sentinel |
 
-### Kafka SASL — unfinished
-
-`docker-compose.sasl.yml` overlays SASL/PLAIN onto the brokers. Verified:
-authenticated clients work, unauthenticated ones are refused, and authenticated
-healthchecks pass on all three brokers. **Not** verified: the Flink job. The DDL
-is generated correctly (`properties.security.protocol`, `sasl.mechanism`,
-`sasl.jaas.config` all present) but `flink run` hangs during submission instead
-of erroring, and the cause was not identified. The overlay is separate from the
-base file so the 8/8 drills keep running against a topology that works.
-
-One lesson survives regardless: **turning SASL on breaks every healthcheck that
-does not authenticate.** All three brokers go `unhealthy`, and anything gated on
-`depends_on: service_healthy` silently never starts. The symptom presents as
-"Flink won't come up", which sends you looking in the wrong place.
+| Unauthenticated Kafka client | Refused; authenticated one works | SASL/PLAIN on both client listeners |
 
 ## 2. Sizing — the numbers here are NOT production sizing
 
@@ -84,6 +71,21 @@ into a node that Sentinel is allowed to promote.
 **The sentinel needs its own `requirepass`,** not just `auth-pass` for the master.
 An open sentinel plus a password-sending client fails the AUTH, and discovery
 dies with `MasterNotFoundError` rather than an auth error.
+
+**The Kafka connector is a SHADED jar, and SASL needs the relocated login
+module.** `flink-sql-connector-kafka-5.0.0-2.2.jar` ships
+`org/apache/flink/kafka/shaded/org/apache/kafka/common/security/plain/PlainLoginModule`
+and *not* the plain `org.apache.kafka` one. Naming the unshaded class in
+`sasl.jaas.config` throws a `LoginException` that surfaces as **`flink run`
+hanging during submission** — no "class not found" anywhere obvious. The broker
+config and the kafka-python producer use the *unshaded* name; only the Flink
+connector needs the relocated one. This cost the most time of anything here.
+
+**Enabling SASL breaks every unauthenticated Kafka call**, not just clients:
+healthchecks go `unhealthy` so `depends_on: service_healthy` never releases
+(symptom: "Flink won't come up"), and CLI tools like `kafka-get-offsets.sh`
+return empty rather than erroring — which made a failure drill silently skip
+itself while reporting success.
 
 **Flink rejects a bucket root for checkpoints** — `s3://bucket/` fails with
 "Cannot use the root directory for checkpoints". Use a prefix.
