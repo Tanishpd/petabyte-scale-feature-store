@@ -144,5 +144,6 @@ of 1.8 KB was 2.3× optimistic.) The full argument is in [docs/SCALING.md](docs/
 | `make up` fails: port 6379 in use | Expected if you run a system/Homebrew redis. The stack uses **host port 6380** by default and leaves 6379 alone. `REDIS_HOST_PORT=6379 make up` to override. |
 | Restarting Docker Desktop mid-build | Kills the running build. Completed layers are cached, so re-running `make build` resumes rather than starting over. |
 | `Cannot connect to the Docker daemon` | Docker Desktop isn't running. |
+| `Failed to create directory for shared state` | The `flink-state` volume is root-owned from before the Dockerfile created it. `make clean` (drops volumes), then `make build && make up`. |
 | Edited a UDF/sink but the job behaves as before | PyFlink reuses Python worker processes across job submissions, so an edited module may not be reloaded. `docker compose restart taskmanager` after changing Python that runs inside Flink. |
 | Only some users appear in the ANN index | Was a race between task slots on `FT.CREATE`; fixed. If it recurs, check `ensure_index` still treats "index already exists" as success rather than disabling indexing for that slot. |

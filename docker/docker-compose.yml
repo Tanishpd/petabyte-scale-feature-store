@@ -75,10 +75,23 @@ services:
         jobmanager.memory.process.size: 1024m
         parallelism.default: 2
         state.backend.type: rocksdb
+        # Checkpoints must go somewhere BOTH the JobManager and TaskManager can
+        # read, and that outlives a container. Without a checkpoint directory,
+        # `execution.checkpointing.interval` alone buys nothing: in-flight
+        # window state does not survive a restart. Locally that is a shared
+        # named volume; in production it is object storage (s3://, gs://).
+        execution.checkpointing.dir: file:///flink-state/checkpoints
+        execution.checkpointing.savepoint-dir: file:///flink-state/savepoints
         execution.checkpointing.interval: 30s
+        # Keep the last checkpoint when a job is cancelled, so a cancel/resubmit
+        # cycle can resume instead of replaying from the Kafka offset.
+        execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+        execution.checkpointing.num-retained: 3
+        restart-strategy.type: exponential-delay
     volumes:
       - ../src:/opt/project/src:ro
       - ../contracts:/opt/project/contracts:ro
+      - flink-state:/flink-state
     depends_on:
       kafka:
         condition: service_healthy
@@ -104,9 +117,14 @@ services:
         taskmanager.memory.process.size: 2048m
         taskmanager.numberOfTaskSlots: 2
         state.backend.type: rocksdb
+        # Must match the JobManager: the TaskManager writes the checkpoint data
+        # and the JobManager writes the metadata, so both need this path.
+        execution.checkpointing.dir: file:///flink-state/checkpoints
+        execution.checkpointing.savepoint-dir: file:///flink-state/savepoints
     volumes:
       - ../src:/opt/project/src:ro
       - ../contracts:/opt/project/contracts:ro
+      - flink-state:/flink-state
     depends_on:
       jobmanager:
         condition: service_healthy
@@ -128,3 +146,8 @@ services:
       kafka:
         condition: service_healthy
     profiles: ["ui"]   # opt-in: `make up UI=1` — saves ~400 MB when not needed
+
+volumes:
+  # Checkpoint/savepoint storage shared by the JobManager and TaskManager.
+  # Survives `make down`; removed by `make clean` (down -v).
+  flink-state:

@@ -273,3 +273,43 @@ embed to different vectors. Sorting makes the embedding input deterministic.
 
 **Verified.** `make verify-windows` compares Flink against an independent pandas recomputation over 4,433
 (user, window) pairs: `behavior_summary` matches on every row, and the rolling average agrees to 3.6e-12.
+
+---
+
+## ADR-011 — Checkpoints go to a shared volume, not the JobManager
+
+**Decision.** `execution.checkpointing.dir` points at `file:///flink-state/checkpoints` on a Docker named
+volume mounted into **both** the JobManager and the TaskManager. Externalized checkpoints are retained on
+cancellation, three deep, with an exponential-delay restart strategy.
+
+**Why it was a bug, not a nicety.** The compose file already set
+`execution.checkpointing.interval: 30s` and `state.backend.type: rocksdb`, which *looks* like working
+fault tolerance. It was not: with no checkpoint directory configured, storage falls back to the
+JobManager, so in-flight window state did not survive a restart. Nothing warns about this — the job runs,
+checkpoints "succeed", and the gap only shows up the first time something dies. It was found by being
+asked whether the project was production-ready, not by any test.
+
+**Two things that bite when fixing it:**
+
+1. The directory must be reachable from both processes. The TaskManager writes the state data and the
+   JobManager writes the checkpoint metadata, so a bind mount on one service alone silently half-works.
+2. Docker seeds a **fresh named volume's ownership from the image's directory**. The image runs as
+   `flink`, the volume is created root-owned, and the job dies at submission with
+   `FlinkRuntimeException: Failed to create checkpoint storage at checkpoint coordinator side ... Failed
+   to create directory for shared state`. The fix is `mkdir -p` + `chown flink:flink` in the Dockerfile,
+   *before* the volume is first mounted — an existing root-owned volume must be removed, not just
+   remounted.
+
+**Verified by killing it.** `docker kill petafs-taskmanager` mid-job, then restart:
+
+```
+CheckpointCoordinator - Restoring job fc99819e... from Checkpoint 16
+SourceCoordinator     - Recovering subtask 0 to checkpoint 16 for source
+REST /checkpoints     - restored: {id: 16, external_path: file:/flink-state/checkpoints/.../chk-16}
+```
+
+Kafka source offsets recover with the operator state, so the job resumes rather than replaying. ⓜ 16
+checkpoints completed before the kill, 778 KB state, 105 ms each.
+
+**Production.** `file://` on a shared volume is correct for a single-node local stack and wrong for a
+cluster — there, this becomes `s3://` or `gs://`, which is a one-line change to the same key.

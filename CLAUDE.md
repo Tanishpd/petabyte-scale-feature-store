@@ -129,6 +129,11 @@ Invariant 4. Override with `REDIS_HOST_PORT=6379`.
   execute DataStream jobs with `stream_env.execute_async(name)` — not `t_env.execute(...)`.
 - **A `UnixTimestamp` feature is written as int64 seconds and read back as a `datetime`.** Same instant,
   different Python type; comparing the raw int to the read value looks like a mismatch when it isn't.
+- **`execution.checkpointing.interval` alone is not fault tolerance.** Without
+  `execution.checkpointing.dir`, storage falls back to the JobManager and state does not survive a
+  restart — with no warning. The directory must be mounted into *both* flink services, and because
+  Docker seeds a new named volume's ownership from the image, the Dockerfile has to `mkdir` + `chown
+  flink:flink` it or the job dies with "Failed to create directory for shared state". See ADR-011.
 - **PyFlink caches Python modules across job submissions.** Worker processes are reused within a
   TaskManager, so cancelling and resubmitting a job does *not* reload edited UDF/sink code — the old
   module keeps running and the change appears to have no effect. `docker compose restart taskmanager`

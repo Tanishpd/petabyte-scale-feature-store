@@ -63,6 +63,16 @@ print('baked', '${EMBEDDING_MODEL}', 'dim=', v.shape[-1])"
 ENV HF_HUB_OFFLINE=1
 ENV TRANSFORMERS_OFFLINE=1
 
+# --- checkpoint storage ----------------------------------------------------
+# The compose file mounts a named volume here. Docker seeds a fresh named
+# volume's ownership from the image's directory, so this mkdir+chown is what
+# makes the volume writable by the `flink` user. Without it the JobManager
+# fails at job start with:
+#   FlinkRuntimeException: Failed to create checkpoint storage at checkpoint
+#   coordinator side ... Failed to create directory for shared state
+RUN mkdir -p /flink-state/checkpoints /flink-state/savepoints \
+    && chown -R flink:flink /flink-state
+
 # Flink launches Python workers as `python`; make sure it is the venv one.
 ENV PYFLINK_PYTHON=/opt/venv/bin/python
 
