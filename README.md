@@ -139,23 +139,27 @@ the claims below.
 | Nothing watched it | Prometheus + 5 alerts on lag, checkpoints, restarts, backpressure, feature staleness | 2/2 scrape targets up, rules loaded |
 | Tests never ran | CI on every push, **fails on any skip** | A skipped round-trip test is the same as no test |
 | Sentinel could split-brain | 3 sentinels, quorum 2, config-file Redis so promotions persist | Killed the master, restarted the old one: it rejoins as a replica, exactly one master, all 3 sentinels agree |
-| Nothing proved any of it | `make prod-drill` — 12 assertions | **12/12 passing** against the live topology |
+| Everything in the clear | **TLS on Redis and Sentinel**, plaintext listener removed (`port 0`), replication encrypted | Plaintext client refused; TLS client works; replication link up over TLS |
+| Nothing proved any of it | `make prod-drill` — 15 assertions | **15/15 passing** against the live topology |
 
 **Still open, honestly:**
 
 - **Single-host.** Three brokers on one machine survive a *process* failure, not
   a *host* failure. Real fault tolerance needs separate failure domains.
-- **No TLS anywhere**, and secrets are compose env vars with dev defaults, not a
-  secret store.
+- **Kafka is SASL_PLAINTEXT, not SASL_SSL.** Redis and Sentinel are TLS-only;
+  Kafka authenticates but does not encrypt. Adding it means JKS keystores and a
+  broker restart — the certs and CA already exist (`make prod-tls`).
+- **Secrets are compose env vars with dev defaults**, not a secret store.
 - **Feast internals dependency** ([ADR-003](docs/DECISIONS.md)). CI is the
   tripwire; a supported path would be `write_to_online_store`, at the cost of a hop.
 - **One unexplained behaviour**: a long-lived `FeatureStore` drifts 2.7× over 200
   calls. Mitigated by refreshing the registry, root cause unknown
   ([SCALING §8](docs/SCALING.md)).
 
-So: **durability, availability and authentication are real and tested; the
-deployment story is still single-host and there is no TLS.** Operationally it is
-a credible reference topology — 12/12 failure drills — but three brokers on one
+So: **durability, availability, authentication and Redis transport security are
+real and tested; the deployment story is still single-host and Kafka's transport
+is unencrypted.** Operationally it is
+a credible reference topology — 15/15 failure drills — but three brokers on one
 machine survive a process failure, not a datacentre one.
 
 ## Documentation

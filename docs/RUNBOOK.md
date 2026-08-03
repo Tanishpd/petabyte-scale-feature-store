@@ -27,6 +27,24 @@ live in `scripts/failure_drills.sh`.
 | Unauthenticated client | Rejected | `NOAUTH Authentication required` on both Redis and Sentinel |
 
 | Unauthenticated Kafka client | Refused; authenticated one works | SASL/PLAIN on both client listeners |
+| Plaintext Redis client | Refused — the listener does not exist | `port 0` + `tls-port 6379`; replication encrypted too |
+
+### TLS
+
+`make prod-tls` generates a local CA and per-service certs into `docker/tls/out/`
+(gitignored). Redis and Sentinel are **TLS-only**: `port 0` removes the plaintext
+listener entirely, so a password-only client cannot connect at all rather than
+falling back to an unencrypted session. `tls-replication yes` encrypts the
+primary→replica stream, which otherwise carries every feature value in clear.
+
+Clients verify the server chain (`ssl_cert_reqs=required`); anything less
+encrypts the transport while accepting any certificate. The sentinels are TLS
+too, so `sentinel_kwargs` needs the same settings — otherwise discovery fails
+while the data connection would have worked.
+
+In a real deployment the certs come from your CA or cert-manager and only their
+source changes. **Kafka remains SASL_PLAINTEXT** — authenticated but not
+encrypted; that needs JKS keystores.
 
 ## 2. Sizing — the numbers here are NOT production sizing
 

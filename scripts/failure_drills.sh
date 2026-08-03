@@ -12,6 +12,9 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 P="docker compose -f docker/docker-compose.prod.yml"
 PW="${REDIS_PASSWORD:-petafs-dev-secret}"
+# Redis and Sentinel are TLS-only in the production topology (`port 0` disables
+# the plaintext listener), so every redis-cli call needs --tls and the CA.
+RCLI="redis-cli --tls --cacert /tls/ca.crt"
 
 pass=0; fail=0
 step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
@@ -35,13 +38,13 @@ kafka_records() {
     | awk -F: '{s+=$3} END {print s+0}'
 }
 sentinel_master() {
-  docker exec petafs-prod-redis-sentinel-1 redis-cli -p 26379 -a "$PW" \
+  docker exec petafs-prod-redis-sentinel-1 $RCLI -p 26379 -a "$PW" \
     SENTINEL get-master-addr-by-name mymaster 2>/dev/null | head -1
 }
 count_masters() {
   n=0
   for c in primary replica; do
-    docker exec "petafs-prod-redis-$c" redis-cli -a "$PW" INFO replication 2>/dev/null \
+    docker exec "petafs-prod-redis-$c" $RCLI -a "$PW" INFO replication 2>/dev/null \
       | grep -q "^role:master" && n=$((n+1))
   done
   echo "$n"
@@ -90,13 +93,17 @@ if [ -z "$M0" ]; then
   bad "sentinel is not reporting a master — check credentials"
 else
   echo "  master before: $M0"
-  VICTIM=petafs-prod-redis-primary
-  # `.Networks.petafs-prod_default` does not parse — the hyphen breaks the Go
-  # template field path, it returns empty, and we end up killing the replica
-  # while reporting it as the master. Use index with a quoted key.
-  IP_P=$(docker inspect -f '{{index .NetworkSettings.Networks "petafs-prod_default" "IPAddress"}}' petafs-prod-redis-primary 2>/dev/null)
-  if [ -z "$IP_P" ]; then bad "could not resolve redis-primary IP — check the network name"; fi
-  [ -n "$IP_P" ] && [ "$M0" != "$IP_P" ] && VICTIM=petafs-prod-redis-replica
+  # Pick the victim by asking each node its role, not by matching addresses.
+  # Sentinel is configured with `announce-hostnames yes` so it reports
+  # "redis-primary", while docker inspect gives an IP — comparing the two never
+  # matches and silently killed the replica every time, making a correct
+  # "no promotion" look like a failure.
+  VICTIM=""
+  for c in primary replica; do
+    if docker exec "petafs-prod-redis-$c" $RCLI -a "$PW" INFO replication 2>/dev/null \
+       | grep -q "^role:master"; then VICTIM="petafs-prod-redis-$c"; fi
+  done
+  if [ -z "$VICTIM" ]; then bad "no node reports role:master — cannot pick a victim"; VICTIM=petafs-prod-redis-primary; fi
   docker kill "$VICTIM" >/dev/null 2>&1
   echo "  killed $VICTIM"
 
@@ -108,8 +115,8 @@ else
   [ -n "$M1" ] && [ "$M1" != "$M0" ] && ok "sentinel promoted a new master ($M0 -> $M1)" \
                                      || bad "no promotion (master still $M1)"
 
-  SURV=$(docker exec petafs-prod-redis-replica redis-cli -a "$PW" DBSIZE 2>/dev/null \
-      || docker exec petafs-prod-redis-primary redis-cli -a "$PW" DBSIZE 2>/dev/null)
+  SURV=$(docker exec petafs-prod-redis-replica $RCLI -a "$PW" DBSIZE 2>/dev/null \
+      || docker exec petafs-prod-redis-primary $RCLI -a "$PW" DBSIZE 2>/dev/null)
   [ "${SURV:-0}" -gt 0 ] && ok "features survived the failover ($SURV keys)" \
                          || bad "no keys after failover"
 
@@ -124,7 +131,7 @@ else
                  || bad "$M masters after restart — split brain"
 
   AGREE=$(for n in 1 2 3; do
-            docker exec "petafs-prod-redis-sentinel-$n" redis-cli -p 26379 -a "$PW" \
+            docker exec "petafs-prod-redis-sentinel-$n" $RCLI -p 26379 -a "$PW" \
               SENTINEL get-master-addr-by-name mymaster 2>/dev/null | head -1
           done | sort -u | wc -l | tr -d " ")
   [ "${AGREE:-0}" -eq 1 ] && ok "all three sentinels agree on the master" \
@@ -160,12 +167,12 @@ fi
 
 # ---------------------------------------------------------------------------
 step "Drill 4 — authentication is actually enforced"
-if docker exec petafs-prod-redis-sentinel-1 redis-cli -p 26379 PING 2>&1 | grep -q NOAUTH; then
+if docker exec petafs-prod-redis-sentinel-1 $RCLI -p 26379 PING 2>&1 | grep -q NOAUTH; then
   ok "sentinel rejects unauthenticated clients"
 else
   bad "sentinel answered without credentials"
 fi
-if docker exec petafs-prod-redis-primary redis-cli PING 2>&1 | grep -q NOAUTH; then
+if docker exec petafs-prod-redis-primary $RCLI PING 2>&1 | grep -q NOAUTH; then
   ok "redis rejects unauthenticated clients"
 else
   bad "redis answered without credentials"
@@ -186,6 +193,35 @@ if $P exec -T kafka1 sh -c '/opt/kafka/bin/kafka-topics.sh --bootstrap-server ka
   [ "${UNAUTH:-0}" -eq 0 ] && ok "kafka rejects unauthenticated clients" \
                            || bad "kafka listed $UNAUTH topics without credentials"
 fi
+
+# ---------------------------------------------------------------------------
+step "Drill 5 — transport is encrypted, not just authenticated"
+# `port 0` removes the plaintext listener entirely. A password-only setup would
+# still put every feature value and the password itself on the wire in clear.
+# Assert on the exit code: the error text ("I/O error", "Connection reset",
+# "protocol error") varies by redis-cli version, and matching it made this
+# check fail against a server that was correctly refusing the connection.
+if docker exec petafs-prod-redis-primary sh -c "redis-cli -a '$PW' PING >/dev/null 2>&1"; then
+  bad "redis answered a plaintext client — transport is not encrypted"
+else
+  ok "redis refuses plaintext connections (TLS-only)"
+fi
+if docker exec petafs-prod-redis-primary $RCLI -a "$PW" PING 2>/dev/null | grep -q PONG; then
+  ok "redis answers over TLS"
+else
+  bad "redis did not answer over TLS"
+fi
+# Check whichever node is CURRENTLY the replica. Drill 2 may have swapped the
+# roles, and a master has no master_link_status at all — hardcoding the
+# container name reported a healthy link as down.
+LINK=""
+for c in primary replica; do
+  INFO=$(docker exec "petafs-prod-redis-$c" $RCLI -a "$PW" INFO replication 2>/dev/null)
+  echo "$INFO" | grep -q "^role:slave" || continue
+  LINK=$(echo "$INFO" | grep -o "master_link_status:[a-z]*" | cut -d: -f2)
+done
+[ "$LINK" = "up" ] && ok "replication link is up over TLS (replica -> master)" \
+                   || bad "TLS replication link is '${LINK:-absent}'"
 
 printf '\n\033[1m== %d passed, %d failed ==\033[0m\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

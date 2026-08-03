@@ -46,6 +46,24 @@ REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD") or None
 REDIS_SENTINELS = os.environ.get("REDIS_SENTINELS", "").strip()
 REDIS_SENTINEL_MASTER = os.environ.get("REDIS_SENTINEL_MASTER", "mymaster")
 
+#: CA bundle for verifying the Redis/Sentinel server certificates. Empty means
+#: plaintext (the dev stack). The production topology is TLS-only — `port 0`
+#: disables the plaintext listener — so without this the sink cannot connect at
+#: all rather than silently falling back to an unencrypted connection.
+REDIS_TLS_CA = os.environ.get("REDIS_TLS_CA", "").strip()
+
+
+def _tls_kwargs() -> dict:
+    if not REDIS_TLS_CA:
+        return {}
+    return {
+        "ssl": True,
+        "ssl_ca_certs": REDIS_TLS_CA,
+        # Verify the server chain. `none` would encrypt the transport while
+        # accepting any certificate, which defeats most of the point.
+        "ssl_cert_reqs": "required",
+    }
+
 FLUSH_ROWS = int(os.environ.get("SINK_FLUSH_ROWS", "500"))
 FLUSH_MS = int(os.environ.get("SINK_FLUSH_MS", "100"))
 
@@ -73,11 +91,19 @@ class FeastRedisWriter(MapFunction):
             for hp in REDIS_SENTINELS.split(","):
                 host, _, port = hp.strip().partition(":")
                 nodes.append((host, int(port or 26379)))
+            tls = _tls_kwargs()
+            # The sentinels themselves are TLS too, so sentinel_kwargs needs the
+            # same settings — otherwise discovery fails while the data
+            # connection would have worked.
+            sentinel_kwargs = dict(tls)
+            if REDIS_PASSWORD:
+                sentinel_kwargs["password"] = REDIS_PASSWORD
             sentinel = Sentinel(
                 nodes,
                 socket_timeout=5,
                 password=REDIS_PASSWORD,
-                sentinel_kwargs={"password": REDIS_PASSWORD} if REDIS_PASSWORD else {},
+                sentinel_kwargs=sentinel_kwargs,
+                **tls,
             )
             # master_for() re-resolves on every failover, so a promotion costs a
             # reconnect rather than a stream of READONLY errors.
@@ -86,6 +112,7 @@ class FeastRedisWriter(MapFunction):
                 socket_timeout=5,
                 password=REDIS_PASSWORD,
                 health_check_interval=30,
+                **tls,
             )
         else:
             self._client = redis.Redis(
@@ -93,6 +120,7 @@ class FeastRedisWriter(MapFunction):
                 password=REDIS_PASSWORD,
                 socket_timeout=5, socket_connect_timeout=5,
                 health_check_interval=30,
+                **_tls_kwargs(),
             )
         self._client.ping()          # fail at open(), not on the first row
 

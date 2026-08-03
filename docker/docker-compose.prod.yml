@@ -186,12 +186,27 @@ services:
         masterauth ${REDIS_PASSWORD:-petafs-dev-secret}
         appendonly yes
         dir /data
+        # TLS-only: `port 0` disables the plaintext listener entirely, so an
+        # unencrypted client cannot connect even with the right password.
+        port 0
+        tls-port 6379
+        tls-cert-file /tls/redis-primary.crt
+        tls-key-file /tls/redis-primary.key
+        tls-ca-cert-file /tls/ca.crt
+        # Replication traffic is encrypted too — otherwise the data is in the
+        # clear on the wire between primary and replica.
+        tls-replication yes
+        # Server-authenticated TLS; identity is the password. mTLS
+        # (tls-auth-clients yes + a client cert) is the stronger posture.
+        tls-auth-clients no
         EOF
         fi
         exec redis-server "$$CONF"
-    volumes: ["redis-primary-data:/data"]
+    volumes:
+      - redis-primary-data:/data
+      - ./tls/out:/tls:ro
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli -a ${REDIS_PASSWORD:-petafs-dev-secret} ping | grep -q PONG"]
+      test: ["CMD-SHELL", "redis-cli --tls --cacert /tls/ca.crt -a ${REDIS_PASSWORD:-petafs-dev-secret} ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
       retries: 12
@@ -212,16 +227,31 @@ services:
         masterauth ${REDIS_PASSWORD:-petafs-dev-secret}
         appendonly yes
         dir /data
+        # TLS-only: `port 0` disables the plaintext listener entirely, so an
+        # unencrypted client cannot connect even with the right password.
+        port 0
+        tls-port 6379
+        tls-cert-file /tls/redis-primary.crt
+        tls-key-file /tls/redis-primary.key
+        tls-ca-cert-file /tls/ca.crt
+        # Replication traffic is encrypted too — otherwise the data is in the
+        # clear on the wire between primary and replica.
+        tls-replication yes
+        # Server-authenticated TLS; identity is the password. mTLS
+        # (tls-auth-clients yes + a client cert) is the stronger posture.
+        tls-auth-clients no
         replicaof redis-primary 6379
         EOF
         fi
         exec redis-server "$$CONF"
-    volumes: ["redis-replica-data:/data"]
+    volumes:
+      - redis-replica-data:/data
+      - ./tls/out:/tls:ro
     depends_on:
       redis-primary:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli -a ${REDIS_PASSWORD:-petafs-dev-secret} ping | grep -q PONG"]
+      test: ["CMD-SHELL", "redis-cli --tls --cacert /tls/ca.crt -a ${REDIS_PASSWORD:-petafs-dev-secret} ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
       retries: 12
@@ -238,7 +268,13 @@ services:
         CONF=/data/sentinel.conf
         if [ ! -f "$$CONF" ]; then
           cat > "$$CONF" <<EOF
-        port 26379
+        port 0
+        tls-port 26379
+        tls-cert-file /tls/sentinel.crt
+        tls-key-file /tls/sentinel.key
+        tls-ca-cert-file /tls/ca.crt
+        tls-replication yes
+        tls-auth-clients no
         requirepass ${REDIS_PASSWORD:-petafs-dev-secret}
         sentinel resolve-hostnames yes
         sentinel announce-hostnames yes
@@ -250,7 +286,9 @@ services:
         EOF
         fi
         exec redis-sentinel "$$CONF"
-    volumes: ["redis-sentinel-1-data:/data"]
+    volumes:
+      - redis-sentinel-1-data:/data
+      - ./tls/out:/tls:ro
     ports: ["26379:26379"]
     depends_on:
       redis-primary:
@@ -269,7 +307,13 @@ services:
         CONF=/data/sentinel.conf
         if [ ! -f "$$CONF" ]; then
           cat > "$$CONF" <<EOF
-        port 26379
+        port 0
+        tls-port 26379
+        tls-cert-file /tls/sentinel.crt
+        tls-key-file /tls/sentinel.key
+        tls-ca-cert-file /tls/ca.crt
+        tls-replication yes
+        tls-auth-clients no
         requirepass ${REDIS_PASSWORD:-petafs-dev-secret}
         sentinel resolve-hostnames yes
         sentinel announce-hostnames yes
@@ -281,7 +325,9 @@ services:
         EOF
         fi
         exec redis-sentinel "$$CONF"
-    volumes: ["redis-sentinel-2-data:/data"]
+    volumes:
+      - redis-sentinel-2-data:/data
+      - ./tls/out:/tls:ro
     ports: ["26380:26379"]
     depends_on:
       redis-primary:
@@ -300,7 +346,13 @@ services:
         CONF=/data/sentinel.conf
         if [ ! -f "$$CONF" ]; then
           cat > "$$CONF" <<EOF
-        port 26379
+        port 0
+        tls-port 26379
+        tls-cert-file /tls/sentinel.crt
+        tls-key-file /tls/sentinel.key
+        tls-ca-cert-file /tls/ca.crt
+        tls-replication yes
+        tls-auth-clients no
         requirepass ${REDIS_PASSWORD:-petafs-dev-secret}
         sentinel resolve-hostnames yes
         sentinel announce-hostnames yes
@@ -312,7 +364,9 @@ services:
         EOF
         fi
         exec redis-sentinel "$$CONF"
-    volumes: ["redis-sentinel-3-data:/data"]
+    volumes:
+      - redis-sentinel-3-data:/data
+      - ./tls/out:/tls:ro
     ports: ["26381:26379"]
     depends_on:
       redis-primary:
@@ -338,6 +392,7 @@ services:
       REDIS_SENTINELS: redis-sentinel-1:26379,redis-sentinel-2:26379,redis-sentinel-3:26379
       REDIS_SENTINEL_MASTER: mymaster
       REDIS_PASSWORD: ${REDIS_PASSWORD:-petafs-dev-secret}
+      REDIS_TLS_CA: /tls/ca.crt
       KAFKA_SECURITY_PROTOCOL: SASL_PLAINTEXT
       KAFKA_SASL_MECHANISM: PLAIN
       KAFKA_USER: ${KAFKA_USER:-petafs}
@@ -369,6 +424,7 @@ services:
     volumes:
       - ../src:/opt/project/src:ro
       - ../contracts:/opt/project/contracts:ro
+      - ./tls/out:/tls:ro
     depends_on:
       minio-init:
         condition: service_completed_successfully
@@ -398,6 +454,7 @@ services:
       REDIS_SENTINELS: redis-sentinel-1:26379,redis-sentinel-2:26379,redis-sentinel-3:26379
       REDIS_SENTINEL_MASTER: mymaster
       REDIS_PASSWORD: ${REDIS_PASSWORD:-petafs-dev-secret}
+      REDIS_TLS_CA: /tls/ca.crt
       KAFKA_SECURITY_PROTOCOL: SASL_PLAINTEXT
       KAFKA_SASL_MECHANISM: PLAIN
       KAFKA_USER: ${KAFKA_USER:-petafs}
@@ -417,6 +474,7 @@ services:
     volumes:
       - ../src:/opt/project/src:ro
       - ../contracts:/opt/project/contracts:ro
+      - ./tls/out:/tls:ro
     depends_on:
       jobmanager:
         condition: service_healthy

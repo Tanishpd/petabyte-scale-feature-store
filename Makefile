@@ -32,7 +32,7 @@ endif
 .PHONY: help bootstrap build up down restart ps logs health topics sample tail-topic topic-count \
         produce submit apply seed registry read bench test smoke clean nuke \
         verify-seed verify-windows bench-embed similar \
-        prod-up prod-down prod-clean prod-ps prod-submit prod-drill
+        prod-up prod-down prod-clean prod-ps prod-submit prod-drill prod-tls
 
 help:  ## Show this help
 	@echo "Petabyte-Scale Feature Store — available targets:"
@@ -212,3 +212,6 @@ prod-submit:  ## Submit the pipeline against the production topology
 
 prod-drill:  ## Run the failure drills (kill a broker, kill the redis master)
 	bash scripts/failure_drills.sh
+
+prod-tls:  ## Generate the local CA and service certs for the prod topology
+	bash docker/tls/generate-certs.sh
