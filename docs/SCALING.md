@@ -4,8 +4,8 @@ This repo runs on one laptop. This document is the argument for what the same ar
 scale, which constants govern it, and what breaks first.
 
 > **Numbers marked ⓔ are estimates from published characteristics of the components.**
-> **Numbers marked ⓜ are measured in this repo** and get filled in during Phase 8. Nothing here should
-> stay ⓔ if it can be measured.
+> **Numbers marked ⓜ are measured in this repo.** Nothing here should stay ⓔ if it can be measured;
+> several ⓔ estimates have already been corrected by 2–3× once measured.
 
 ---
 
@@ -18,21 +18,25 @@ fortune and is not what happens. The volume splits sharply:
 |---|---|---|
 | **Raw event log** (Kafka → object storage) | every event, retained | ⓔ ~30 TB/day raw, ~3 TB/day as zstd parquet → **1 PB in ~5 weeks raw** |
 | **Offline store** (training sets, backfills) | historical feature values, point-in-time correct | ⓔ grows with retention — this is the petabyte |
-| **Online store** (Redis) | *current* feature vector per user only | ⓔ **~90 GB** |
+| **Online store** (Redis) | *current* feature vector per user only | ⓜ **~204 GB** |
 
 The online store holds one row per entity, not one row per event. That's the whole trick:
 
 ```
 per-user row = 384 float32 embedding (1536 B)
-             + 8 scalar features      (~90 B)
-             + Feast key/proto overhead (~150 B)
-             ≈ 1.8 KB
+             + 8 protobuf-encoded scalars
+             + Redis hash + Feast key overhead
+             = 4,073 B measured   (MEMORY USAGE, mean over 100 real keys)
 
-50M users × 1.8 KB ≈ 90 GB      → a 6-node Redis cluster with headroom
+50M users × 4.07 KB ≈ 204 GB    → a 6-node Redis cluster, still comfortably
 ```
 
+An earlier draft of this section estimated 1.8 KB and 90 GB from first principles. The measurement
+(§8) came out **2.3× larger** — the embedding is only 38% of the row; Redis hash overhead and protobuf
+framing are the rest. The conclusion is unchanged and the arithmetic is now real.
+
 So: **the offline store scales with events × retention; the online store scales with entities.** A
-petabyte offline and 90 GB online are the same system.
+petabyte offline and 204 GB online are the same system.
 
 ## 2. Event-rate arithmetic
 
@@ -133,13 +137,49 @@ End-to-end, event → readable by a model:
 | Kafka → Flink consume | ⓔ ~5–20 ms |
 | watermark wait (out-of-order allowance) | **30 s** — configured, dominates |
 | window close → embedding → HSET | ⓔ ~5–50 ms |
-| `get_online_features()` | ⓜ target p99 < 10 ms |
+| `get_online_features()` | ⓜ 2.2 ms p99 (single entity) — see §8 |
 
 The 30-second watermark delay dwarfs everything else, and it's a deliberate correctness-vs-latency dial,
 not overhead. Drop it to 1 s and features are near-instant but late events get dropped. This tradeoff is
 the real content of "real-time" — the pipeline machinery is milliseconds; the *semantics* cost seconds.
 
-## 8. Measurement plan (Phase 8)
+## 8. Online read path — measured
+
+`make bench`, idle cluster, 150 live entities, host venv → Redis on :6380.
+
+| | p50 | p99 |
+|---|---|---|
+| raw Redis `HGETALL`, 1 entity | ⓜ 0.19 ms | ⓜ 1.7 ms |
+| `get_online_features`, 1 entity | ⓜ 0.93 ms | ⓜ **2.17 ms** |
+| `get_online_features`, 10 entities | ⓜ 3.49 ms | ⓜ 5.37 ms |
+| `get_online_features`, 100 entities | ⓜ 15.72 ms | ⓜ **22.55 ms** |
+
+Both PLAN targets hold: p99 < 10 ms single, < 25 ms for 100.
+
+**Redis is not the cost.** A single-entity read is 0.19 ms of Redis and 0.74 ms of Feast — proto decode,
+registry lookup, response assembly — so ~79% of the call is Python. 100 keys fetched in one Redis
+pipeline take ⓜ 1.6 ms, versus ⓜ 15.8 ms issued sequentially, so the connection is not the bottleneck
+either. Batching still pays: per-entity cost falls from 0.93 ms to 0.157 ms, ~6× cheaper at 100.
+
+**Per-entity row size: ⓜ 4,073 B** (`MEMORY USAGE`, mean over 100 keys) — more than double §1's 1.8 KB
+estimate. The 384-float embedding is 1,536 B of it; the rest is Redis hash overhead plus 9 protobuf-
+encoded values. Revised: 50M users ≈ **204 GB**, not 90 GB. Still small next to the offline petabyte, and
+still the point of §1 — but the estimate was optimistic by 2.3×.
+
+### An unresolved degradation
+
+Reads through a **single long-lived `FeatureStore` slow down as calls accumulate**: ⓜ 8.1 ms → 21.3 ms
+p50 over 240 calls on a 100-entity read, a 2.6× drift. What is ruled out:
+
+- not elapsed time — 30 s idle changes nothing
+- not a connection leak — Redis stays at 2 `connected_clients`
+- not a Python object leak — no growth in `gc.get_objects()` counts
+- not per-instance — constructing *any* new `FeatureStore` restores speed for existing ones too, so
+  whatever resets is process-global
+
+Cause unidentified. It matters for a long-running model server, and it silently corrupted this
+benchmark before it was noticed: an early run reported a 107 ms p99 that was mostly drift. `make bench`
+now uses a fresh store per batch size and reports the drift separately as section 5.
 
 Replace every ⓔ above with a measurement:
 

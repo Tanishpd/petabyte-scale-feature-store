@@ -1,6 +1,6 @@
 # Build Plan — Petabyte-Scale Feature Store & Streaming Pipeline
 
-> Status: **Phases 0–6 complete** (2026-08-03). Next: Phase 7, serving + latency benchmark.
+> Status: **Phases 0–7 complete** (2026-08-03). Next: Phase 8, scale story + polish.
 > Update the status column as phases land.
 > Every phase has a *verifiable* acceptance criterion. A phase is not done until its check passes.
 
@@ -24,7 +24,7 @@ them back in single-digit milliseconds via `feast.get_online_features()` — wit
 | 4 | Flink aggregation | PyFlink job: Kafka → watermarks → HOP(10min/1min) → print | `make verify-windows`: 4,433 (user, window) pairs match an independent pandas recomputation; rolling avg agrees to 3.6e-12 | ☑ |
 | 5 | Embedding UDF | Pandas UDF (`func_type="pandas"`), model baked into image, offline mode | `make bench-embed`: dim 384, batching 5–7× faster than unbatched, 167 rows/s end-to-end on 2 slots | ☑ |
 | 6 | **Feast-compatible Redis sink** | `sinks/feast_redis_sink.py` using Feast's own key codec | 10 round-trip tests green incl. every contract feature; `make smoke` passes end to end (150 keys, 25/25 users readable) | ☑ |
-| 7 | Serving | `serving/online_read.py` + `serving/benchmark.py` | p99 single-entity read < 10 ms local; 100-entity batch < 25 ms | ☐ |
+| 7 | Serving | `serving/online_read.py` + `serving/benchmark.py` | p99 **2.17 ms** single-entity, **22.55 ms** for 100 — both targets met; Redis is only 21% of the call | ☑ |
 | 8 | Scale story | Load test, real numbers in `docs/SCALING.md`, ANN index, tests, README polish | `make test` green; SCALING.md contains *measured* not guessed numbers | ☐ |
 
 ## 2. Phase detail

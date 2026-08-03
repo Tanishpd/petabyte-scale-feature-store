@@ -139,15 +139,11 @@ submit:  ## Submit the PyFlink job (FROM_START=1 to replay, JOB_TOPIC=x)
 	  --no-wait --sink $(or $(SINK),redis) \
 	  $(if $(FROM_START),--startup-mode earliest-offset,) $(if $(JOB_TOPIC),--topic $(JOB_TOPIC),)
 
-read:  ## [Phase 7] Read features back the way a model would
-	@test -f src/serving/online_read.py \
-	  || { echo "Not built yet — Phase 7 in PLAN.md."; exit 1; }
-	$(PY) src/serving/online_read.py
+read:  ## Read features back the way a model would (USERS="1 2 3")
+	$(PY) src/serving/online_read.py $(if $(USERS),--users $(USERS),)
 
-bench:  ## [Phase 7] p50/p95/p99 online read latency
-	@test -f src/serving/benchmark.py \
-	  || { echo "Not built yet — Phase 7 in PLAN.md."; exit 1; }
-	$(PY) src/serving/benchmark.py
+bench:  ## p50/p95/p99 online read latency + Redis footprint
+	$(PY) src/serving/benchmark.py $(if $(ITERS),--iterations $(ITERS),)
 
 test:  ## Run pytest (includes the Feast codec round-trip)
 	$(VENV)/bin/pytest -q tests/
