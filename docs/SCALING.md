@@ -107,8 +107,12 @@ Raise load 10× at a time and the failures arrive in this sequence:
    CPU-bound event generation plus `kafka-python`'s pure-Python protocol. *Fix:* run N producers, or move
    to `confluent-kafka` (librdkafka). An earlier draft of this section blamed single-broker Kafka at ~10k;
    that was wrong, and measuring it is what corrected it.
-2. **~50k events/s** — Flink checkpoint duration climbs as state grows; backpressure appears in the UI.
-   *Fix:* RocksDB backend, incremental checkpoints, unaligned checkpoints. ⓔ — not yet reached.
+2. **Not yet reached.** ⓜ At a sustained 5,000 eps over 90 s against 20,000 users, the full pipeline
+   (Kafka → HOP window → MiniLM embedding → Feast-encoded Redis write, plus the ANN index) held
+   **zero consumer lag on all 6 partitions** — 1.6M events in the topic, every one consumed, ~441 window
+   rows/s emitted and 18,016 Redis keys written. Flink was never the constraint at the rate a single
+   Python producer can feed it (§5.1). The next thing expected to bend is checkpoint duration as keyed
+   state grows; *fix:* RocksDB backend, incremental and unaligned checkpoints. ⓔ until measured.
 3. **~100k reads/s** — single Redis node hits its ceiling. *Fix:* Redis Cluster; Feast supports
    `redis_type: redis_cluster` natively.
 4. **Then, and only then, embeddings** — because §3 decoupled them from event rate. If they *did* appear
@@ -142,6 +146,21 @@ End-to-end, event → readable by a model:
 The 30-second watermark delay dwarfs everything else, and it's a deliberate correctness-vs-latency dial,
 not overhead. Drop it to 1 s and features are near-instant but late events get dropped. This tradeoff is
 the real content of "real-time" — the pipeline machinery is milliseconds; the *semantics* cost seconds.
+
+### The parallel vector index
+
+Feast cannot search vectors on Redis (ADR-004), so the sink writes each embedding a **second** time as a
+raw float32 blob under `petafs:vec:{user_id}` for a RediSearch HNSW index. Costs measured at ~1.6 KB per
+entity on top of the ~4 KB Feast row — call it 40% more online storage to buy nearest-neighbour
+retrieval. `make similar` returns 4 neighbours in ⓜ ~57 ms cold on a 150-vector index.
+
+Two failure modes worth knowing, both found by testing rather than reasoning:
+
+- **`FT.CREATE` races across task slots.** Every slot calls it from `open()`; the losers get "index
+  already exists". Treating that as an error made the sink disable indexing *for that slot only*, so
+  exactly half the keyspace (74 of 150 entities) was searchable while everything looked healthy.
+- **`FT.SEARCH` defaults to `LIMIT 0 10`** and truncates the response regardless of the KNN `k`, so
+  asking for 20 neighbours silently returns 10.
 
 ## 8. Online read path — measured
 

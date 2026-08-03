@@ -30,6 +30,7 @@ sys.path.insert(0, "/opt/project")
 from pyflink.datastream.functions import MapFunction  # noqa: E402
 
 from contracts.schema import FEATURES, ONLINE_TTL_SECONDS, TS_KEY  # noqa: E402
+from src.flink.sinks.ann_index import ensure_index, index_mapping, vec_key  # noqa: E402
 from src.flink.sinks.feast_codec import decode_ts, encode_row  # noqa: E402
 
 # Invariant 4's shape: inside the compose network Redis is always redis:6379.
@@ -39,6 +40,11 @@ REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
 
 FLUSH_ROWS = int(os.environ.get("SINK_FLUSH_ROWS", "500"))
 FLUSH_MS = int(os.environ.get("SINK_FLUSH_MS", "100"))
+
+#: Maintain the parallel RediSearch HNSW index alongside the Feast hash.
+#: Feast cannot do vector search on Redis (ADR-004), so similarity search needs
+#: a second copy of the vector as a raw float32 blob. Set 0 to skip it.
+WRITE_ANN_INDEX = os.environ.get("SINK_ANN_INDEX", "1") not in ("0", "false", "")
 
 
 class FeastRedisWriter(MapFunction):
@@ -58,6 +64,16 @@ class FeastRedisWriter(MapFunction):
             health_check_interval=30,
         )
         self._client.ping()          # fail at open(), not on the first row
+
+        self._ann = WRITE_ANN_INDEX
+        if self._ann:
+            try:
+                ensure_index(self._client)
+            except Exception:
+                # An index we cannot build must not take the pipeline down —
+                # it is an optional retrieval path, not the feature store.
+                self._ann = False
+
         self._buf: list[tuple[int, dict, datetime]] = []
         self._last_flush = time.monotonic()
         self.written = 0
@@ -119,6 +135,12 @@ class FeastRedisWriter(MapFunction):
                 # sink bypasses online_write_batch, key_ttl_seconds in the yaml
                 # would never be applied either. The sink must do it.
                 pipe.expire(key, ONLINE_TTL_SECONDS)
+
+                if self._ann:
+                    vk = vec_key(_uid)
+                    pipe.hset(vk, mapping=index_mapping(
+                        _uid, _feats["embedding"], _feats["behavior_summary"]))
+                    pipe.expire(vk, ONLINE_TTL_SECONDS)
                 n += 1
             if n:
                 pipe.execute()

@@ -31,7 +31,7 @@ endif
 .DEFAULT_GOAL := help
 .PHONY: help bootstrap build up down restart ps logs health topics sample tail-topic topic-count \
         produce submit apply seed registry read bench test smoke clean nuke \
-        verify-seed verify-windows bench-embed
+        verify-seed verify-windows bench-embed similar
 
 help:  ## Show this help
 	@echo "Petabyte-Scale Feature Store — available targets:"
@@ -180,3 +180,6 @@ verify-windows:  ## Prove Flink's aggregates match a pandas recomputation
 bench-embed:  ## Measure embedding throughput and prove batching pays
 	$(COMPOSE) exec -T jobmanager python /opt/project/src/flink/bench_embeddings.py \
 	  --topic $(VERIFY_TOPIC) --parallelism $(or $(PAR),2)
+
+similar:  ## Find behaviourally similar users (USER=1 K=5) — RediSearch KNN
+	$(PY) src/serving/similar_users.py $(if $(USER),--user $(USER),) $(if $(K),--k $(K),)

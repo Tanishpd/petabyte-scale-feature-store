@@ -124,6 +124,11 @@ Invariant 4. Override with `REDIS_HOST_PORT=6379`.
   execute DataStream jobs with `stream_env.execute_async(name)` — not `t_env.execute(...)`.
 - **A `UnixTimestamp` feature is written as int64 seconds and read back as a `datetime`.** Same instant,
   different Python type; comparing the raw int to the read value looks like a mismatch when it isn't.
+- **PyFlink caches Python modules across job submissions.** Worker processes are reused within a
+  TaskManager, so cancelling and resubmitting a job does *not* reload edited UDF/sink code — the old
+  module keeps running and the change appears to have no effect. `docker compose restart taskmanager`
+  after editing any Python that executes inside Flink. Cost me a debugging round chasing a bug I had
+  already fixed.
 - **UDF workers need `PYTHONPATH=/opt/project`.** PyFlink cloudpickles UDFs and unpickles them in a
   *separate* Python worker process that does not inherit the driver's `sys.path`. A
   `sys.path.insert(...)` at the top of the job script is not enough. Symptom: the job submits cleanly,
