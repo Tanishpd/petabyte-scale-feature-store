@@ -232,6 +232,9 @@ services:
         # is exactly when checkpoints would otherwise time out.
         execution.checkpointing.unaligned.enabled: true
         restart-strategy.type: exponential-delay
+        # Prometheus reporter — the plugin ships in the image, this activates it.
+        metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prom.port: 9250
         s3.endpoint: http://minio:9000
         s3.path.style.access: true
     volumes:
@@ -274,6 +277,8 @@ services:
         state.backend.incremental: true
         execution.checkpointing.dir: s3://flink-checkpoints/petafs
         execution.checkpointing.savepoint-dir: s3://flink-savepoints/petafs
+        metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prom.port: 9250
         s3.endpoint: http://minio:9000
         s3.path.style.access: true
     volumes:
@@ -282,6 +287,32 @@ services:
     depends_on:
       jobmanager:
         condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    container_name: petafs-prod-prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=6h
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports: ["9090:9090"]
+    depends_on:
+      jobmanager:
+        condition: service_healthy
+
+  grafana:
+    image: grafana/grafana:11.6.0
+    container_name: petafs-prod-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-petafs-dev-secret}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
+    profiles: ["ui"]
 
 volumes:
   redis-primary-data:

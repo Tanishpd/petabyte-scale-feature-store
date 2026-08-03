@@ -124,34 +124,42 @@ of 1.8 KB was 2.3× optimistic.) The full argument is in [docs/SCALING.md](docs/
 
 ## Is this production ready?
 
-**No** — and the gaps are listed rather than glossed, because a demo that claims otherwise is worse than
-one that doesn't.
+Two stacks. `docker-compose.yml` is the laptop demo. **`docker-compose.prod.yml`
+is a real topology** — `make prod-up`, and `make prod-drill` kills things to prove
+the claims below.
 
-Addressed, and verified rather than configured:
+**Closed, each verified by breaking it** (drills in `scripts/failure_drills.sh`):
 
-| | |
-|---|---|
-| Flink state survives a restart | Checkpoints to a shared volume; verified by `docker kill` + restore from `chk-16` ([ADR-011](docs/DECISIONS.md)) |
-| Kafka + Redis survive container recreate | Named volumes; verified by `compose down` then checking the data is still there |
-| Services come back on their own | `restart: unless-stopped` on all four |
-| The Feast private-API risk has a live tripwire | CI runs all 61 tests on every push, and **fails if any test is skipped** — a skipped round-trip test is the same as no test |
-| One bad record needn't kill the job | `--on-bad-record skip` tolerates and counts; default stays `fail` so schema drift is loud in dev |
+| Gap | Now | How it was proven |
+|---|---|---|
+| Single broker, RF=1 | 3 brokers, RF=3, `min.insync.replicas=2` | Killed a broker: ISR 3→2, **zero data loss**, writes continued at `acks=all`, broker rejoined |
+| State lost on restart | Checkpoints to object storage (MinIO → S3) | Killed the TaskManager: restored from `s3://.../chk-N`, Kafka offsets recovered with it |
+| Single Redis | primary + replica + Sentinel; the sink discovers the master | Killed the master: promotion in ~9 s, 8,018 keys intact, writes resumed |
+| Redis unauthenticated | `requirepass` on nodes *and* Sentinel | `NOAUTH Authentication required` without credentials |
+| Nothing watched it | Prometheus + 5 alerts on lag, checkpoints, restarts, backpressure, feature staleness | 2/2 scrape targets up, rules loaded |
+| Tests never ran | CI on every push, **fails on any skip** | A skipped round-trip test is the same as no test |
 
-Still missing, in rough order of how much it would hurt:
+**Still open, honestly:**
 
-- **Single node everywhere.** One Kafka broker with RF=1, one Redis, one TaskManager. Any loss is
-  unrecoverable for whatever that node held.
-- **No auth or TLS.** Kafka PLAINTEXT, Redis unauthenticated, Flink UI open.
-- **Depends on Feast internals.** `_redis_key` / `_mmh3` are private ([ADR-003](docs/DECISIONS.md)). CI
-  now catches breakage, but a supported path would be `write_to_online_store` at the cost of a hop.
-- **`file://` checkpoints.** Correct for one node, wrong for a cluster — becomes `s3://`, one line.
-- **No alerting** on consumer lag, backpressure or feature staleness.
-- **Schema evolution is manual.** Versioning must stay off ([Invariant 8](CLAUDE.md)), so adding a
-  feature changes hashes and cold-starts the cache.
-- **One unexplained behaviour**: a long-lived `FeatureStore` drifts 2.7× over 200 calls. Mitigated by
-  refreshing the registry; root cause unknown ([SCALING §8](docs/SCALING.md)).
+- **Kafka is still PLAINTEXT.** Redis and Sentinel are authenticated; Kafka SASL
+  is not done. This is the largest remaining gap.
+- **One sentinel, not three.** Enough to demonstrate failover, not enough for
+  quorum. The drills exposed why that matters — see the split-brain trap in
+  [RUNBOOK §4](docs/RUNBOOK.md).
+- **Single-host.** Three brokers on one machine survive a *process* failure, not
+  a *host* failure. Real fault tolerance needs separate failure domains.
+- **No TLS anywhere**, and secrets are compose env vars with dev defaults, not a
+  secret store.
+- **Feast internals dependency** ([ADR-003](docs/DECISIONS.md)). CI is the
+  tripwire; a supported path would be `write_to_online_store`, at the cost of a hop.
+- **One unexplained behaviour**: a long-lived `FeatureStore` drifts 2.7× over 200
+  calls. Mitigated by refreshing the registry, root cause unknown
+  ([SCALING §8](docs/SCALING.md)).
 
----
+So: **the durability and availability story is real and tested; the security
+story is half-done and the deployment story is single-host.** Operationally it is
+a credible reference topology, not something to put on a revenue path without
+finishing the list above.
 
 ## Documentation
 
@@ -161,6 +169,7 @@ Still missing, in rough order of how much it would hurt:
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Data flow, schemas, how the Feast/Redis encoding works |
 | [docs/DECISIONS.md](docs/DECISIONS.md) | Why these versions, why direct-write, what was rejected |
 | [docs/SCALING.md](docs/SCALING.md) | The petabyte math, bottleneck ordering, what breaks at each 10× |
+| [docs/RUNBOOK.md](docs/RUNBOOK.md) | Production topology: drills, sizing, upgrades, alert response |
 | [CLAUDE.md](CLAUDE.md) | Working context for AI coding sessions |
 
 ## Troubleshooting

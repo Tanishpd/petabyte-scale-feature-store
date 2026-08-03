@@ -1,0 +1,64 @@
+# Alerts on the three things that actually go wrong in this pipeline, as
+# identified in docs/SCALING.md §5. Deliberately not a generic CPU/memory set:
+# those fire late and say nothing about whether features are correct.
+groups:
+  - name: petafs-pipeline
+    rules:
+      # 1. Falling behind. The measured ceiling is ~8,500 events/s; sustained
+      #    lag growth means the embedding tier is saturated (SCALING §5).
+      - alert: KafkaConsumerLagGrowing
+        expr: >
+          sum(flink_taskmanager_job_task_operator_currentEmitEventTimeLag) > 120000
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Pipeline is falling behind (event-time lag > 2 min)"
+          description: >
+            Sustained lag means throughput is below ingest. Check the embedding
+            operator first — it saturates before Kafka does.
+
+      # 2. Checkpoints failing. Without them a restart replays from the source
+      #    and window state is lost (ADR-011).
+      - alert: CheckpointsFailing
+        expr: increase(flink_jobmanager_job_numberOfFailedCheckpoints[15m]) > 2
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "Flink checkpoints are failing"
+          description: >
+            More than two failures in 15 minutes. State is not durable; a
+            restart will lose in-flight windows. Check object-storage
+            credentials and checkpoint duration vs interval.
+
+      # 3. The job is flapping rather than running.
+      - alert: JobRestarting
+        expr: increase(flink_jobmanager_job_numRestarts[10m]) > 3
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "Flink job is in a restart loop"
+          description: >
+            Check the SDK-harness traceback in the TaskManager log — a Python
+            UDF or sink exception is the usual cause.
+
+      # 4. Backpressure: the operator that cannot keep up.
+      - alert: SustainedBackpressure
+        expr: avg(flink_taskmanager_job_task_backPressuredTimeMsPerSecond) > 500
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "An operator is backpressured more than half the time"
+
+      # 5. Features going stale is the failure that serves wrong answers
+      #    silently. FeatureView.ttl does NOT cover this — expiry is the sink's
+      #    EXPIRE, and a stalled pipeline simply stops refreshing.
+      - alert: NoFeaturesWritten
+        expr: >
+          sum(rate(flink_taskmanager_job_task_operator_numRecordsOut[10m])) == 0
+        for: 15m
+        labels: {severity: critical}
+        annotations:
+          summary: "No feature rows written for 15 minutes"
+          description: >
+            The pipeline is up but producing nothing. Models are reading
+            increasingly stale features and Feast reports them as PRESENT.

@@ -42,15 +42,19 @@ else
   AFTER=$(kafka_records)
   [ "$AFTER" = "$BEFORE" ] && ok "no data loss ($AFTER records)" || bad "records $BEFORE -> $AFTER"
 
+  # Count partitions whose ISR has exactly 2 members. Anchoring with `$` fails:
+  # the describe line continues with Elr: / LastKnownElr: columns.
   UNDER=$($P exec -T kafka1 /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka1:9092 \
-          --describe --topic transactions 2>/dev/null | grep -c "Isr: [0-9]*,[0-9]*$")
+          --describe --topic transactions 2>/dev/null \
+          | grep -oE "Isr: [0-9]+(,[0-9]+)*" | awk -F, 'NF==2' | wc -l | tr -d " ")
   [ "${UNDER:-0}" -gt 0 ] && ok "ISR shrank to 2 but stayed at min.insync.replicas" \
                           || bad "unexpected ISR state"
 
   $P up -d kafka2 >/dev/null 2>&1
   for _ in $(seq 1 20); do
     FULL=$($P exec -T kafka1 /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka1:9092 \
-           --describe --topic transactions 2>/dev/null | grep -c "Isr: [0-9]*,[0-9]*,[0-9]*")
+           --describe --topic transactions 2>/dev/null \
+           | grep -oE "Isr: [0-9]+(,[0-9]+)*" | awk -F, 'NF==3' | wc -l | tr -d " ")
     [ "${FULL:-0}" -ge 6 ] && break
     sleep 5
   done
@@ -67,8 +71,12 @@ if [ -z "$M0" ]; then
 else
   echo "  master before: $M0"
   VICTIM=petafs-prod-redis-primary
-  IP_P=$(docker inspect -f '{{.NetworkSettings.Networks.petafs-prod_default.IPAddress}}' petafs-prod-redis-primary 2>/dev/null)
-  [ "$M0" != "$IP_P" ] && VICTIM=petafs-prod-redis-replica
+  # `.Networks.petafs-prod_default` does not parse — the hyphen breaks the Go
+  # template field path, it returns empty, and we end up killing the replica
+  # while reporting it as the master. Use index with a quoted key.
+  IP_P=$(docker inspect -f '{{index .NetworkSettings.Networks "petafs-prod_default" "IPAddress"}}' petafs-prod-redis-primary 2>/dev/null)
+  if [ -z "$IP_P" ]; then bad "could not resolve redis-primary IP — check the network name"; fi
+  [ -n "$IP_P" ] && [ "$M0" != "$IP_P" ] && VICTIM=petafs-prod-redis-replica
   docker kill "$VICTIM" >/dev/null 2>&1
   echo "  killed $VICTIM"
 
