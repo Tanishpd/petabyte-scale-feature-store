@@ -141,8 +141,12 @@ the claims below.
 
 **Still open, honestly:**
 
-- **Kafka is still PLAINTEXT.** Redis and Sentinel are authenticated; Kafka SASL
-  is not done. This is the largest remaining gap.
+- **Kafka SASL is written but not working end to end.** `docker-compose.sasl.yml`
+  is an opt-in overlay. Broker-side it is verified — authenticated clients work,
+  unauthenticated ones are refused, authenticated healthchecks pass — but
+  `flink run` hangs during submission against SASL brokers and the cause was not
+  found. It is deliberately kept OUT of the base topology so the verified stack
+  stays verified. Treat it as unfinished, not as a feature.
 - **One sentinel, not three.** Enough to demonstrate failover, not enough for
   quorum. The drills exposed why that matters — see the split-brain trap in
   [RUNBOOK §4](docs/RUNBOOK.md).

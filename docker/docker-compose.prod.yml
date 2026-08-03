@@ -9,7 +9,8 @@
 #   3 Kafka brokers, RF=3, min.insync.replicas=2   single broker at RF=1 lost everything
 #   MinIO + s3:// checkpoints                       file:// is meaningless off one node
 #   Redis primary + replica + Sentinel              single Redis was a hard dependency
-#   SASL on Kafka, requirepass on Redis             everything was unauthenticated
+#   requirepass on Redis and Sentinel               everything was unauthenticated
+#   (Kafka SASL is an opt-in overlay: docker-compose.sasl.yml — see its header)
 #   Prometheus + Grafana + alert rules              nothing watched lag or staleness
 #
 # ⚠️ Sizing: this topology wants ~10 GiB of RAM. It does NOT fit alongside the

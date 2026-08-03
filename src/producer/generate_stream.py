@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import sys
 import time
@@ -240,7 +241,19 @@ class EventGenerator:
 def build_producer(bootstrap: str, acks: str, compression: str | None):
     from kafka import KafkaProducer
 
+    # SASL only when the environment asks for it: the dev stack is PLAINTEXT and
+    # the production topology sets KAFKA_SECURITY_PROTOCOL=SASL_PLAINTEXT.
+    security = {}
+    if os.environ.get("KAFKA_SECURITY_PROTOCOL"):
+        security = dict(
+            security_protocol=os.environ["KAFKA_SECURITY_PROTOCOL"],
+            sasl_mechanism=os.environ.get("KAFKA_SASL_MECHANISM", "PLAIN"),
+            sasl_plain_username=os.environ.get("KAFKA_USER", ""),
+            sasl_plain_password=os.environ.get("KAFKA_PASSWORD", ""),
+        )
+
     return KafkaProducer(
+        **security,
         bootstrap_servers=bootstrap,
         acks=int(acks) if acks.isdigit() else acks,
         linger_ms=20,

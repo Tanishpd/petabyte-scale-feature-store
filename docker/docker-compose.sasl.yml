@@ -1,0 +1,65 @@
+# SASL overlay for the production topology. Opt-in:
+#
+#   docker compose -f docker/docker-compose.prod.yml -f docker/docker-compose.sasl.yml up -d
+#
+# ⚠️ STATUS: broker-side verified, pipeline NOT verified end to end.
+#
+# What was confirmed working:
+#   - brokers accept an authenticated client (kafka-topics.sh --command-config lists topics)
+#   - an unauthenticated client is refused
+#   - authenticated healthchecks pass on all three brokers
+#
+# What was NOT confirmed:
+#   - the Flink job running against SASL brokers. The DDL is generated correctly
+#     (verified: properties.security.protocol / sasl.mechanism / sasl.jaas.config
+#     all present), but `flink run` hangs during submission rather than erroring,
+#     and the cause was not identified. Do not treat this overlay as working.
+#
+# It is separate from the base file precisely so the base topology stays the
+# verified one — the 8/8 failure drills run against PLAINTEXT.
+#
+# The bug worth remembering from getting this far: turning SASL on breaks any
+# healthcheck that does not authenticate. Every broker goes `unhealthy`, and
+# anything gated on `depends_on: service_healthy` silently never starts. The
+# symptom is "Flink won't come up", not "auth is misconfigured".
+
+x-kafka-sasl-env: &kafka-sasl-env
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:SASL_PLAINTEXT,EXTERNAL:SASL_PLAINTEXT,CONTROLLER:PLAINTEXT
+  KAFKA_SASL_ENABLED_MECHANISMS: PLAIN
+  KAFKA_SASL_MECHANISM_INTER_BROKER_PROTOCOL: PLAIN
+  KAFKA_LISTENER_NAME_INTERNAL_PLAIN_SASL_JAAS_CONFIG: |
+    org.apache.kafka.common.security.plain.PlainLoginModule required username="${KAFKA_USER:-petafs}" password="${KAFKA_PASSWORD:-petafs-dev-secret}" user_${KAFKA_USER:-petafs}="${KAFKA_PASSWORD:-petafs-dev-secret}";
+  KAFKA_LISTENER_NAME_EXTERNAL_PLAIN_SASL_JAAS_CONFIG: |
+    org.apache.kafka.common.security.plain.PlainLoginModule required username="${KAFKA_USER:-petafs}" password="${KAFKA_PASSWORD:-petafs-dev-secret}" user_${KAFKA_USER:-petafs}="${KAFKA_PASSWORD:-petafs-dev-secret}";
+
+x-kafka-sasl-healthcheck: &kafka-sasl-healthcheck
+  test:
+    - CMD-SHELL
+    - |
+      printf 'security.protocol=SASL_PLAINTEXT\nsasl.mechanism=PLAIN\nsasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="${KAFKA_USER:-petafs}" password="${KAFKA_PASSWORD:-petafs-dev-secret}";\n' > /tmp/hc.properties
+      /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 --command-config /tmp/hc.properties >/dev/null 2>&1
+  interval: 10s
+  timeout: 10s
+  retries: 18
+  start_period: 30s
+
+x-flink-kafka-creds: &flink-kafka-creds
+  KAFKA_SECURITY_PROTOCOL: SASL_PLAINTEXT
+  KAFKA_SASL_MECHANISM: PLAIN
+  KAFKA_USER: ${KAFKA_USER:-petafs}
+  KAFKA_PASSWORD: ${KAFKA_PASSWORD:-petafs-dev-secret}
+
+services:
+  kafka1:
+    environment: *kafka-sasl-env
+    healthcheck: *kafka-sasl-healthcheck
+  kafka2:
+    environment: *kafka-sasl-env
+    healthcheck: *kafka-sasl-healthcheck
+  kafka3:
+    environment: *kafka-sasl-env
+    healthcheck: *kafka-sasl-healthcheck
+  jobmanager:
+    environment: *flink-kafka-creds
+  taskmanager:
+    environment: *flink-kafka-creds

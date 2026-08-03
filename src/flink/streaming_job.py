@@ -17,6 +17,7 @@ so this file names nothing twice.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 # The compose file mounts ../src and ../contracts under /opt/project.
@@ -38,6 +39,29 @@ from contracts.schema import (  # noqa: E402
 from src.flink.udfs.embeddings import register as register_embedding_udfs  # noqa: E402
 
 SOURCE_TABLE = "transactions"
+
+# Kafka client security. Empty (the dev stack) means PLAINTEXT; the production
+# topology sets SASL_PLAINTEXT and credentials via the environment so they never
+# live in the image or the repo.
+KAFKA_SECURITY_PROTOCOL = os.environ.get("KAFKA_SECURITY_PROTOCOL", "")
+KAFKA_SASL_MECHANISM = os.environ.get("KAFKA_SASL_MECHANISM", "PLAIN")
+KAFKA_USER = os.environ.get("KAFKA_USER", "")
+KAFKA_PASSWORD = os.environ.get("KAFKA_PASSWORD", "")
+
+
+def _kafka_security_options() -> str:
+    """DDL options for an authenticated broker, or nothing for PLAINTEXT."""
+    if not KAFKA_SECURITY_PROTOCOL:
+        return ""
+    jaas = (
+        "org.apache.kafka.common.security.plain.PlainLoginModule required "
+        f'username="{KAFKA_USER}" password="{KAFKA_PASSWORD}";'
+    )
+    return (
+        f"      'properties.security.protocol' = '{KAFKA_SECURITY_PROTOCOL}',\n"
+        f"      'properties.sasl.mechanism' = '{KAFKA_SASL_MECHANISM}',\n"
+        f"      'properties.sasl.jaas.config' = '{jaas}',\n"
+    )
 
 
 def build_source_ddl(
@@ -85,7 +109,7 @@ def build_source_ddl(
       'properties.bootstrap.servers' = '{bootstrap}',
       'properties.group.id' = '{group_id}',
       'scan.startup.mode' = '{startup_mode}',
-{bounded_opt}      'format' = 'json',
+{bounded_opt}{_kafka_security_options()}      'format' = 'json',
       'json.timestamp-format.standard' = '{JSON_TIMESTAMP_FORMAT}',
       'json.fail-on-missing-field' = 'false',
       'json.ignore-parse-errors' = '{str(ignore_parse_errors).lower()}'

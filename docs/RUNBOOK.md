@@ -26,6 +26,21 @@ live in `scripts/failure_drills.sh`.
 | Redis master dies | Sentinel promotes the replica; the sink re-discovers and keeps writing | promotion in ~9 s; 8,018 keys replicated |
 | Unauthenticated client | Rejected | `NOAUTH Authentication required` on both Redis and Sentinel |
 
+### Kafka SASL — unfinished
+
+`docker-compose.sasl.yml` overlays SASL/PLAIN onto the brokers. Verified:
+authenticated clients work, unauthenticated ones are refused, and authenticated
+healthchecks pass on all three brokers. **Not** verified: the Flink job. The DDL
+is generated correctly (`properties.security.protocol`, `sasl.mechanism`,
+`sasl.jaas.config` all present) but `flink run` hangs during submission instead
+of erroring, and the cause was not identified. The overlay is separate from the
+base file so the 8/8 drills keep running against a topology that works.
+
+One lesson survives regardless: **turning SASL on breaks every healthcheck that
+does not authenticate.** All three brokers go `unhealthy`, and anything gated on
+`depends_on: service_healthy` silently never starts. The symptom presents as
+"Flink won't come up", which sends you looking in the wrong place.
+
 ## 2. Sizing — the numbers here are NOT production sizing
 
 The prod compose runs small heaps so three brokers and a Flink cluster fit on a
