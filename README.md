@@ -116,6 +116,8 @@ cross a petabyte in about a month. But the *serving* layer only holds current st
 | Producer hangs, no error | Using `kafka:9092` from the host. Host scripts must use `localhost:29092`. |
 | `get_online_features` returns all `None` | Feature-view or feature name drift between the Flink sink and the Feast registry — the Redis field is a hash of both. Check `contracts/schema.py` is the only definition. |
 | Flink job fails on submit | Version skew between the cluster image and the `apache-flink` pip package. Both must be 2.2.1. |
-| First `make up` looks stuck | It's building a ~3 GB image with PyTorch, downloading the model, and — on Apple Silicon — compiling PyFlink from source, since no Linux aarch64 wheel exists. Once only. |
+| First `make build` takes a few minutes | It builds a 3.48 GB image with PyTorch, bakes the model, and — on Apple Silicon — compiles PyFlink from source since no Linux aarch64 wheel exists. Measured ~5 min cold. Once only. |
 | Image build fails compiling PyFlink | Missing `build-essential` / `python3.12-dev` in the Flink Dockerfile. See [ADR-009](docs/DECISIONS.md). |
+| `make up` fails: port 6379 in use | Expected if you run a system/Homebrew redis. The stack uses **host port 6380** by default and leaves 6379 alone. `REDIS_HOST_PORT=6379 make up` to override. |
+| Restarting Docker Desktop mid-build | Kills the running build. Completed layers are cached, so re-running `make build` resumes rather than starting over. |
 | `Cannot connect to the Docker daemon` | Docker Desktop isn't running. |

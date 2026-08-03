@@ -89,13 +89,19 @@ Makefile
 ## Verify commands
 
 ```bash
-make up            # bring up infra, wait for healthy
+make up            # bring up infra, wait for healthy (prints a health summary)
+make health        # re-check: container status + kafka/redis/flink reachability
+make topics        # create `transactions` with retention caps
 make smoke         # end-to-end: produce → flink → redis → feast read
 make test          # pytest, includes the codec round-trip
-docker compose -f docker/docker-compose.yml ps        # container health
-redis-cli -p 6379 --scan --pattern '*' | head         # raw Feast keys (binary)
+redis-cli -p 6380 --scan --pattern '*' | head         # raw Feast keys (binary) — note 6380
 open http://localhost:8081                            # Flink UI: watch backpressure + watermarks
 ```
+
+**Redis is on host port 6380, not 6379** — this machine runs a Homebrew redis on 6379 with real data in
+it. Only the host mapping moved; inside the compose network it is still `redis:6379`, so the Flink sink
+is unaffected while `feature_store.yaml` and host serving scripts need `localhost:6380`. Same shape as
+Invariant 4. Override with `REDIS_HOST_PORT=6379`.
 
 ## Environment facts
 

@@ -41,7 +41,11 @@ services:
     image: redis/redis-stack-server:7.4.0-v8
     container_name: petafs-redis
     ports:
-      - "6379:6379"
+      # Host port is 6380, not 6379, to coexist with a system/Homebrew redis.
+      # Only the HOST side moves: inside the compose network this is still
+      # redis:6379, so the Flink sink is unaffected. Host-side Feast reads
+      # (feature_store.yaml, serving scripts) must use localhost:6380.
+      - "${REDIS_HOST_PORT:-6380}:6379"
     # Stack (not plain redis) for the optional RediSearch ANN index — Feast 0.65
     # has no vector search of its own on Redis (ADR-004).
     healthcheck:

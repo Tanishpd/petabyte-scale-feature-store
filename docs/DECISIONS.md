@@ -185,9 +185,25 @@ released sdist is always. Cython itself is *not* the blocker: it is only a build
 
 The base image `eclipse-temurin:17-jre-noble` is JRE-only and ships neither.
 
-**Consequence.** First build is slow (compiling seven Cython-generated extensions). Subsequent builds hit
-the Docker layer cache. `apache-beam` — PyFlink's own dependency — does publish `manylinux_2_17_aarch64`
-wheels, so it is not affected.
+**Confirmed by building it** (2026-08-01, M-series, 8 cores, Docker 8 GB):
+
+```
+Arch=arm64 OS=linux            # native, not emulated
+machine    : aarch64
+py         : 3.12.3
+fast coder : .../pyflink/fn_execution/coder_impl_fast.cpython-312-aarch64-linux-gnu.so
+```
+
+That `.so` is the proof: pip did fall back to the sdist and did compile the C extensions for aarch64,
+exactly as predicted. Without `build-essential` + `python3.12-dev` the layer fails.
+
+**Consequence — measured, and milder than expected.** The whole `pip install` layer took **242 s**, with
+the compile a minority of that (the rest is downloading torch, transformers and feast). Total image build
+≈ 5 min cold, 3.48 GB. An earlier estimate here said 10–40 minutes; that was guesswork and it was wrong.
+Note pip buffers compiler output unless the build fails, so a successful run shows *no* gcc lines — the
+absence of compile chatter is not evidence that no compile happened. Subsequent builds hit the layer
+cache. `apache-beam` — PyFlink's own dependency — does publish `manylinux_2_17_aarch64` wheels, so it is
+not affected.
 
 **Rejected.** (a) Switching Flink versions to find a wheel — none exists, at any version; this is a
 platform constraint, not a pin. (b) Running the Flink services as `platform: linux/amd64` under

@@ -15,6 +15,11 @@ PARTITIONS   ?= 6
 RETENTION_MS ?= 3600000
 EPS          ?= 5000
 
+# Host-side Redis port. 6380 by default so the stack coexists with a system or
+# Homebrew redis on 6379. Inside the compose network it is always redis:6379.
+REDIS_HOST_PORT ?= 6380
+export REDIS_HOST_PORT
+
 # `make up UI=1` also starts kafka-ui.
 ifdef UI
 PROFILES := --profile ui
@@ -75,8 +80,8 @@ health:  ## Report health of each service
 	@echo
 	@printf "kafka   (host listener 29092) : "; \
 	  (nc -z localhost 29092 2>/dev/null && echo reachable) || echo "NOT reachable"
-	@printf "redis   (6379)               : "; \
-	  (redis-cli -p 6379 ping 2>/dev/null | grep -q PONG && echo PONG) || echo "no response"
+	@printf "redis   ($(REDIS_HOST_PORT))               : "; \
+	  (redis-cli -p $(REDIS_HOST_PORT) ping 2>/dev/null | grep -q PONG && echo PONG) || echo "no response"
 	@printf "flink   (ui 8081)            : "; \
 	  (curl -fs http://localhost:8081/overview >/dev/null 2>&1 && echo up) || echo "not up"
 

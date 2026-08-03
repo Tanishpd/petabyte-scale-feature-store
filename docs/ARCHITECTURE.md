@@ -194,11 +194,16 @@ Three PyFlink-specific details, each of which is a plausible-looking mistake in 
 | `kafka` | `apache/kafka:4.3.1` | 29092 | broker + controller (KRaft) |
 | `jobmanager` | custom `flink:2.2.1` + PyFlink | 8081 | Flink UI, job submission |
 | `taskmanager` | same image | — | execution slots; holds the model in memory |
-| `redis` | `redis/redis-stack-server:7.4.0-v8` | 6379, 8001 | online store + RediSearch |
+| `redis` | `redis/redis-stack-server:7.4.0-v8` | **6380** | online store + RediSearch |
 | `kafka-ui` | `ghcr.io/kafbat/kafka-ui` | 8080 | topic inspection (dev convenience) |
 
 (`kafbat` is the maintained fork of the abandoned `provectuslabs/kafka-ui`, whose last image predates
-Kafka 4.x by two years.)
+Kafka 4.x by two years. It sits behind a compose profile — `make up UI=1` — so it costs nothing normally.)
+
+**Redis uses host port 6380**, not 6379, so the stack coexists with a system or Homebrew redis. This is
+the same shape as the Kafka dual-listener split: only the *host* side moves. Inside the compose network
+it is still `redis:6379`, so the Flink sink is unaffected — but `feature_store.yaml` and the host-side
+serving scripts must say `localhost:6380`. Override with `REDIS_HOST_PORT=6379 make up` if 6379 is free.
 
 The custom Flink image carries PyTorch, sentence-transformers, `feast[redis]`, the Kafka SQL connector
 JAR, and a **pre-downloaded** copy of `all-MiniLM-L6-v2`. It runs with `HF_HUB_OFFLINE=1`: a UDF that

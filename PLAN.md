@@ -1,6 +1,7 @@
 # Build Plan — Petabyte-Scale Feature Store & Streaming Pipeline
 
-> Status: **Phase 0 — not started.** Update the status column as phases land.
+> Status: **Phases 0–1 complete** (2026-08-01). Next: Phase 2, the mock stream.
+> Update the status column as phases land.
 > Every phase has a *verifiable* acceptance criterion. A phase is not done until its check passes.
 
 ## 0. What we're building, in one paragraph
@@ -16,8 +17,8 @@ them back in single-digit milliseconds via `feast.get_online_features()` — wit
 
 | # | Phase | Deliverable | Acceptance check | Status |
 |---|-------|-------------|------------------|--------|
-| 0 | Foundations | Repo skeleton, py3.11 venv, pinned `requirements*.txt`, `Makefile`, `.env` | `make bootstrap && python -c "import feast, kafka, sentence_transformers"` | ☐ |
-| 1 | Infrastructure | `docker-compose.yml`: Kafka (KRaft), Flink JM+TM (custom image), Redis Stack, Kafka UI | `make up` → all 5 containers healthy; Flink UI on :8081; `redis-cli PING` | ☐ |
+| 0 | Foundations | Repo skeleton, py3.11 venv, pinned `requirements*.txt`, `Makefile` | `make bootstrap` → feast 0.65.0, redis 7.4.1 (<8), kafka-python 3.0.9 | ☑ |
+| 1 | Infrastructure | `docker-compose.yml`: Kafka (KRaft), Flink JM+TM (custom image), Redis Stack, Kafka UI | `make up` → 4 services healthy, TM registered with 2 slots, Invariant-4 round-trip on `localhost:29092` | ☑ |
 | 2 | Mock stream | `producer/generate_stream.py` — Zipf users, anomalies, late events, tunable EPS | `make produce EPS=5000` sustains ≥5k msg/s; `make tail-topic` shows valid JSON | ☐ |
 | 3 | Feature contract + Feast repo | `contracts/schema.py` (single source of truth), Feast entity/FV, seeded offline parquet | `feast apply` clean; `feast feature-views list` shows `user_txn_stats_10m` | ☐ |
 | 4 | Flink aggregation | PyFlink job: Kafka → watermarks → HOP(10min/1min) → print | Printed rolling avg matches a pandas recomputation of the same window (±1e-6) | ☐ |
