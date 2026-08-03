@@ -53,16 +53,12 @@ def to_utc(x):
     return s.tz_localize("UTC") if s.tz is None else s.tz_convert("UTC")
 
 
-def normalise_categories(multiset: dict | None) -> str:
-    """MULTISET<STRING> -> a sorted, deduplicated string.
-
-    COLLECT gives a {category: count} dict, so dedup is structural; sorting is
-    what makes it deterministic, since dict order is not defined and this
-    pipeline delivers events out of order on purpose (ADR-010).
-    """
-    if not multiset:
+def normalise_categories(categories) -> str:
+    """ARRAY<STRING> -> a sorted, deduplicated string. Same normalisation the
+    production UDF applies (ADR-010)."""
+    if categories is None or len(categories) == 0:
         return ""
-    return ", ".join(sorted(multiset))
+    return ", ".join(sorted({str(c) for c in categories}))
 
 
 def pandas_hop(events: pd.DataFrame, window_ends: list[pd.Timestamp]) -> pd.DataFrame:
@@ -157,7 +153,7 @@ def main() -> int:
         return 1
 
     # --- 3. independent recomputation -------------------------------------
-    flink["categories"] = flink["category_counts"].map(normalise_categories)
+    flink["categories"] = flink["categories_agg"].map(normalise_categories)
     flink["window_end"] = to_utc(flink["window_end"])
     events["event_timestamp"] = to_utc(events["event_timestamp"])
 

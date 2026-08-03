@@ -142,6 +142,23 @@ consumer**, because the model reads the window aggregate anyway.
 **Consequence.** The embedding describes a user's *recent behaviour*, not a single transaction — which is
 also the more useful semantic for user-level features.
 
+**Measured** (`make bench-embed`, 8-core container, MiniLM, 2 task slots):
+
+| | rate |
+|---|---|
+| model, one sentence per `encode()` call | ⓜ 50–95 emb/s |
+| model, batched `encode()` — what the pandas UDF does | ⓜ **450–475 emb/s** (5–7× faster) |
+| embedding stage inside Flink, 2 slots | ⓜ ~250 emb/s aggregate |
+| whole pipeline end-to-end (Kafka read + window + embed) | ⓜ 167 rows/s |
+| cold model load, once per task slot in `open()` | ⓜ 0.2–0.3 s |
+
+The 5–7× gap is the evidence for the pandas-UDF decision. Note also what *doesn't* help: throughput is
+flat at 410–480 emb/s across batch sizes 32–512 and 1/4/8 torch threads, so MiniLM here is bound by
+memory bandwidth, not by batch width or thread count.
+
+At 167 rows/s on two slots, reaching §3's 830 emb/s target needs roughly 5× this hardware — which is the
+honest scaling statement, and far better than the ~300 cores per-event embedding would demand.
+
 ---
 
 ## ADR-007 — A shared feature contract module
@@ -213,21 +230,24 @@ escape hatch if the compile proves unworkable.
 
 ---
 
-## ADR-010 — Collect categories as a `MULTISET`, and sort in Python
+## ADR-010 — Aggregate categories with `ARRAY_AGG(DISTINCT ...)`, sort in Python
 
-**Decision.** `behavior_summary` comes from `COLLECT(merchant_category)` — a `MULTISET<STRING>`, which
-PyFlink hands over as a `{category: count}` dict — then sorted in Python. The normalised string is what
-gets both stored as the feature and embedded.
+**Decision.** `behavior_summary` comes from `ARRAY_AGG(DISTINCT merchant_category)` — an `ARRAY<STRING>` —
+sorted in Python. The normalised string is what gets both stored as the feature and embedded.
 
-**Amended after measuring** (this ADR first said "plain `LISTAGG`, deduplicate in Python"). That works,
-but `LISTAGG` concatenates one entry per *transaction*: the busiest user in a 10-minute window had 5,293
-transactions across 12 distinct categories, so the pipeline was building a ~50 KB string per row purely to
-throw it away in dedup — and handing it to the Phase 5 embedding UDF on the way. `COLLECT` keeps a
-bounded multiset (≤ 12 entries here) and carries per-category counts for free.
+**This ADR has been revised twice, each time by measurement.** Recorded in full because the three
+candidates fail in different, non-obvious ways:
 
-`COLLECT` under a HOP window plans and executes fine on 2.2.1. One caveat: `MULTISET` cannot cross Arrow,
-so `to_pandas()` fails on it with an opaque `collectAsPandasDataFrame` error — use `.execute().collect()`.
-That is a serialisation limit, not a planner one, and it does not affect the streaming path.
+| candidate | verdict |
+|---|---|
+| `LISTAGG(DISTINCT ...)` | **Fails at plan time** under HOP: `This function does not support retraction`. Sliced windows force retraction-capable codegen, and `ListAggFunction` has no `retractExpressions`. |
+| plain `LISTAGG(...)` | Works, but emits one entry per *transaction* — the busiest measured user had 2,084 transactions across 12 distinct categories, so a ~20 KB string was built only to be deduplicated away, and serialised to the embedding UDF on the way. |
+| `COLLECT(...)` → `MULTISET` | Compact and plans fine, but **Python UDFs reject it**: `Python UDF doesn't support logical type MULTISET`. Neither `CAST(... AS MAP<STRING,INT>)` nor `MAP_KEYS(...)` bridges it. `MULTISET` also cannot cross Arrow, so `to_pandas()` fails with an opaque `collectAsPandasDataFrame` error. |
+| **`ARRAY_AGG(DISTINCT ...)`** | **Chosen.** Compact (12 elements, not 2,084), and `ARRAY<STRING>` is a type Python UDFs accept. |
+
+The instructive detail: `ARRAY_AGG(DISTINCT ...)` works under HOP where `LISTAGG(DISTINCT ...)` does not,
+because `ArrayAggFunction` implements retraction and `ListAggFunction` does not. Same window, same
+`DISTINCT`, opposite outcome. `COUNT(DISTINCT ...)` in the same query is fine throughout.
 
 **Evidence.** `LISTAGG(DISTINCT ...)` inside a HOP window TVF **fails at plan time** on Flink 2.2.1:
 

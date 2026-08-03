@@ -31,7 +31,7 @@ endif
 .DEFAULT_GOAL := help
 .PHONY: help bootstrap build up down restart ps logs health topics sample tail-topic topic-count \
         produce submit apply seed registry read bench test smoke clean nuke \
-        verify-seed verify-windows
+        verify-seed verify-windows bench-embed
 
 help:  ## Show this help
 	@echo "Petabyte-Scale Feature Store — available targets:"
@@ -171,7 +171,7 @@ verify-seed:  ## Backfill a small, ordered history into the verification topic
 	@$(COMPOSE) exec -T kafka /opt/kafka/bin/kafka-topics.sh \
 	  --bootstrap-server localhost:9092 --create --if-not-exists \
 	  --topic $(VERIFY_TOPIC) --partitions 3 --replication-factor 1 \
-	  --config retention.ms=$(RETENTION_MS) >/dev/null
+	  --config retention.ms=86400000 >/dev/null   # 24h: must outlive a work session
 	$(PY) src/producer/generate_stream.py --topic $(VERIFY_TOPIC) \
 	  --backfill $(or $(SPAN),1200) --eps $(or $(VEPS),40) --users $(or $(VUSERS),150) \
 	  --late-rate 0 --seed 42
@@ -179,3 +179,7 @@ verify-seed:  ## Backfill a small, ordered history into the verification topic
 verify-windows:  ## Prove Flink's aggregates match a pandas recomputation
 	$(COMPOSE) exec -T jobmanager python /opt/project/src/flink/verify_windows.py \
 	  --topic $(VERIFY_TOPIC)
+
+bench-embed:  ## Measure embedding throughput and prove batching pays
+	$(COMPOSE) exec -T jobmanager python /opt/project/src/flink/bench_embeddings.py \
+	  --topic $(VERIFY_TOPIC) --parallelism $(or $(PAR),2)

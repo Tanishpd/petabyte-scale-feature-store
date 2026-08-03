@@ -118,6 +118,19 @@ Invariant 4. Override with `REDIS_HOST_PORT=6379`.
   among them. The embedding is stored as an `Array(Float32)` feature and retrieved by key. True ANN needs
   a parallel RediSearch index we maintain ourselves. Do not go looking for a Feast Redis vector config —
   it isn't there.
+- **UDF workers need `PYTHONPATH=/opt/project`.** PyFlink cloudpickles UDFs and unpickles them in a
+  *separate* Python worker process that does not inherit the driver's `sys.path`. A
+  `sys.path.insert(...)` at the top of the job script is not enough. Symptom: the job submits cleanly,
+  then sits in a restart loop with `ModuleNotFoundError: No module named 'src'` buried in the SDK-harness
+  traceback. Set on both flink services in compose.
+- **`COLLECT`/`MULTISET` cannot reach a Python UDF** — `Python UDF doesn't support logical type MULTISET`,
+  and neither `CAST(... AS MAP<STRING,INT>)` nor `MAP_KEYS()` bridges it. Use `ARRAY_AGG(DISTINCT ...)`,
+  which is equally compact and yields `ARRAY<STRING>`. See ADR-010.
+- **Never benchmark a pipeline by `collect()`ing an `ARRAY<FLOAT>` to the client.** Shipping 4,403 × 384
+  floats over gRPC/Arrow cost 225 s — ~10× the actual pipeline work — and made the embedding stage look
+  25× slower than it is. Project to a scalar (`CARDINALITY(...)`) or sink to `blackhole` instead.
+- **`SELECT COUNT(*)` in streaming mode emits a changelog** (1, 2, 3, …), so reading its first row gives
+  1, not the total. Count rows in the same pass you are already making.
 - **PyFlink API names differ from Java.** There is no `RichMapFunction` (use `MapFunction`, which already
   has `open()`/`close()` on its base `Function`), no `DiscardingSink` (removed in Flink 2.0, never
   wrapped for Python — and unnecessary, since a `map` runs without a terminal sink), and

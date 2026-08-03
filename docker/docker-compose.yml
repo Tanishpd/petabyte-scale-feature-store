@@ -65,6 +65,11 @@ services:
       - "8081:8081"
     command: jobmanager
     environment:
+      # PyFlink UDFs are cloudpickled and unpickled in a SEPARATE Python worker
+      # process, which does not inherit the driver's sys.path. Without this the
+      # job submits fine and then dies in a restart loop with
+      # "ModuleNotFoundError: No module named 'src'".
+      PYTHONPATH: /opt/project
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: jobmanager
         jobmanager.memory.process.size: 1024m
@@ -91,6 +96,9 @@ services:
     container_name: petafs-taskmanager
     command: taskmanager
     environment:
+      # See the jobmanager note: the UDF worker process needs this to unpickle
+      # functions whose classes live under /opt/project/src.
+      PYTHONPATH: /opt/project
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: jobmanager
         taskmanager.memory.process.size: 2048m

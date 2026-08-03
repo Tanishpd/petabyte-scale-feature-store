@@ -14,7 +14,7 @@
                               │  Flink 2.2.1  (JobManager + TaskManager) │
                               │                                          │
                               │  1. Kafka source, JSON format            │
-                              │  2. watermark: event_time - 30s          │
+                              │  2. watermark: event_timestamp - 30s     │
                               │  3. HOP window  size 10m / slide 1m      │
                               │     GROUP BY user_id                     │
                               │  4. render behaviour sentence            │
@@ -29,7 +29,7 @@
                               │  one hash per (project, user_id)         │
                               │  + optional RediSearch HNSW index        │
                               └──────────────────┬───────────────────────┘
-                                                 │ localhost:6379
+                                                 │ localhost:6380
                                                  ▼
                               ┌──────────────────────────────────────────┐
                               │  Feast 0.65  →  get_online_features()    │
@@ -89,27 +89,30 @@ lives in `contracts/schema.py` so `feature_store.yaml` and the sink cannot drift
 | `txn_amount_max_10m` | Float64 | `MAX(amount)` |
 | `txn_amount_stddev_10m` | Float64 | `STDDEV_POP(amount)` |
 | `distinct_merchants_10m` | Int64 | `COUNT(DISTINCT merchant_id)` |
-| `behavior_summary` | String | `COLLECT(merchant_category)` → `MULTISET`, sorted in Python — see §4 |
+| `behavior_summary` | String | `ARRAY_AGG(DISTINCT merchant_category)`, sorted in Python — see §4 |
 | `embedding` | Array(Float32), 384 | MiniLM over a rendered sentence |
 | `window_end` | UnixTimestamp | window boundary, doubles as feature freshness |
 
 The embedding input sentence is rendered from the aggregate, e.g.:
 
-> `"user made 7 transactions averaging $23.40, max $91.00, across coffee_shop, grocery, rideshare"`
+> `"user made 7 transactions averaging 23.40, max 91.00, across coffee_shop, grocery, rideshare"`
+
+No currency symbol: amounts are in each user's local currency (§2), so a "$" would be wrong for most
+rows, and the signal worth embedding is the spending *pattern* rather than the unit.
 
 This gives the vector actual semantics: users with similar behaviour profiles end up close together,
 which is what makes the vector useful for similarity search or as a model input.
 
-The category list is **deduplicated and sorted** before rendering. That is not cosmetic: `LISTAGG`
-concatenates in arrival order, which this pipeline deliberately perturbs (the producer injects
-out-of-order events), so without normalisation two windows with identical content would render
+The category list is **sorted** before rendering. That is not cosmetic: `ARRAY_AGG`'s element order is
+undefined, and this pipeline deliberately perturbs arrival order (the producer injects out-of-order
+events), so without normalisation two windows with identical content would render
 `"coffee_shop, rideshare"` and `"rideshare, coffee_shop"` and embed to different vectors — destroying the
 similarity property above and making round-trip comparisons irreproducible. The same normalised string is
 what gets stored as `behavior_summary`, so the feature and the embedding input never disagree.
 
 ## 4. Windowing
 
-`HOP(TABLE txns, DESCRIPTOR(event_time), INTERVAL '1' MINUTE, INTERVAL '10' MINUTE)` — a 10-minute
+`HOP(TABLE txns, DESCRIPTOR(event_timestamp), INTERVAL '1' MINUTE, INTERVAL '10' MINUTE)` — a 10-minute
 window advancing every minute. Each user therefore gets a fresh feature row every minute reflecting their
 last 10 minutes of activity.
 
@@ -129,14 +132,16 @@ Three properties matter downstream:
   `to_data_stream()` yields an append stream, and the sink can be a plain writer with no retraction
   handling. A non-windowed `GROUP BY` would produce a changelog and require the sink to process
   retract/update-before messages.
-- **Categories use `COLLECT`, not `LISTAGG`.** `LISTAGG(DISTINCT ...)` under a HOP window **fails at plan
+- **Categories use `ARRAY_AGG(DISTINCT ...)`.** `LISTAGG(DISTINCT ...)` under a HOP window **fails at plan
   time** on Flink 2.2.1 with `TableException: This function does not support retraction` — sliced hopping
   windows force retraction-capable codegen for distinct aggregates, and `ListAggFunction` has no
   `retractExpressions`. Note the trap: `COUNT(DISTINCT ...)` in the *same query* is fine, plain `LISTAGG`
   in a HOP window is fine, and `LISTAGG(DISTINCT ...)` under `TUMBLE` is fine — only this exact
   combination breaks, so it invites being "fixed" back.
-  Plain `LISTAGG` does work, but emits one entry per *transaction* (~50 KB for the busiest measured user)
-  where `COLLECT` returns a bounded `MULTISET` of ≤ 12 entries with counts. See [ADR-010](DECISIONS.md).
+  `ARRAY_AGG(DISTINCT ...)` *does* work under HOP — `ArrayAggFunction` implements retraction where
+  `ListAggFunction` does not — and returns 12 elements rather than the 2,084 plain `LISTAGG` would emit
+  for the busiest measured user. `COLLECT` is equally compact but Python UDFs reject `MULTISET`
+  outright. Full comparison in [ADR-010](DECISIONS.md).
 - **Event-time correctness.** Watermarks are `event_time - 30s`, matching the producer's injected
   lateness. Events later than that are dropped by the windowing operator. Surfacing a count of them takes
   deliberate work — Table API has no built-in late-record metric on window TVFs — so treat "we measure

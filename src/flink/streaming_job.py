@@ -35,6 +35,7 @@ from contracts.schema import (  # noqa: E402
     WINDOW_SIZE_MINUTES,
     WINDOW_SLIDE_MINUTES,
 )
+from src.flink.udfs.embeddings import register as register_embedding_udfs  # noqa: E402
 
 SOURCE_TABLE = "transactions"
 
@@ -89,20 +90,25 @@ def build_source_ddl(
 def windowed_aggregate_sql(source: str = SOURCE_TABLE) -> str:
     """The 10-minute window advancing every minute, keyed by user.
 
-    Categories come back as `COLLECT(...)` -> `MULTISET<STRING>`, which PyFlink
-    hands over as a `{{category: count}}` dict.
+    Categories use `ARRAY_AGG(DISTINCT ...)` -> `ARRAY<STRING>`. ADR-010 records
+    why the two obvious alternatives lose:
 
-    ADR-010: `LISTAGG(DISTINCT ...)` fails at plan time under a HOP window
-    ("This function does not support retraction") — sliced windows force
-    retraction-capable codegen and ListAggFunction has none. Note the trap:
-    COUNT(DISTINCT) in this same query is fine.
+    - `LISTAGG(DISTINCT ...)` fails at plan time under a HOP window ("This
+      function does not support retraction"): sliced windows force
+      retraction-capable codegen, and ListAggFunction has none. ArrayAggFunction
+      does, which is why the DISTINCT form works here and not there. The trap:
+      COUNT(DISTINCT) in this same query is fine either way.
+    - `COLLECT` -> `MULTISET` is equally compact, but Python UDFs reject it:
+      "Python UDF doesn't support logical type MULTISET". Neither
+      `CAST(... AS MAP<STRING,INT>)` nor `MAP_KEYS(...)` bridges it.
 
-    Plain LISTAGG works but concatenates one entry per *transaction*: measured,
-    the busiest user in a 10-minute window had 5,293 transactions across 12
-    distinct categories, i.e. a ~50 KB string built only to be deduplicated
-    away. COLLECT keeps a bounded multiset instead — 12 entries — and carries
-    per-category counts for free. Keys still need sorting downstream, since
-    neither LISTAGG's order nor a dict's is defined.
+    Compactness is the point. Measured: the busiest user in a 10-minute window
+    had 2,084 transactions across 12 distinct categories. DISTINCT yields 12
+    elements; without it, 2,084 — built only to be deduplicated away, and
+    serialised across the Python boundary to the embedding UDF on the way.
+
+    Sorting still happens downstream: ARRAY_AGG's element order is not defined,
+    and this pipeline delivers events out of order on purpose.
 
     Output is append-only: a windowed aggregate emits each window once, on
     close. That is what lets Phase 6 attach a plain writer with no retraction
@@ -119,7 +125,7 @@ def windowed_aggregate_sql(source: str = SOURCE_TABLE) -> str:
       MAX(`amount`)                   AS txn_amount_max_10m,
       STDDEV_POP(`amount`)            AS txn_amount_stddev_10m,
       COUNT(DISTINCT `merchant_id`)   AS distinct_merchants_10m,
-      COLLECT(`merchant_category`)    AS category_counts
+      ARRAY_AGG(DISTINCT `merchant_category`) AS categories_agg
     FROM TABLE(
       HOP(
         TABLE {source},
@@ -129,6 +135,35 @@ def windowed_aggregate_sql(source: str = SOURCE_TABLE) -> str:
       )
     )
     GROUP BY `user_id`, window_start, window_end
+    """
+
+
+def enriched_sql(agg_view: str = "windowed") -> str:
+    """Add `behavior_summary` and `embedding` to the window aggregate.
+
+    `sorted_categories` is applied once in the inner query and reused, rather
+    than called again inside the embed call — the sorted string is both a stored
+    feature and the embedding input, and they must be identical.
+    """
+    return f"""
+    SELECT
+      `user_id`,
+      window_start,
+      window_end,
+      txn_count_10m,
+      txn_amount_sum_10m,
+      txn_amount_avg_10m,
+      txn_amount_max_10m,
+      txn_amount_stddev_10m,
+      distinct_merchants_10m,
+      behavior_summary,
+      embed_behavior(
+        txn_count_10m, txn_amount_avg_10m, txn_amount_max_10m, behavior_summary
+      ) AS embedding
+    FROM (
+      SELECT *, sorted_categories(categories_agg) AS behavior_summary
+      FROM {agg_view}
+    )
     """
 
 
@@ -168,9 +203,13 @@ def main() -> int:
                          args.startup_mode, bounded=False)
     )
 
-    agg = t_env.sql_query(windowed_aggregate_sql())
+    register_embedding_udfs(t_env)
+    t_env.create_temporary_view("windowed", t_env.sql_query(windowed_aggregate_sql()))
+    final = t_env.sql_query(enriched_sql())
 
-    # Phase 4 sink. Rows land in the TaskManager stdout: `make logs S=taskmanager`.
+    # Phase 5 sink. Rows land in the TaskManager stdout: `make logs S=taskmanager`.
+    # The 384-dim vector is truncated in the print output for legibility; Phase 6
+    # replaces this with the Feast/Redis writer.
     t_env.execute_sql("""
     CREATE TABLE window_print (
       `user_id`                BIGINT,
@@ -182,11 +221,12 @@ def main() -> int:
       txn_amount_max_10m       DOUBLE,
       txn_amount_stddev_10m    DOUBLE,
       distinct_merchants_10m   BIGINT,
-      category_counts          MULTISET<STRING>
+      behavior_summary         STRING,
+      embedding                ARRAY<FLOAT>
     ) WITH ('connector' = 'print')
     """)
 
-    result = agg.execute_insert("window_print")
+    result = final.execute_insert("window_print")
     if args.no_wait:
         job_id = result.get_job_client().get_job_id()
         print(f"submitted: {job_id}  ->  http://localhost:8081")
