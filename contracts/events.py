@@ -25,13 +25,21 @@ EVENT_FIELDS: dict[str, tuple[str, str]] = {
     "country":           ("string",  "STRING"),
     "device":            ("string",  "STRING"),
     "is_card_present":   ("boolean", "BOOLEAN"),
-    "event_timestamp":   ("string",  "TIMESTAMP(3)"),
+    # TIMESTAMP_LTZ(3), not TIMESTAMP(3). The producer emits a UTC instant with
+    # an explicit `Z` (`2026-08-03T06:30:13.695Z`). TIMESTAMP(3) is a timestamp
+    # WITHOUT time zone, and Flink's ISO-8601 JSON parser rejects the trailing
+    # `Z` for it — silently, yielding NULL rowtimes, a watermark that never
+    # advances, and a job that produces zero rows without erroring. Measured:
+    # every one of 48,000 events parsed to NaT before this was corrected.
+    "event_timestamp":   ("string",  "TIMESTAMP_LTZ(3)"),
 }
 
-#: The rowtime column. ARCHITECTURE.md §4: the wire field is `event_timestamp`,
-#: and the DDL exposes it as `event_time` so prose and SQL agree on one name.
+#: The rowtime column. ONE name end to end: Flink's JSON format matches columns
+#: to JSON keys by name and offers no field-mapping option, so renaming would
+#: cost a computed column and buy nothing. `event_timestamp` is also Feast's
+#: conventional name for the same concept.
 ROWTIME_WIRE_FIELD = "event_timestamp"
-ROWTIME_COLUMN = "event_time"
+ROWTIME_COLUMN = ROWTIME_WIRE_FIELD
 
 #: Producer emits `2026-08-01T12:00:00.123Z`. Flink's JSON format only parses
 #: that when told to — the default is the SQL standard (`... 12:00:00.123`),
@@ -39,7 +47,7 @@ ROWTIME_COLUMN = "event_time"
 JSON_TIMESTAMP_FORMAT = "ISO-8601"
 
 #: Matches the producer's injected lateness (see generate_stream.py --max-lateness).
-WATERMARK_DELAY = "30' SECOND"
+WATERMARK_DELAY_SECONDS = 30
 
 MERCHANT_CATEGORIES: tuple[str, ...] = (
     "coffee_shop", "grocery", "rideshare", "restaurant", "streaming",
@@ -55,20 +63,17 @@ CURRENCIES: dict[str, str] = {
 
 
 def source_ddl_columns() -> str:
-    """Column list for the Flink Kafka source DDL, minus the watermark clause.
-
-    The rowtime column is renamed from the wire field, so Phase 4 does not have
-    to remember which of the two names belongs where.
-    """
-    lines = []
-    for name, (_json_type, flink_type) in EVENT_FIELDS.items():
-        if name == ROWTIME_WIRE_FIELD:
-            lines.append(f"  `{ROWTIME_COLUMN}` {flink_type}")
-        else:
-            lines.append(f"  `{name}` {flink_type}")
-    return ",\n".join(lines)
+    """Column list for the Flink Kafka source DDL, minus the watermark clause."""
+    return ",\n".join(
+        f"  `{name}` {flink_type}"
+        for name, (_json_type, flink_type) in EVENT_FIELDS.items()
+    )
 
 
-def json_field_mapping() -> dict[str, str]:
-    """DDL column -> wire field, for the columns where the two differ."""
-    return {ROWTIME_COLUMN: ROWTIME_WIRE_FIELD}
+def watermark_clause() -> str:
+    """Event-time watermark. The delay must be >= the producer's injected
+    lateness, or Flink drops events the producer deliberately delayed."""
+    return (
+        f"  WATERMARK FOR `{ROWTIME_COLUMN}` AS "
+        f"`{ROWTIME_COLUMN}` - INTERVAL '{WATERMARK_DELAY_SECONDS}' SECOND"
+    )

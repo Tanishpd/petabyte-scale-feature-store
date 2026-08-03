@@ -82,7 +82,11 @@ def build(hours: float, users: int, eps: int, seed: int) -> pd.DataFrame:
 
     rows = []
     for w_end in window_ends:
-        w = df[(df["ts"] > w_end - size) & (df["ts"] <= w_end)]
+        # Flink window bounds are [window_start, window_end) — a record stamped
+        # exactly at window_end belongs to the NEXT window. Getting this
+        # backwards puts boundary events in the wrong window, so the offline
+        # and online values for the same (user, window) would disagree.
+        w = df[(df["ts"] >= w_end - size) & (df["ts"] < w_end)]
         if w.empty:
             continue
         g = w.groupby("user_id")

@@ -1,6 +1,6 @@
 # Build Plan — Petabyte-Scale Feature Store & Streaming Pipeline
 
-> Status: **Phases 0–3 complete** (2026-08-03). Next: Phase 4, the Flink aggregation.
+> Status: **Phases 0–4 complete** (2026-08-03). Next: Phase 5, the embedding UDF.
 > Update the status column as phases land.
 > Every phase has a *verifiable* acceptance criterion. A phase is not done until its check passes.
 

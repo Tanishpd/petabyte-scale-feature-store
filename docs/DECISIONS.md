@@ -213,10 +213,21 @@ escape hatch if the compile proves unworkable.
 
 ---
 
-## ADR-010 — Deduplicate the category list in Python, not with SQL `DISTINCT`
+## ADR-010 — Collect categories as a `MULTISET`, and sort in Python
 
-**Decision.** `behavior_summary` is computed as a plain `LISTAGG(merchant_category)`, then deduplicated
-and sorted in Python. The normalised string is what gets both stored as the feature and embedded.
+**Decision.** `behavior_summary` comes from `COLLECT(merchant_category)` — a `MULTISET<STRING>`, which
+PyFlink hands over as a `{category: count}` dict — then sorted in Python. The normalised string is what
+gets both stored as the feature and embedded.
+
+**Amended after measuring** (this ADR first said "plain `LISTAGG`, deduplicate in Python"). That works,
+but `LISTAGG` concatenates one entry per *transaction*: the busiest user in a 10-minute window had 5,293
+transactions across 12 distinct categories, so the pipeline was building a ~50 KB string per row purely to
+throw it away in dedup — and handing it to the Phase 5 embedding UDF on the way. `COLLECT` keeps a
+bounded multiset (≤ 12 entries here) and carries per-category counts for free.
+
+`COLLECT` under a HOP window plans and executes fine on 2.2.1. One caveat: `MULTISET` cannot cross Arrow,
+so `to_pandas()` fails on it with an opaque `collectAsPandasDataFrame` error — use `.execute().collect()`.
+That is a serialisation limit, not a planner one, and it does not affect the streaming path.
 
 **Evidence.** `LISTAGG(DISTINCT ...)` inside a HOP window TVF **fails at plan time** on Flink 2.2.1:
 
@@ -236,6 +247,9 @@ in the *same query* plans fine, plain `LISTAGG` in the *same window* plans fine,
 `DISTINCT`. This record exists to stop that.
 
 **Bonus.** Python-side normalisation also fixes a correctness problem SQL `DISTINCT` would not have:
-`LISTAGG` concatenates in arrival order, and this pipeline deliberately injects out-of-order events, so
-identical window contents could otherwise render different sentences and embed to different vectors.
-Sorting makes the embedding input deterministic.
+neither `LISTAGG`'s concatenation order nor a dict's key order is defined, and this pipeline deliberately
+injects out-of-order events, so identical window contents could otherwise render different sentences and
+embed to different vectors. Sorting makes the embedding input deterministic.
+
+**Verified.** `make verify-windows` compares Flink against an independent pandas recomputation over 4,433
+(user, window) pairs: `behavior_summary` matches on every row, and the rolling average agrees to 3.6e-12.

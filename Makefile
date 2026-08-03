@@ -14,6 +14,7 @@ TOPIC        ?= transactions
 PARTITIONS   ?= 6
 RETENTION_MS ?= 3600000
 EPS          ?= 5000
+VERIFY_TOPIC ?= transactions_verify
 
 # Host-side Redis port. 6380 by default so the stack coexists with a system or
 # Homebrew redis on 6379. Inside the compose network it is always redis:6379.
@@ -29,7 +30,8 @@ endif
 
 .DEFAULT_GOAL := help
 .PHONY: help bootstrap build up down restart ps logs health topics sample tail-topic topic-count \
-        produce submit apply seed registry read bench test smoke clean nuke
+        produce submit apply seed registry read bench test smoke clean nuke \
+        verify-seed verify-windows
 
 help:  ## Show this help
 	@echo "Petabyte-Scale Feature Store — available targets:"
@@ -130,10 +132,11 @@ registry:  ## Show what is registered
 	@cd src/feast_repo && ../../$(VENV)/bin/feast feature-views list \
 	  && echo && ../../$(VENV)/bin/feast entities list
 
-submit:  ## [Phase 4-6] Submit the PyFlink job into the cluster
+submit:  ## Submit the PyFlink job (FROM_START=1 to replay, JOB_TOPIC=x)
 	@test -f src/flink/streaming_job.py \
 	  || { echo "Not built yet — Phase 4 in PLAN.md."; exit 1; }
-	$(COMPOSE) exec jobmanager flink run -py /opt/project/src/flink/streaming_job.py
+	$(COMPOSE) exec -T jobmanager flink run -d -py /opt/project/src/flink/streaming_job.py \
+	  --no-wait $(if $(FROM_START),--startup-mode earliest-offset,) $(if $(JOB_TOPIC),--topic $(JOB_TOPIC),)
 
 read:  ## [Phase 7] Read features back the way a model would
 	@test -f src/serving/online_read.py \
@@ -161,3 +164,18 @@ clean:  ## Remove the stack and its volumes (keeps images)
 nuke: clean  ## clean + drop the built Flink image and the host venv
 	-docker image rm petafs/flink:2.2.1
 	rm -rf $(VENV)
+
+# ---------------------------------------------------------------- Phase 4 ---
+
+verify-seed:  ## Backfill a small, ordered history into the verification topic
+	@$(COMPOSE) exec -T kafka /opt/kafka/bin/kafka-topics.sh \
+	  --bootstrap-server localhost:9092 --create --if-not-exists \
+	  --topic $(VERIFY_TOPIC) --partitions 3 --replication-factor 1 \
+	  --config retention.ms=$(RETENTION_MS) >/dev/null
+	$(PY) src/producer/generate_stream.py --topic $(VERIFY_TOPIC) \
+	  --backfill $(or $(SPAN),1200) --eps $(or $(VEPS),40) --users $(or $(VUSERS),150) \
+	  --late-rate 0 --seed 42
+
+verify-windows:  ## Prove Flink's aggregates match a pandas recomputation
+	$(COMPOSE) exec -T jobmanager python /opt/project/src/flink/verify_windows.py \
+	  --topic $(VERIFY_TOPIC)

@@ -274,6 +274,11 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--dry-run", action="store_true",
                     help="generate and print a few events without touching Kafka")
+    ap.add_argument("--backfill", type=float, default=0, metavar="SECONDS",
+                    help="emit a historical span of this many seconds, sorted by "
+                         "event time, as fast as possible, then exit. Sorting is "
+                         "required: out-of-order history would advance the "
+                         "watermark past earlier events and Flink would drop them.")
     args = ap.parse_args()
 
     gen = EventGenerator(
@@ -290,6 +295,31 @@ def main() -> int:
     producer = build_producer(args.bootstrap, args.acks, args.compression)
     stats = Stats()
     running = True
+
+    if args.backfill:
+        n = int(args.backfill * args.eps)
+        print(f"backfilling {n:,} events over {args.backfill:.0f}s of history "
+              f"-> {args.bootstrap} topic={args.topic}")
+        now = time.time()
+        events, n_anom, n_late = gen.batch(n, now=now)
+        # Re-stamp across the span, then sort ascending so the watermark only
+        # ever moves forward and nothing is dropped as late.
+        span = np.linspace(now - args.backfill, now, num=n)
+        for ev, ts in zip(events, span):
+            ev["event_timestamp"] = gen._iso_ms(ts)
+        events.sort(key=lambda e: e["event_timestamp"])
+        for e in events:
+            payload = json.dumps(e, separators=(",", ":")).encode()
+            producer.send(args.topic, key=str(e["user_id"]).encode(), value=payload)
+            stats.bytes_sent += len(payload)
+        stats.sent = len(events)
+        stats.anomalies, stats.late = n_anom, n_late
+        producer.flush(timeout=60)
+        producer.close(timeout=10)
+        print(f"backfilled {stats.sent:,} events, "
+              f"{stats.bytes_sent / (1 << 20):.1f} MiB, "
+              f"span {events[0]['event_timestamp']} .. {events[-1]['event_timestamp']}")
+        return 0
 
     def stop(_sig, _frm):
         nonlocal running

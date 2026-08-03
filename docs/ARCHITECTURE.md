@@ -89,7 +89,7 @@ lives in `contracts/schema.py` so `feature_store.yaml` and the sink cannot drift
 | `txn_amount_max_10m` | Float64 | `MAX(amount)` |
 | `txn_amount_stddev_10m` | Float64 | `STDDEV_POP(amount)` |
 | `distinct_merchants_10m` | Int64 | `COUNT(DISTINCT merchant_id)` |
-| `behavior_summary` | String | `LISTAGG(merchant_category)`, then deduped + sorted in Python — see §4 |
+| `behavior_summary` | String | `COLLECT(merchant_category)` → `MULTISET`, sorted in Python — see §4 |
 | `embedding` | Array(Float32), 384 | MiniLM over a rendered sentence |
 | `window_end` | UnixTimestamp | window boundary, doubles as feature freshness |
 
@@ -113,21 +113,30 @@ what gets stored as `behavior_summary`, so the feature and the embedding input n
 window advancing every minute. Each user therefore gets a fresh feature row every minute reflecting their
 last 10 minutes of activity.
 
-The source DDL declares the rowtime column as `event_time TIMESTAMP(3)`, mapped from the JSON field
-`event_timestamp`, with the `WATERMARK` clause on it. Everything downstream — the TVF above, the diagram
-in §1 — refers to `event_time`; `event_timestamp` only ever names the wire field.
+The rowtime column is `event_timestamp TIMESTAMP_LTZ(3)` — one name end to end, since Flink's JSON format
+matches columns to JSON keys by name and has no field-mapping option.
+
+**`TIMESTAMP_LTZ(3)`, not `TIMESTAMP(3)`**, and this is not cosmetic. The producer emits a UTC instant
+with an explicit `Z` (`2026-08-03T06:30:13.695Z`). `TIMESTAMP(3)` is a timestamp *without* time zone, and
+Flink's ISO-8601 JSON parser rejects the trailing `Z` for it. Combined with `json.ignore-parse-errors`,
+that rejection becomes a NULL rather than an error: the watermark never advances, no window ever fires,
+and the job reports success while emitting nothing. Measured during Phase 4 — all 48,000 events parsed to
+`NaT` before the type was corrected. The source therefore defaults to
+`json.ignore-parse-errors = false`, so a schema mismatch is loud instead of silent.
 
 Three properties matter downstream:
 - **Append-only output.** Windowed aggregation emits each window once, on close. That means
   `to_data_stream()` yields an append stream, and the sink can be a plain writer with no retraction
   handling. A non-windowed `GROUP BY` would produce a changelog and require the sink to process
   retract/update-before messages.
-- **No `DISTINCT` inside `LISTAGG`.** `LISTAGG(DISTINCT ...)` under a HOP window **fails at plan time** on
-  Flink 2.2.1 with `TableException: This function does not support retraction`. Sliced hopping windows
-  force retraction-capable codegen for distinct aggregates, and `ListAggFunction` has no
+- **Categories use `COLLECT`, not `LISTAGG`.** `LISTAGG(DISTINCT ...)` under a HOP window **fails at plan
+  time** on Flink 2.2.1 with `TableException: This function does not support retraction` — sliced hopping
+  windows force retraction-capable codegen for distinct aggregates, and `ListAggFunction` has no
   `retractExpressions`. Note the trap: `COUNT(DISTINCT ...)` in the *same query* is fine, plain `LISTAGG`
   in a HOP window is fine, and `LISTAGG(DISTINCT ...)` under `TUMBLE` is fine — only this exact
-  combination breaks, so it invites being "fixed" back. Dedup happens in Python instead (§3).
+  combination breaks, so it invites being "fixed" back.
+  Plain `LISTAGG` does work, but emits one entry per *transaction* (~50 KB for the busiest measured user)
+  where `COLLECT` returns a bounded `MULTISET` of ≤ 12 entries with counts. See [ADR-010](DECISIONS.md).
 - **Event-time correctness.** Watermarks are `event_time - 30s`, matching the producer's injected
   lateness. Events later than that are dropped by the windowing operator. Surfacing a count of them takes
   deliberate work — Table API has no built-in late-record metric on window TVFs — so treat "we measure
