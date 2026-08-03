@@ -16,6 +16,8 @@ redis>=4.2.2,<8
 
 pandas>=2.0,<3
 pyarrow>=15,<22
+# Direct dependency of the producer's vectorised generator, not just pandas'.
+numpy>=1.26,<3
 
 # Test + tooling
 pytest>=8,<9

@@ -36,16 +36,17 @@ petabyte offline and 90 GB online are the same system.
 
 ## 2. Event-rate arithmetic
 
-At ~350 bytes/event:
+ⓜ **258 bytes/event**, measured over 545k generated events (compact JSON, no whitespace). An earlier
+draft of this document assumed 350 B; every figure below is recomputed from the measurement.
 
 | Rate | Bytes/s | Per day | Time to 1 PB (raw) |
 |---|---|---|---|
-| 10k/s | 3.5 MB/s | 300 GB | ~9 years |
-| 100k/s | 35 MB/s | 3 TB | ~11 months |
-| 1M/s | 350 MB/s | 30 TB | **~5 weeks** |
+| 10k/s | 2.6 MB/s | 223 GB | ~12 years |
+| 100k/s | 25.8 MB/s | 2.2 TB | ~15 months |
+| 1M/s | 258 MB/s | 22.3 TB | **~6.5 weeks** |
 
-Compressed parquet at ~10:1 on this schema (low-cardinality categoricals compress well) pushes 1 PB out
-to roughly a year at 1M/s.
+Compressed parquet at ⓔ ~10:1 on this schema (low-cardinality categoricals compress well) pushes 1 PB out
+to well over a year at 1M/s.
 
 ## 3. The embedding bottleneck, and why the design sidesteps it
 
@@ -96,9 +97,14 @@ Parallelism is capped by partition count — that's why partitions are the first
 
 Raise load 10× at a time and the failures arrive in this sequence:
 
-1. **~10k events/s** — single-broker Kafka on a laptop saturates. *Fix:* partitions + brokers.
+1. ⓜ **~30k events/s — the single-threaded Python producer**, not Kafka. Measured: one producer tracks its
+   target exactly to 5k, and tops out at 29.6k (74% of a 40k ask). Two producers in parallel each hold 20k
+   for an **aggregate of 39,972 eps**, which proves the broker was never the constraint — the limit is
+   CPU-bound event generation plus `kafka-python`'s pure-Python protocol. *Fix:* run N producers, or move
+   to `confluent-kafka` (librdkafka). An earlier draft of this section blamed single-broker Kafka at ~10k;
+   that was wrong, and measuring it is what corrected it.
 2. **~50k events/s** — Flink checkpoint duration climbs as state grows; backpressure appears in the UI.
-   *Fix:* RocksDB backend, incremental checkpoints, unaligned checkpoints.
+   *Fix:* RocksDB backend, incremental checkpoints, unaligned checkpoints. ⓔ — not yet reached.
 3. **~100k reads/s** — single Redis node hits its ceiling. *Fix:* Redis Cluster; Feast supports
    `redis_type: redis_cluster` natively.
 4. **Then, and only then, embeddings** — because §3 decoupled them from event rate. If they *did* appear

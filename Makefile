@@ -28,7 +28,7 @@ PROFILES :=
 endif
 
 .DEFAULT_GOAL := help
-.PHONY: help bootstrap build up down restart ps logs health topics \
+.PHONY: help bootstrap build up down restart ps logs health topics sample tail-topic topic-count \
         produce submit apply read bench test smoke clean nuke
 
 help:  ## Show this help
@@ -97,10 +97,26 @@ topics:  ## Create the transactions topic with retention caps
 # --------------------------------------------------------- Phases 2 and on ---
 # Defined so the interface is visible, but honest about not existing yet.
 
-produce:  ## [Phase 2] Stream mock transactions into Kafka
-	@test -f src/producer/generate_stream.py \
-	  || { echo "Not built yet — Phase 2 in PLAN.md."; exit 1; }
-	$(PY) src/producer/generate_stream.py --eps $(EPS) --topic $(TOPIC)
+produce:  ## Stream mock transactions into Kafka (EPS=n, DURATION=s)
+	$(PY) src/producer/generate_stream.py --eps $(EPS) --topic $(TOPIC) \
+	  $(if $(DURATION),--duration $(DURATION),)
+
+sample:  ## Print a few generated events without touching Kafka
+	$(PY) src/producer/generate_stream.py --dry-run
+
+tail-topic:  ## Show N recent events as JSON (N=5 default)
+	@# --from-beginning is required: the console consumer defaults to the LATEST
+	@# offset and would block forever when no producer is running. -T avoids a
+	@# TTY that hangs in non-interactive shells. timeout-ms bounds an empty topic.
+	@$(COMPOSE) exec -T kafka /opt/kafka/bin/kafka-console-consumer.sh \
+	  --bootstrap-server localhost:9092 --topic $(TOPIC) --from-beginning \
+	  --max-messages $(or $(N),5) --timeout-ms 10000 2>/dev/null \
+	  || echo "(topic empty or fewer than $(or $(N),5) records — run 'make produce')"
+
+topic-count:  ## Total records currently in the topic
+	@$(COMPOSE) exec -T kafka /opt/kafka/bin/kafka-get-offsets.sh \
+	  --bootstrap-server localhost:9092 --topic $(TOPIC) \
+	  | awk -F: '{s+=$$3} END {print "records:", s+0}'
 
 apply:  ## [Phase 3] Register feature definitions with Feast
 	@test -f src/feast_repo/feature_store.yaml \

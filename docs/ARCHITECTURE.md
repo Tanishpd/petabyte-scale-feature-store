@@ -59,8 +59,14 @@ file registered as the feature view's batch source. At real scale this is object
 }
 ```
 
-~350 bytes serialized. Keyed by `user_id` so a user's events land on one partition and ordering is
-per-user consistent.
+**258 bytes serialized** (measured over 545k events; compact JSON, no whitespace). Keyed by `user_id` so
+a user's events land on one partition and ordering is per-user consistent.
+
+`country`/`currency` follow the **user**, not the event — each user has one home market, assigned once.
+Drawing per event would let a single user transact in USD then BRL, making `txn_amount_avg_10m` an
+average over mixed currencies. Amounts are FX-scaled so a coffee reads as ~R$15 rather than ~R$4. Per-user
+aggregates are therefore coherent in the user's own currency; a production feature would additionally
+carry a USD-normalised amount so cross-user comparisons work.
 
 ## 3. Feature view — `user_txn_stats_10m`
 
