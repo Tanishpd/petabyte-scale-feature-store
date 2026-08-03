@@ -1,6 +1,6 @@
 # Build Plan — Petabyte-Scale Feature Store & Streaming Pipeline
 
-> Status: **Phases 0–2 complete** (2026-08-03). Next: Phase 3, the feature contract + Feast repo.
+> Status: **Phases 0–3 complete** (2026-08-03). Next: Phase 4, the Flink aggregation.
 > Update the status column as phases land.
 > Every phase has a *verifiable* acceptance criterion. A phase is not done until its check passes.
 
@@ -20,7 +20,7 @@ them back in single-digit milliseconds via `feast.get_online_features()` — wit
 | 0 | Foundations | Repo skeleton, py3.11 venv, pinned `requirements*.txt`, `Makefile` | `make bootstrap` → feast 0.65.0, redis 7.4.1 (<8), kafka-python 3.0.9 | ☑ |
 | 1 | Infrastructure | `docker-compose.yml`: Kafka (KRaft), Flink JM+TM (custom image), Redis Stack, Kafka UI | `make up` → 4 services healthy, TM registered with 2 slots, Invariant-4 round-trip on `localhost:29092` | ☑ |
 | 2 | Mock stream | `producer/generate_stream.py` — Zipf users, anomalies, late events, tunable EPS | 4,998 eps vs 5,000 target (100.0%); anomalies 0.51%, late 7.85%; 15 tests green | ☑ |
-| 3 | Feature contract + Feast repo | `contracts/schema.py` (single source of truth), Feast entity/FV, seeded offline parquet | `feast apply` clean; `feast feature-views list` shows `user_txn_stats_10m` | ☐ |
+| 3 | Feature contract + Feast repo | `contracts/schema.py` (single source of truth), Feast entity/FV, seeded offline parquet | `feast apply` clean; registry shows `user_txn_stats_10m`; **Feast's field hashes byte-match `qualified()`** for all 9 features | ☑ |
 | 4 | Flink aggregation | PyFlink job: Kafka → watermarks → HOP(10min/1min) → print | Printed rolling avg matches a pandas recomputation of the same window (±1e-6) | ☐ |
 | 5 | Embedding UDF | Pandas UDF (`func_type="pandas"`), model baked into image, offline mode | Job emits `ARRAY<FLOAT>` len 384; ≥500 embeddings/s/slot measured | ☐ |
 | 6 | **Feast-compatible Redis sink** | `sinks/feast_redis_sink.py` using Feast's own key codec | **Round-trip test**: Flink writes → `get_online_features()` returns identical values | ☐ |

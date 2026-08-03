@@ -29,7 +29,7 @@ endif
 
 .DEFAULT_GOAL := help
 .PHONY: help bootstrap build up down restart ps logs health topics sample tail-topic topic-count \
-        produce submit apply read bench test smoke clean nuke
+        produce submit apply seed registry read bench test smoke clean nuke
 
 help:  ## Show this help
 	@echo "Petabyte-Scale Feature Store — available targets:"
@@ -118,10 +118,17 @@ topic-count:  ## Total records currently in the topic
 	  --bootstrap-server localhost:9092 --topic $(TOPIC) \
 	  | awk -F: '{s+=$$3} END {print "records:", s+0}'
 
-apply:  ## [Phase 3] Register feature definitions with Feast
-	@test -f src/feast_repo/feature_store.yaml \
-	  || { echo "Not built yet — Phase 3 in PLAN.md."; exit 1; }
+seed:  ## Generate the offline parquet backing the FeatureView's batch source
+	$(PY) scripts/seed_offline.py $(if $(HOURS),--hours $(HOURS),) $(if $(USERS),--users $(USERS),)
+
+apply:  ## Register feature definitions with Feast
+	@test -f src/feast_repo/data/user_txn_stats_10m.parquet \
+	  || { echo "No batch source yet — run 'make seed' first."; exit 1; }
 	cd src/feast_repo && ../../$(VENV)/bin/feast apply
+
+registry:  ## Show what is registered
+	@cd src/feast_repo && ../../$(VENV)/bin/feast feature-views list \
+	  && echo && ../../$(VENV)/bin/feast entities list
 
 submit:  ## [Phase 4-6] Submit the PyFlink job into the cluster
 	@test -f src/flink/streaming_job.py \

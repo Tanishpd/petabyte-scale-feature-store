@@ -1,0 +1,37 @@
+# Feast repo config. Applied with `make apply`.
+#
+# Values here are mirrored in contracts/schema.py — Feast needs literals in
+# YAML, so tests/test_feature_contract.py asserts the two agree rather than
+# letting them drift silently.
+
+project: petafs
+provider: local
+
+registry:
+  path: data/registry.db
+  # CLAUDE.md Invariant 8 — pinned explicitly, not left to the default.
+  # When true, Feast resolves the feature-view name through _versioned_fv_name()
+  # BEFORE hashing, appending _v{N} inside both the mmh3 field key and the _ts:
+  # key. Our Flink sink hashes the raw name from contracts/schema.py. The trap:
+  # a fresh FV is v0 and unsuffixed, so everything works until the first schema
+  # change promotes it to v1 — after which reads silently return None.
+  enable_online_feature_view_versioning: false
+
+online_store:
+  type: redis
+  # Host port 6380, not 6379: this machine runs a system redis on 6379.
+  # Inside the compose network the Flink sink uses redis:6379 — only the host
+  # side moves. Same shape as the Kafka dual-listener (Invariant 4).
+  connection_string: localhost:6380
+  # The ONLY mechanism that expires online values. FeatureView.ttl does not.
+  # Our sink bypasses online_write_batch, so the sink issues EXPIRE itself and
+  # reads this same number from contracts.schema.ONLINE_TTL_SECONDS.
+  key_ttl_seconds: 1800
+
+offline_store:
+  type: file
+
+# Invariant 3: v2 and v3 encode entity keys differently, and a mismatch between
+# this and the sink's _redis_key() call is a permanent cache miss. 3 is already
+# the default in 0.65.0; stated here so an old tutorial's `2` is visibly wrong.
+entity_key_serialization_version: 3
