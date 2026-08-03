@@ -1,0 +1,145 @@
+"""Flink -> Redis, in Feast's own encoding. The hot path of the whole project.
+
+Shape (ARCHITECTURE.md §6):
+
+    ds = t_env.to_data_stream(table)
+    ds.map(FeastRedisWriter(), output_type=Types.STRING()).name("feast-redis-writer")
+
+Three PyFlink specifics, each a plausible Java-idiom mistake:
+
+- `to_data_stream` is a **StreamTableEnvironment** method, not a `Table` one.
+- There is **no `RichMapFunction`** in PyFlink. `MapFunction` is already rich:
+  `open(runtime_context)` / `close()` live on the base `Function`.
+- **No terminal sink is required.** `map()` registers its operator with the
+  execution environment at creation, so a side-effect-only branch runs on
+  `execute()`. (`DiscardingSink` is the instinctive choice and does not exist
+  in PyFlink 2.2.1.)
+
+Writes are pipelined and flushed at 500 rows or 100 ms, whichever comes first.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import time
+from datetime import datetime, timezone
+
+sys.path.insert(0, "/opt/project")
+
+from pyflink.datastream.functions import MapFunction  # noqa: E402
+
+from contracts.schema import FEATURES, ONLINE_TTL_SECONDS, TS_KEY  # noqa: E402
+from src.flink.sinks.feast_codec import decode_ts, encode_row  # noqa: E402
+
+# Invariant 4's shape: inside the compose network Redis is always redis:6379.
+# Only the *host* mapping moved to 6380 to coexist with a system redis.
+REDIS_HOST = os.environ.get("REDIS_HOST", "redis")
+REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
+
+FLUSH_ROWS = int(os.environ.get("SINK_FLUSH_ROWS", "500"))
+FLUSH_MS = int(os.environ.get("SINK_FLUSH_MS", "100"))
+
+
+class FeastRedisWriter(MapFunction):
+    """Buffers rows, then writes them as Feast-encoded hashes.
+
+    Row layout is positional and comes from `enriched_sql()`:
+        0 user_id, 1 window_start, 2 window_end, 3..8 numeric features,
+        9 behavior_summary, 10 embedding
+    """
+
+    def open(self, runtime_context):
+        import redis
+
+        self._client = redis.Redis(
+            host=REDIS_HOST, port=REDIS_PORT,
+            socket_timeout=5, socket_connect_timeout=5,
+            health_check_interval=30,
+        )
+        self._client.ping()          # fail at open(), not on the first row
+        self._buf: list[tuple[int, dict, datetime]] = []
+        self._last_flush = time.monotonic()
+        self.written = 0
+        self.skipped_stale = 0
+
+    def _row_to_features(self, row) -> tuple[int, dict, datetime]:
+        user_id = row[0]
+        window_end = row[2]
+        # window_end arrives as a datetime; make it tz-aware so the Timestamp
+        # proto and any comparison against a stored _ts agree on a zone.
+        if window_end.tzinfo is None:
+            window_end = window_end.replace(tzinfo=timezone.utc)
+
+        values = {
+            "txn_count_10m": row[3],
+            "txn_amount_sum_10m": row[4],
+            "txn_amount_avg_10m": row[5],
+            "txn_amount_max_10m": row[6],
+            "txn_amount_stddev_10m": row[7],
+            "distinct_merchants_10m": row[8],
+            "behavior_summary": row[9],
+            "embedding": row[10],
+            "window_end": int(window_end.timestamp()),
+        }
+        missing = set(FEATURES) - set(values)
+        if missing:
+            raise KeyError(f"sink is not writing contract features: {sorted(missing)}")
+        return user_id, values, window_end
+
+    def _flush(self) -> None:
+        if not self._buf:
+            return
+
+        encoded = [encode_row(uid, feats, ts) for uid, feats, ts in self._buf]
+
+        # Staleness guard. Feast's own default write path reads `_ts` first and
+        # refuses to regress a newer value to an older one; our sink bypasses
+        # online_write_batch, so it has to do the same. HOP windows fire in
+        # window_end order per key, but a replay after a Flink restart would
+        # otherwise overwrite fresh values with stale ones.
+        with self._client.pipeline(transaction=False) as pipe:
+            for key, _ in encoded:
+                pipe.hget(key, TS_KEY)
+            existing = pipe.execute()
+
+        with self._client.pipeline(transaction=False) as pipe:
+            n = 0
+            for (key, mapping), (_uid, _feats, ts), prev_raw in zip(
+                encoded, self._buf, existing
+            ):
+                prev = decode_ts(prev_raw)
+                if prev is not None:
+                    prev = prev.replace(tzinfo=timezone.utc)
+                    if ts <= prev:
+                        self.skipped_stale += 1
+                        continue
+                pipe.hset(key, mapping=mapping)
+                # FeatureView.ttl does NOT expire Redis keys, and because this
+                # sink bypasses online_write_batch, key_ttl_seconds in the yaml
+                # would never be applied either. The sink must do it.
+                pipe.expire(key, ONLINE_TTL_SECONDS)
+                n += 1
+            if n:
+                pipe.execute()
+
+        self.written += n
+        self._buf.clear()
+        self._last_flush = time.monotonic()
+
+    def map(self, row):
+        self._buf.append(self._row_to_features(row))
+        due = (len(self._buf) >= FLUSH_ROWS
+               or (time.monotonic() - self._last_flush) * 1000 >= FLUSH_MS)
+        if due:
+            self._flush()
+        # A map must return something; the value is unused downstream.
+        return f"{row[0]}"
+
+    def close(self):
+        try:
+            self._flush()
+        finally:
+            client = getattr(self, "_client", None)
+            if client is not None:
+                client.close()

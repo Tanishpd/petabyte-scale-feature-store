@@ -136,7 +136,8 @@ submit:  ## Submit the PyFlink job (FROM_START=1 to replay, JOB_TOPIC=x)
 	@test -f src/flink/streaming_job.py \
 	  || { echo "Not built yet — Phase 4 in PLAN.md."; exit 1; }
 	$(COMPOSE) exec -T jobmanager flink run -d -py /opt/project/src/flink/streaming_job.py \
-	  --no-wait $(if $(FROM_START),--startup-mode earliest-offset,) $(if $(JOB_TOPIC),--topic $(JOB_TOPIC),)
+	  --no-wait --sink $(or $(SINK),redis) \
+	  $(if $(FROM_START),--startup-mode earliest-offset,) $(if $(JOB_TOPIC),--topic $(JOB_TOPIC),)
 
 read:  ## [Phase 7] Read features back the way a model would
 	@test -f src/serving/online_read.py \

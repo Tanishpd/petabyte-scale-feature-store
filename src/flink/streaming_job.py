@@ -167,8 +167,25 @@ def enriched_sql(agg_view: str = "windowed") -> str:
     """
 
 
-def build_env(parallelism: int | None = None) -> TableEnvironment:
-    t_env = TableEnvironment.create(EnvironmentSettings.in_streaming_mode())
+def build_stream_env(parallelism: int | None = None):
+    """Return `(stream_env, table_env)`.
+
+    Deliberately a **StreamTableEnvironment**, built from a
+    StreamExecutionEnvironment. `TableEnvironment.create(...)` returns a plain
+    `TableEnvironment`, which has no `to_data_stream` at all —
+    `AttributeError: 'TableEnvironment' object has no attribute
+    'to_data_stream'` — so the Redis sink hop is unreachable from one. Knowing
+    that `to_data_stream` belongs to StreamTableEnvironment rather than Table is
+    only half of it; you also have to construct the right environment.
+    """
+    from pyflink.datastream import StreamExecutionEnvironment
+    from pyflink.table import StreamTableEnvironment
+
+    env = StreamExecutionEnvironment.get_execution_environment()
+    if parallelism:
+        env.set_parallelism(parallelism)
+
+    t_env = StreamTableEnvironment.create(env)
     cfg = t_env.get_config()
     cfg.set("pipeline.name", "petafs-user-txn-stats-10m")
     # Idle partitions must not stall the watermark. With 6 partitions and a
@@ -177,7 +194,12 @@ def build_env(parallelism: int | None = None) -> TableEnvironment:
     cfg.set("table.exec.source.idle-timeout", "15 s")
     if parallelism:
         cfg.set("parallelism.default", str(parallelism))
-    return t_env
+    return env, t_env
+
+
+def build_env(parallelism: int | None = None):
+    """Table environment only — for the SQL-shaped callers (verify, bench)."""
+    return build_stream_env(parallelism)[1]
 
 
 def main() -> int:
@@ -190,6 +212,9 @@ def main() -> int:
     ap.add_argument("--startup-mode", default="latest-offset",
                     choices=["earliest-offset", "latest-offset", "group-offsets"])
     ap.add_argument("--parallelism", type=int, default=None)
+    ap.add_argument("--sink", default="redis", choices=["redis", "print"],
+                    help="redis writes Feast-encoded hashes (the real path); "
+                         "print dumps rows to the TaskManager stdout")
     ap.add_argument("--no-wait", dest="no_wait", action="store_true",
                     help="submit and return. Required with `flink run -d`. Named "
                          "--no-wait, not --detached: the latter collides with "
@@ -197,7 +222,7 @@ def main() -> int:
                          "launcher instead of reaching this script.")
     args = ap.parse_args()
 
-    t_env = build_env(args.parallelism)
+    stream_env, t_env = build_stream_env(args.parallelism)
     t_env.execute_sql(
         build_source_ddl(args.bootstrap, args.topic, args.group_id,
                          args.startup_mode, bounded=False)
@@ -207,9 +232,11 @@ def main() -> int:
     t_env.create_temporary_view("windowed", t_env.sql_query(windowed_aggregate_sql()))
     final = t_env.sql_query(enriched_sql())
 
-    # Phase 5 sink. Rows land in the TaskManager stdout: `make logs S=taskmanager`.
-    # The 384-dim vector is truncated in the print output for legibility; Phase 6
-    # replaces this with the Feast/Redis writer.
+    if args.sink == "redis":
+        return run_redis_sink(stream_env, t_env, final, args)
+
+    # `print` sink — useful for eyeballing the aggregate without Redis.
+    # Rows land in the TaskManager stdout: `make logs S=taskmanager`.
     t_env.execute_sql("""
     CREATE TABLE window_print (
       `user_id`                BIGINT,
@@ -233,6 +260,33 @@ def main() -> int:
         return 0
 
     result.wait()
+    return 0
+
+
+def run_redis_sink(stream_env, t_env, table, args) -> int:
+    """Table -> DataStream -> Feast-encoded Redis writes.
+
+    `to_data_stream` is a StreamTableEnvironment method, not a Table one. The
+    windowed aggregate is append-only, so the resulting stream needs no
+    retraction handling. `map()` registers its operator with the execution
+    environment at creation, so no terminal sink is required — and PyFlink 2.2.1
+    has no DiscardingSink to attach anyway.
+    """
+    from pyflink.common.typeinfo import Types
+
+    from src.flink.sinks.feast_redis_sink import FeastRedisWriter
+
+    ds = t_env.to_data_stream(table)
+    ds.map(FeastRedisWriter(), output_type=Types.STRING()).name("feast-redis-writer")
+
+    # DataStream jobs execute through the StreamExecutionEnvironment, not the
+    # table env. execute_async returns a JobClient without blocking, which is
+    # what `flink run -d` needs (see --no-wait).
+    if args.no_wait:
+        client = stream_env.execute_async("petafs-user-txn-stats-10m")
+        print(f"submitted: {client.get_job_id()}  ->  http://localhost:8081")
+        return 0
+    stream_env.execute("petafs-user-txn-stats-10m")
     return 0
 
 

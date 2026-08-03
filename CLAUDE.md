@@ -118,6 +118,12 @@ Invariant 4. Override with `REDIS_HOST_PORT=6379`.
   among them. The embedding is stored as an `Array(Float32)` feature and retrieved by key. True ANN needs
   a parallel RediSearch index we maintain ourselves. Do not go looking for a Feast Redis vector config —
   it isn't there.
+- **`TableEnvironment.create()` cannot reach the DataStream API.** It returns a plain
+  `TableEnvironment` with no `to_data_stream`, so the sink hop is unreachable. Build
+  `StreamTableEnvironment.create(StreamExecutionEnvironment.get_execution_environment())` instead, and
+  execute DataStream jobs with `stream_env.execute_async(name)` — not `t_env.execute(...)`.
+- **A `UnixTimestamp` feature is written as int64 seconds and read back as a `datetime`.** Same instant,
+  different Python type; comparing the raw int to the read value looks like a mismatch when it isn't.
 - **UDF workers need `PYTHONPATH=/opt/project`.** PyFlink cloudpickles UDFs and unpickles them in a
   *separate* Python worker process that does not inherit the driver's `sys.path`. A
   `sys.path.insert(...)` at the top of the job script is not enough. Symptom: the job submits cleanly,

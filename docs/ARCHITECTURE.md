@@ -196,7 +196,12 @@ task slot; `map()` buffers into a pipeline and flushes at 500 rows or 100 ms, wh
 Three PyFlink-specific details, each of which is a plausible-looking mistake in Java idiom:
 
 - **`to_data_stream` is a `StreamTableEnvironment` method**, called as `t_env.to_data_stream(table)`.
-  `Table` has no such attribute — its only conversion method is `to_pandas()`.
+  `Table` has no such attribute — its only conversion method is `to_pandas()`. Knowing that is only half
+  of it: `TableEnvironment.create(...)` returns a *plain* `TableEnvironment` which has no
+  `to_data_stream` either, so the environment must be built as
+  `StreamTableEnvironment.create(StreamExecutionEnvironment.get_execution_environment())`.
+- **A DataStream job executes through the stream environment**, not the table one:
+  `stream_env.execute_async(name)` (or `.execute(name)` to block). `t_env.execute(...)` will not run it.
 - **There is no `RichMapFunction` in PyFlink.** That name is Java/Scala. The Python class is
   `MapFunction`, and it is *already* rich: the base `Function` defines `open(runtime_context)` and
   `close()`, which `DataStream.map()` wires through. So `class FeastRedisWriter(MapFunction)` with an
