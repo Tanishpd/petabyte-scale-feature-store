@@ -1,0 +1,28 @@
+# The Flink image build context is the repo root (it needs requirements-flink.txt).
+# Keep everything else out so the context stays small and layer caching holds.
+
+.git/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+docs/
+*.md
+!requirements-flink.txt
+
+data/
+*.parquet
+models/
+.cache/
+
+flink-checkpoints/
+flink-savepoints/
+*.log
+
+.DS_Store
+.idea/
+.vscode/

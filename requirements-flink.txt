@@ -1,0 +1,23 @@
+# Flink container — Python 3.12 (forced by the Ubuntu 24.04 base; ADR-001).
+#
+# Installed inside docker/flink/Dockerfile only. Never install this on the host.
+#
+# ⚠️ apache-flink has NO Linux aarch64 wheel, at any version, so on Apple Silicon
+# pip builds it from the sdist and compiles 7 C extensions. That is why the
+# Dockerfile installs build-essential and python3.12-dev. See ADR-009.
+
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# Must equal the cluster version exactly.
+apache-flink==2.2.1
+
+# CPU-only torch. `torch-cpu` is not a package (PyPI 404).
+# The CPU index publishes manylinux_2_28_aarch64 wheels, so this resolves on
+# arm64 as well as x86_64 — keeping the build identical on both.
+torch==2.9.0+cpu
+
+sentence-transformers==5.6.1
+
+# Needed in the image so the sink can import Feast's own Redis codec
+# (_redis_key / _mmh3 / ValueProto) instead of reimplementing it. See ADR-003.
+feast[redis]==0.65.0

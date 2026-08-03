@@ -1,0 +1,21 @@
+# Host venv — Python 3.11. See docs/DECISIONS.md ADR-001.
+#
+# This set NEVER contains apache-flink: the Flink job is submitted into the
+# container with `flink run -py`, never run from the host. The host only runs
+# the producer, the Feast CLI, and the serving scripts.
+#
+# Do not merge with requirements-flink.txt — different interpreter, different
+# machine, deliberately different resolution.
+
+feast[redis]==0.65.0
+kafka-python==3.0.9
+
+# Pinned by feast[redis] to <8; stated explicitly so an accidental
+# `pip install -U redis` is a visible conflict rather than a silent break.
+redis>=4.2.2,<8
+
+pandas>=2.0,<3
+pyarrow>=15,<22
+
+# Test + tooling
+pytest>=8,<9
