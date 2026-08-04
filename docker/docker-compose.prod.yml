@@ -26,7 +26,18 @@ x-kafka-common: &kafka-common
   environment: &kafka-env
     KAFKA_PROCESS_ROLES: broker,controller
     KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka1:9093,2@kafka2:9093,3@kafka3:9093
-    KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:SASL_PLAINTEXT,EXTERNAL:SASL_PLAINTEXT,CONTROLLER:PLAINTEXT
+    KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:SASL_SSL,EXTERNAL:SASL_SSL,CONTROLLER:PLAINTEXT
+    # SASL_SSL: authenticated AND encrypted. SASL_PLAINTEXT proves who a client
+    # is but leaves every event, and the credentials themselves, readable on the
+    # wire. CONTROLLER stays PLAINTEXT — internal-only, and securing the KRaft
+    # quorum has a bootstrap-ordering problem.
+    KAFKA_SSL_KEYSTORE_PASSWORD: ${TLS_STOREPASS:-petafs-dev-secret}
+    KAFKA_SSL_KEY_PASSWORD: ${TLS_STOREPASS:-petafs-dev-secret}
+    KAFKA_SSL_TRUSTSTORE_LOCATION: /tls/kafka.truststore.jks
+    KAFKA_SSL_TRUSTSTORE_PASSWORD: ${TLS_STOREPASS:-petafs-dev-secret}
+    # Verify the broker hostname against the cert SANs. Empty (the Kafka
+    # default) encrypts the transport while accepting any certificate.
+    KAFKA_SSL_ENDPOINT_IDENTIFICATION_ALGORITHM: https
     # SASL/PLAIN on both client-facing listeners. CONTROLLER stays PLAINTEXT: it
     # is never exposed outside the compose network, and securing the KRaft
     # quorum has a bootstrap-ordering problem (SCRAM credentials live in the
@@ -60,10 +71,13 @@ services:
     environment:
       <<: *kafka-env
       KAFKA_NODE_ID: 1
+      KAFKA_SSL_KEYSTORE_LOCATION: /tls/kafka1.keystore.jks
       KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093
       KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka1:9092,EXTERNAL://localhost:29092
     ports: ["29092:29092"]
-    volumes: ["kafka1-data:/var/lib/kafka/data"]
+    volumes:
+      - kafka1-data:/var/lib/kafka/data
+      - ./tls/out:/tls:ro
     healthcheck:
       # Must authenticate. An unauthenticated healthcheck against a SASL broker
       # fails forever: every broker reports unhealthy and anything gated on
@@ -72,7 +86,7 @@ services:
       test:
         - CMD-SHELL
         - |
-          printf 'security.protocol=SASL_PLAINTEXT\nsasl.mechanism=PLAIN\nsasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="${KAFKA_USER:-petafs}" password="${KAFKA_PASSWORD:-petafs-dev-secret}";\n' > /tmp/hc.properties
+          printf 'security.protocol=SASL_SSL\nsasl.mechanism=PLAIN\nsasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="${KAFKA_USER:-petafs}" password="${KAFKA_PASSWORD:-petafs-dev-secret}";\nssl.truststore.location=/tls/kafka.truststore.jks\nssl.truststore.password=${TLS_STOREPASS:-petafs-dev-secret}\n' > /tmp/hc.properties
           /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 --command-config /tmp/hc.properties >/dev/null 2>&1
       interval: 10s
       timeout: 10s
@@ -85,10 +99,13 @@ services:
     environment:
       <<: *kafka-env
       KAFKA_NODE_ID: 2
+      KAFKA_SSL_KEYSTORE_LOCATION: /tls/kafka2.keystore.jks
       KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:29093,CONTROLLER://0.0.0.0:9093
       KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka2:9092,EXTERNAL://localhost:29093
     ports: ["29093:29093"]
-    volumes: ["kafka2-data:/var/lib/kafka/data"]
+    volumes:
+      - kafka2-data:/var/lib/kafka/data
+      - ./tls/out:/tls:ro
     healthcheck:
       # Must authenticate. An unauthenticated healthcheck against a SASL broker
       # fails forever: every broker reports unhealthy and anything gated on
@@ -97,7 +114,7 @@ services:
       test:
         - CMD-SHELL
         - |
-          printf 'security.protocol=SASL_PLAINTEXT\nsasl.mechanism=PLAIN\nsasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="${KAFKA_USER:-petafs}" password="${KAFKA_PASSWORD:-petafs-dev-secret}";\n' > /tmp/hc.properties
+          printf 'security.protocol=SASL_SSL\nsasl.mechanism=PLAIN\nsasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="${KAFKA_USER:-petafs}" password="${KAFKA_PASSWORD:-petafs-dev-secret}";\nssl.truststore.location=/tls/kafka.truststore.jks\nssl.truststore.password=${TLS_STOREPASS:-petafs-dev-secret}\n' > /tmp/hc.properties
           /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 --command-config /tmp/hc.properties >/dev/null 2>&1
       interval: 10s
       timeout: 10s
@@ -110,10 +127,13 @@ services:
     environment:
       <<: *kafka-env
       KAFKA_NODE_ID: 3
+      KAFKA_SSL_KEYSTORE_LOCATION: /tls/kafka3.keystore.jks
       KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:29094,CONTROLLER://0.0.0.0:9093
       KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka3:9092,EXTERNAL://localhost:29094
     ports: ["29094:29094"]
-    volumes: ["kafka3-data:/var/lib/kafka/data"]
+    volumes:
+      - kafka3-data:/var/lib/kafka/data
+      - ./tls/out:/tls:ro
     healthcheck:
       # Must authenticate. An unauthenticated healthcheck against a SASL broker
       # fails forever: every broker reports unhealthy and anything gated on
@@ -122,7 +142,7 @@ services:
       test:
         - CMD-SHELL
         - |
-          printf 'security.protocol=SASL_PLAINTEXT\nsasl.mechanism=PLAIN\nsasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="${KAFKA_USER:-petafs}" password="${KAFKA_PASSWORD:-petafs-dev-secret}";\n' > /tmp/hc.properties
+          printf 'security.protocol=SASL_SSL\nsasl.mechanism=PLAIN\nsasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="${KAFKA_USER:-petafs}" password="${KAFKA_PASSWORD:-petafs-dev-secret}";\nssl.truststore.location=/tls/kafka.truststore.jks\nssl.truststore.password=${TLS_STOREPASS:-petafs-dev-secret}\n' > /tmp/hc.properties
           /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 --command-config /tmp/hc.properties >/dev/null 2>&1
       interval: 10s
       timeout: 10s
@@ -393,7 +413,9 @@ services:
       REDIS_SENTINEL_MASTER: mymaster
       REDIS_PASSWORD: ${REDIS_PASSWORD:-petafs-dev-secret}
       REDIS_TLS_CA: /tls/ca.crt
-      KAFKA_SECURITY_PROTOCOL: SASL_PLAINTEXT
+      KAFKA_SECURITY_PROTOCOL: SASL_SSL
+      KAFKA_SSL_TRUSTSTORE: /tls/kafka.truststore.jks
+      TLS_STOREPASS: ${TLS_STOREPASS:-petafs-dev-secret}
       KAFKA_SASL_MECHANISM: PLAIN
       KAFKA_USER: ${KAFKA_USER:-petafs}
       KAFKA_PASSWORD: ${KAFKA_PASSWORD:-petafs-dev-secret}
@@ -455,7 +477,9 @@ services:
       REDIS_SENTINEL_MASTER: mymaster
       REDIS_PASSWORD: ${REDIS_PASSWORD:-petafs-dev-secret}
       REDIS_TLS_CA: /tls/ca.crt
-      KAFKA_SECURITY_PROTOCOL: SASL_PLAINTEXT
+      KAFKA_SECURITY_PROTOCOL: SASL_SSL
+      KAFKA_SSL_TRUSTSTORE: /tls/kafka.truststore.jks
+      TLS_STOREPASS: ${TLS_STOREPASS:-petafs-dev-secret}
       KAFKA_SASL_MECHANISM: PLAIN
       KAFKA_USER: ${KAFKA_USER:-petafs}
       KAFKA_PASSWORD: ${KAFKA_PASSWORD:-petafs-dev-secret}

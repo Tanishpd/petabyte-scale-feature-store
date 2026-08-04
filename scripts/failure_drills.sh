@@ -26,9 +26,11 @@ bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$*"; fail=$((fail+1)); }
 # — that silently skipped Drill 1 the first time.
 kafka_client_config() {
   $P exec -T kafka1 sh -c "cat > /tmp/drill.properties <<'EOF'
-security.protocol=SASL_PLAINTEXT
+security.protocol=SASL_SSL
 sasl.mechanism=PLAIN
 sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username=\"${KAFKA_USER:-petafs}\" password=\"${KAFKA_PASSWORD:-petafs-dev-secret}\";
+ssl.truststore.location=/tls/kafka.truststore.jks
+ssl.truststore.password=${TLS_STOREPASS:-petafs-dev-secret}
 EOF" >/dev/null 2>&1
 }
 kafka_records() {
@@ -181,7 +183,7 @@ fi
 # Kafka: an authenticated client must work and an unauthenticated one must not.
 $P exec -T kafka1 sh -c 'printf "security.protocol=SASL_PLAINTEXT\nsasl.mechanism=PLAIN\nsasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username=\"'"${KAFKA_USER:-petafs}"'\" password=\"'"${KAFKA_PASSWORD:-petafs-dev-secret}"'\";\n" > /tmp/d.properties' >/dev/null 2>&1
 if $P exec -T kafka1 /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka1:9092 \
-     --command-config /tmp/d.properties --list >/dev/null 2>&1; then
+     --command-config /tmp/drill.properties --list >/dev/null 2>&1; then
   ok "kafka accepts an authenticated client"
 else
   bad "kafka refused a correctly authenticated client"
@@ -196,6 +198,25 @@ fi
 
 # ---------------------------------------------------------------------------
 step "Drill 5 — transport is encrypted, not just authenticated"
+# Kafka: a client with the CORRECT credentials but no TLS must still be refused.
+# SASL_PLAINTEXT would prove identity while leaving every event and the password
+# itself readable on the wire.
+$P exec -T kafka1 sh -c "cat > /tmp/nossl.properties <<'EOF'
+security.protocol=SASL_PLAINTEXT
+sasl.mechanism=PLAIN
+sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username=\"${KAFKA_USER:-petafs}\" password=\"${KAFKA_PASSWORD:-petafs-dev-secret}\";
+EOF" >/dev/null 2>&1
+if $P exec -T kafka1 sh -c 'timeout 25 /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka1:9092 --command-config /tmp/nossl.properties --list >/dev/null 2>&1'; then
+  bad "kafka served an unencrypted client that had valid credentials"
+else
+  ok "kafka refuses unencrypted clients even with valid credentials"
+fi
+if $P exec -T kafka1 /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka1:9092 \
+     --command-config /tmp/drill.properties --list >/dev/null 2>&1; then
+  ok "kafka serves clients over SASL_SSL"
+else
+  bad "kafka refused a correctly configured SASL_SSL client"
+fi
 # `port 0` removes the plaintext listener entirely. A password-only setup would
 # still put every feature value and the password itself on the wire in clear.
 # Assert on the exit code: the error text ("I/O error", "Connection reset",

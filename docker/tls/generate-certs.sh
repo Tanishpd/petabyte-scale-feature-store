@@ -36,6 +36,30 @@ gen redis-replica  redis-replica
 gen sentinel       redis-sentinel-1 redis-sentinel-2 redis-sentinel-3
 gen client         client
 
-chmod 644 *.key *.crt
+# --- Kafka: same CA, packaged as JKS ---------------------------------------
+# Redis takes PEM; Kafka is Java and takes keystores. Each broker's cert covers
+# its compose hostname AND localhost, because the EXTERNAL listener is
+# advertised to host clients as localhost:2909x — a cert without that SAN fails
+# hostname verification on the host side only, which is a confusing
+# half-working state.
+STOREPASS=${STOREPASS:-petafs-dev-secret}
+for b in kafka1 kafka2 kafka3; do
+  gen "$b" "$b"
+  # keytool cannot import a bare PEM key pair, so go PEM -> PKCS12 -> JKS.
+  openssl pkcs12 -export -in "${b}.crt" -inkey "${b}.key" -certfile ca.crt \
+    -name "$b" -out "${b}.p12" -password "pass:${STOREPASS}" 2>/dev/null
+  keytool -importkeystore -noprompt \
+    -srckeystore "${b}.p12" -srcstoretype PKCS12 -srcstorepass "$STOREPASS" \
+    -destkeystore "${b}.keystore.jks" -deststorepass "$STOREPASS" \
+    -destkeypass "$STOREPASS" >/dev/null 2>&1
+  rm -f "${b}.p12"
+done
+
+# One truststore holding the CA, shared by the brokers and by every Java client
+# — the Flink Kafka connector included.
+keytool -importcert -noprompt -alias petafs-ca -file ca.crt \
+  -keystore kafka.truststore.jks -storepass "$STOREPASS" >/dev/null 2>&1
+
+chmod 644 ./*.key ./*.crt ./*.jks 2>/dev/null || true
 echo "generated in docker/tls/$OUT:"
 ls -1 | sed 's/^/  /'

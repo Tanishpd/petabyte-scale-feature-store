@@ -28,6 +28,7 @@ live in `scripts/failure_drills.sh`.
 
 | Unauthenticated Kafka client | Refused; authenticated one works | SASL/PLAIN on both client listeners |
 | Plaintext Redis client | Refused — the listener does not exist | `port 0` + `tls-port 6379`; replication encrypted too |
+| Unencrypted Kafka client *with valid credentials* | Refused | SASL_SSL on both client listeners; hostname verification on |
 
 ### TLS
 
@@ -42,9 +43,21 @@ encrypts the transport while accepting any certificate. The sentinels are TLS
 too, so `sentinel_kwargs` needs the same settings — otherwise discovery fails
 while the data connection would have worked.
 
+**Kafka is SASL_SSL**, sharing the same CA. Java wants keystores rather than
+PEM, so `make prod-tls` also emits per-broker `*.keystore.jks` and a shared
+`kafka.truststore.jks`. Two details matter: each broker's cert needs a
+`localhost` SAN because the EXTERNAL listener is advertised to host clients as
+`localhost:2909x` (without it, hostname verification fails on the host side
+only — a confusing half-working state), and
+`ssl.endpoint.identification.algorithm=https` must be set or the connection is
+encrypted while accepting any certificate.
+
+Note the packaging split: the Flink connector is Java and reads the **JKS
+truststore**; the kafka-python producer is Python and reads the **PEM CA**. Same
+CA, two formats.
+
 In a real deployment the certs come from your CA or cert-manager and only their
-source changes. **Kafka remains SASL_PLAINTEXT** — authenticated but not
-encrypted; that needs JKS keystores.
+source changes.
 
 ## 2. Sizing — the numbers here are NOT production sizing
 
@@ -113,6 +126,16 @@ healthchecks go `unhealthy` so `depends_on: service_healthy` never releases
 (symptom: "Flink won't come up"), and CLI tools like `kafka-get-offsets.sh`
 return empty rather than erroring — which made a failure drill silently skip
 itself while reporting success.
+
+**A persisted IP-based `replicaof` does not survive network recreation.** Redis
+writes the *address* it was pointed at, and Sentinel rewrites it on promotion.
+After `compose down` + `up` the Docker network is recreated on a different
+subnet, so both nodes wake up chasing a dead IP with no master to promote —
+symptom is "Timeout connecting to the MASTER" in a loop and an unresponsive
+pair. `sentinel resolve-hostnames yes` makes *new* decisions hostname-based but
+does not retroactively fix a config already written with an IP.
+→ Locally: drop the Redis volumes when recreating the stack (`make prod-clean`).
+In production the nodes have stable DNS names, which is the actual fix.
 
 **Flink rejects a bucket root for checkpoints** — `s3://bucket/` fails with
 "Cannot use the root directory for checkpoints". Use a prefix.

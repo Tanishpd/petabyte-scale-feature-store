@@ -47,6 +47,10 @@ KAFKA_SECURITY_PROTOCOL = os.environ.get("KAFKA_SECURITY_PROTOCOL", "")
 KAFKA_SASL_MECHANISM = os.environ.get("KAFKA_SASL_MECHANISM", "PLAIN")
 KAFKA_USER = os.environ.get("KAFKA_USER", "")
 KAFKA_PASSWORD = os.environ.get("KAFKA_PASSWORD", "")
+#: Java clients verify the broker chain from a JKS truststore, not a PEM. Empty
+#: means SASL_PLAINTEXT or no auth at all.
+KAFKA_SSL_TRUSTSTORE = os.environ.get("KAFKA_SSL_TRUSTSTORE", "")
+KAFKA_SSL_TRUSTSTORE_PASSWORD = os.environ.get("TLS_STOREPASS", "")
 
 
 #: The Kafka connector is a SHADED fat jar, so its login modules live under a
@@ -70,11 +74,20 @@ def _kafka_security_options() -> str:
         f"{SHADED_PLAIN_LOGIN_MODULE} required "
         f'username="{KAFKA_USER}" password="{KAFKA_PASSWORD}";'
     )
-    return (
+    opts = (
         f"      'properties.security.protocol' = '{KAFKA_SECURITY_PROTOCOL}',\n"
         f"      'properties.sasl.mechanism' = '{KAFKA_SASL_MECHANISM}',\n"
         f"      'properties.sasl.jaas.config' = '{jaas}',\n"
     )
+    if KAFKA_SSL_TRUSTSTORE:
+        # Without endpoint identification the connection is encrypted but will
+        # accept any certificate, which gives up most of the guarantee.
+        opts += (
+            f"      'properties.ssl.truststore.location' = '{KAFKA_SSL_TRUSTSTORE}',\n"
+            f"      'properties.ssl.truststore.password' = '{KAFKA_SSL_TRUSTSTORE_PASSWORD}',\n"
+            "      'properties.ssl.endpoint.identification.algorithm' = 'https',\n"
+        )
+    return opts
 
 
 def build_source_ddl(

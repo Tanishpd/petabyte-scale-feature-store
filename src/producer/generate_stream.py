@@ -251,6 +251,11 @@ def build_producer(bootstrap: str, acks: str, compression: str | None):
             sasl_plain_username=os.environ.get("KAFKA_USER", ""),
             sasl_plain_password=os.environ.get("KAFKA_PASSWORD", ""),
         )
+        # kafka-python is a Python client: it wants a PEM CA file, not the JKS
+        # truststore the Java side uses. Same CA, different packaging.
+        ca = os.environ.get("KAFKA_SSL_CAFILE")
+        if ca:
+            security["ssl_cafile"] = ca
 
     return KafkaProducer(
         **security,
