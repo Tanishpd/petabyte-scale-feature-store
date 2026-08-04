@@ -56,3 +56,8 @@ benchmarks/*.csv
 .vscode/
 *.swp
 docker/tls/out/
+
+# --- generated credentials (make secrets) ---
+# Never committed. `make secrets` recreates them; the topologies mount them
+# as files so they stay out of `docker inspect` and `docker compose config`.
+docker/secrets/

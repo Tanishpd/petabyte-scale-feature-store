@@ -6,6 +6,8 @@
 # a cert-manager, and the only thing that changes is where the files come from.
 set -euo pipefail
 cd "$(dirname "$0")"
+# Resolved BEFORE the cd into $OUT, so it stays valid afterwards.
+SECRETS_DIR=$(cd ../secrets 2>/dev/null && pwd || echo "")
 OUT=out
 DAYS=${DAYS:-825}
 
@@ -75,6 +77,17 @@ gen redis-node     redis-primary redis-replica \
 # advertised to host clients as localhost:2909x — a cert without that SAN fails
 # hostname verification on the host side only, which is a confusing
 # half-working state.
+# The JKS keystores embed this, so it must match what the brokers and every
+# Java client are given. Precedence mirrors contracts/secrets.py: the mounted
+# secret file wins, then the environment, then the dev default.
+# $SECRETS_DIR is resolved at the top of the script, before the `cd "$OUT"` —
+# a relative path here would be interpreted from docker/tls/out and silently
+# miss, leaving every keystore built with the dev-default password while the
+# brokers read the real one from /run/secrets. The brokers then fail to open
+# their own keystore and the cluster never forms.
+if [ -z "${STOREPASS:-}" ] && [ -f "$SECRETS_DIR/tls_storepass" ]; then
+  STOREPASS=$(tr -d '\r\n' < "$SECRETS_DIR/tls_storepass")
+fi
 STOREPASS=${STOREPASS:-petafs-dev-secret}
 for b in kafka1 kafka2 kafka3; do
   gen "$b" "$b"

@@ -146,6 +146,7 @@ Both are in [docs/MULTIHOST.md](docs/MULTIHOST.md).
 | Sentinel could split-brain | 3 sentinels, quorum 2, config-file Redis so promotions persist | Killed the master, restarted the old one: it rejoins as a replica, exactly one master, all 3 sentinels agree |
 | Everything in the clear | **TLS everywhere**: Kafka SASL_SSL, Redis + Sentinel TLS-only (`port 0`), replication encrypted | An unencrypted client *with valid credentials* is refused on both; the whole path producer→Kafka→Flink→Redis is encrypted |
 | Nothing proved any of it | `make prod-drill` — 17 assertions | **17/17 passing** against the live topology |
+| Credentials in env vars with dev defaults | **Mounted files, no defaults** — `make secrets`, and the code resolves `${VAR}_FILE` first | Grepped every container's `docker inspect` and `docker compose config` for each secret: **absent**, while the file *is* present inside the container that needs it |
 | **Everything on one host** | **Three nodes, separate failure domains** — routable addressing throughout, mTLS on the KRaft quorum | Killed the whole node running the job: rescheduled onto another node, restored from `s3://.../chk-4`, zero data loss, features still writing. Killed the Redis primary's node: promoted across hosts. **24/24** ([MULTIHOST](docs/MULTIHOST.md)) |
 | **The JobManager and the object store were single points of failure** | **ZooKeeper ensemble + standby JobManager + object store distributed across all three nodes**, each Flink process using its node-local S3 endpoint | Killed the whole node holding the *leading* JobManager: leadership moved automatically, the pipeline recovered **with no resubmission and the same job id**, restored from `s3://.../chk-2`, the pool **kept accepting writes** at 2 of 3 drives, and checkpoints kept completing into it. **18/18** |
 
@@ -159,7 +160,17 @@ Both are in [docs/MULTIHOST.md](docs/MULTIHOST.md).
   for anything demonstrated here, but because running an object store is
   operational work an API call avoids. `s3.endpoint` keeps that a
   credentials-and-URL change.
-- **Secrets are compose env vars with dev defaults**, not a secret store.
+- **Two of the four stacks still use env-var credentials.** The HA topology
+  takes every credential from a mounted file with no dev default, asserted by
+  drill (`docker inspect` and `docker compose config` contain none of them).
+  `docker-compose.prod.yml` and `docker-compose.multihost.yml` have not been
+  converted — they are separately verified stacks, and changing their credential
+  plumbing without re-running both drill suites would ship unverified changes
+  ([ADR-015](docs/DECISIONS.md)).
+- **File-based secrets are not a secret manager.** Nothing rotates, expires or
+  audits; the file sits on a host filesystem. It is the interface one plugs
+  into — point the paths at a K8s projected secret or a Vault agent and no
+  service config changes.
 - **Feast internals dependency** ([ADR-003](docs/DECISIONS.md)). CI is the
   tripwire; a supported path would be `write_to_online_store`, at the cost of a hop.
 - **One unexplained behaviour**: a long-lived `FeatureStore` drifts 2.7× over 200
@@ -168,7 +179,7 @@ Both are in [docs/MULTIHOST.md](docs/MULTIHOST.md).
 
 So: **durability, availability, authentication, transport encryption, deployment
 topology, control-plane failover and object storage are all real and tested** —
-59 assertions across the three topologies, every one of them made by breaking
+62 assertions across the three topologies, every one of them made by breaking
 something. **No single node's loss stops the pipeline**: Kafka, Redis,
 ZooKeeper, the JobManager and the object store each survive one, and the drill
 proves it by killing whichever node ZooKeeper currently says is in charge.

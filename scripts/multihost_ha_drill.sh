@@ -23,7 +23,14 @@ A="$MH -p petafs-ha-a --profile a"
 B="$MH -p petafs-ha-b --profile b"
 C="$MH -p petafs-ha-c --profile c"
 
-PW="${REDIS_PASSWORD:-petafs-dev-secret}"
+# Credentials come from the same files the topology mounts (`make secrets`),
+# never from a dev default. A drill that silently fell back to a hardcoded
+# password would pass against a stack whose real credentials it never touched.
+SECRETS=docker/secrets
+_secret() { [ -f "$SECRETS/$1" ] || { echo "missing $SECRETS/$1 — run 'make secrets'" >&2; exit 1; }; tr -d '\r\n' < "$SECRETS/$1"; }
+PW=$(_secret redis_password)
+KAFKA_PW=$(_secret kafka_password)
+STOREPASS=$(_secret tls_storepass)
 RCLI="redis-cli --tls --cacert /tls/ca.crt"
 JM_B_PORT="${JM_B_REST_PORT:-8081}"
 JM_C_PORT="${JM_C_REST_PORT:-8082}"
@@ -81,7 +88,7 @@ zk_mode() { docker exec "$1" sh -c 'echo mntr | nc -w 2 localhost $ZOO_PORT' 2>/
 mc_a() {
   docker run --rm --entrypoint sh --network petafs-ha-a_default \
     minio/mc:RELEASE.2025-04-16T18-13-26Z -c \
-    "mc alias set p http://minio-a:${MINIO_A_PORT:-19000} ${MINIO_USER:-petafs} ${MINIO_PASSWORD:-petafs-dev-secret} >/dev/null 2>&1; $1" \
+    "mc alias set p http://minio-a:${MINIO_A_PORT:-19000} ${MINIO_USER:-petafs} $(_secret minio_root_password) >/dev/null 2>&1; $1" \
     2>/dev/null | grep -v "older version\|Update:"
 }
 # `mc admin info --json` nests everything under "info" — the backend block is at
@@ -134,7 +141,36 @@ else
 fi
 
 # ===========================================================================
-step "Drill 1 — the HA machinery is formed across the three nodes"
+step "Drill 1 — credentials are not visible through the orchestrator"
+# ===========================================================================
+# The point of moving these to files rather than `environment:`. Anyone who can
+# talk to the Docker daemon can read a container's environment; a file mounted
+# at /run/secrets is visible only to the processes in that container.
+IDS=$(docker ps -q --filter name=petafs-mhha- 2>/dev/null)
+LEAKED=""
+for s in redis_password kafka_password tls_storepass minio_root_password; do
+  V=$(_secret "$s")
+  [ -n "$IDS" ] && docker inspect $IDS 2>/dev/null | grep -qF -- "$V" && LEAKED="$LEAKED $s"
+done
+[ -z "$LEAKED" ] && ok "no credential appears anywhere in \`docker inspect\`" \
+                 || bad "credentials readable via docker inspect:$LEAKED"
+
+if $A config 2>/dev/null | grep -qF -- "$(_secret redis_password)"; then
+  bad "the Redis password appears in \`docker compose config\`"
+else
+  ok "no credential appears in \`docker compose config\`"
+fi
+
+# ...and they really are present where the processes need them, so the check
+# above is not passing merely because nothing was wired up.
+if docker exec petafs-mhha-redis-primary sh -c 'test -s /run/secrets/redis_password' 2>/dev/null; then
+  ok "the secret IS mounted inside the container that needs it"
+else
+  bad "/run/secrets/redis_password missing inside redis-primary"
+fi
+
+# ===========================================================================
+step "Drill 2 — the HA machinery is formed across the three nodes"
 # ===========================================================================
 MODES=$(for n in 1 2 3; do zk_mode "petafs-mhha-zk$n"; done | sort | tr '\n' ' ')
 LEADERS=$(echo "$MODES" | tr ' ' '\n' | grep -c '^leader$')
@@ -194,7 +230,7 @@ JOB=$(running_job "$LP")
               || note "no running job — 'make mh-ha-submit' first; recovery cannot be asserted"
 
 # ===========================================================================
-step "Drill 2 — kill the node running the LEADING JobManager"
+step "Drill 3 — kill the node running the LEADING JobManager"
 # ===========================================================================
 if [ -z "$JOB" ]; then
   note "skipped: no running job to recover"

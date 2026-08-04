@@ -194,10 +194,11 @@ cannot be orphaned by its endpoint dying, because that endpoint dies only when
 the node running the client dies. An LB tier would only cover "MinIO died but
 its node did not", which is a process failure `restart: unless-stopped` handles.
 
-### Measured — `make mh-ha-drill`, 18/18
+### Measured — `make mh-ha-drill`, 21/21
 
 | Assertion | Result |
 |---|---|
+| No credential in `docker inspect` or `docker compose config` | absent, while mounted where needed |
 | ZooKeeper ensemble spans three nodes | 1 leader, 2 followers |
 | Both JobManagers live, exactly one leader | per ZooKeeper, not per REST |
 | Job graph reached the HA store | `submittedExecutionPlan` + blob in `s3://flink-ha` |
@@ -260,6 +261,34 @@ Could not resolve ResourceManager address pekko.tcp://flink@host:42335/... retry
 
 forever. On a single host it works by accident, because there is no port
 mapping in the way. Set it explicitly, to a port you publish.
+
+### Credentials are files, not environment variables
+
+`make secrets` generates `docker/secrets/*` (gitignored, mode 600) and the
+topology mounts each at `/run/secrets/<name>`. There are no dev defaults left in
+this file — an unconfigured deployment fails to start rather than coming up with
+a password that is in the repository.
+
+Drill 1 asserts both directions, because the negative alone is not evidence:
+every running container's `docker inspect` output and `docker compose config`
+are grepped for each secret value (absent), *and* the file is confirmed present
+inside the container that needs it (so the check cannot pass against a stack
+where nothing was wired up).
+
+Four programs, four mechanisms: MinIO reads `MINIO_ROOT_PASSWORD_FILE`
+natively; Redis and Sentinel read the file in the entrypoint that already
+writes their config; Kafka's `command` builds the JAAS string from the files
+before handing off to the image's runner; Flink and the producer go through
+`contracts/secrets.py`, which resolves `${VAR}_FILE` ahead of `${VAR}`.
+`AWS_SECRET_ACCESS_KEY` is the one that needs an entrypoint wrapper — Flink's S3
+filesystem reads only the process environment, so it is exported inside the
+container rather than declared in `environment:`.
+
+This is **not** a secret manager and does not pretend to be: nothing rotates or
+expires, and the file sits on a host filesystem. It is the interface one plugs
+into. Note also that `docker-compose.prod.yml` and `docker-compose.multihost.yml`
+have *not* been converted — see [ADR-015](DECISIONS.md) for why that is a
+deliberate stopping point rather than an oversight.
 
 ## 6. What still fails
 

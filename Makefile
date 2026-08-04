@@ -30,6 +30,7 @@ endif
 
 .DEFAULT_GOAL := help
 .PHONY: help bootstrap build up down restart ps logs health topics sample tail-topic topic-count \
+        secrets secrets-rotate \
         produce submit apply seed registry read bench test smoke clean nuke \
         verify-seed verify-windows bench-embed similar \
         prod-up prod-down prod-clean prod-ps prod-submit prod-drill prod-tls \
@@ -248,6 +249,17 @@ mh-up:  ## Start the three-node topology (three isolated Compose projects)
 	$(MH_C) up -d
 	@$(MAKE) --no-print-directory mh-health
 
+secrets:  ## Generate the credential files the authenticated topologies mount
+	@bash scripts/gen_secrets.sh
+
+secrets-rotate:  ## Regenerate ALL credentials (drops stacks + volumes; certs too)
+	@echo ">>> This invalidates running stacks and the JKS keystores."
+	rm -f docker/secrets/*
+	@bash scripts/gen_secrets.sh
+	@$(MAKE) --no-print-directory mh-tls
+	@echo ">>> Redis persists its password into its config file on first boot,"
+	@echo ">>> so drop the volumes too: make mh-ha-clean"
+
 mh-tls:  ## Generate certs with the routable node names in their SANs
 	NODE_SANS=$(or $(NODE_SANS),host.docker.internal) bash docker/tls/generate-certs.sh
 
@@ -347,8 +359,12 @@ mh-ha-topics:  ## Create the transactions topic at RF=3 on the HA topology
 	@bash scripts/multihost_ha_health.sh --create-topic $(TOPIC) $(PARTITIONS)
 
 mh-ha-produce:  ## Produce into the HA topology from this Mac (HOST listeners)
+	@test -f docker/secrets/kafka_password || { echo "No secrets — run 'make secrets'."; exit 1; }
+	@# KAFKA_PASSWORD_FILE, not KAFKA_PASSWORD: the value never enters this
+	@# process's environment, so it cannot leak via `ps -e` or a crash dump.
+	@# contracts/secrets.py resolves it.
 	KAFKA_SECURITY_PROTOCOL=SASL_SSL KAFKA_SASL_MECHANISM=PLAIN \
-	KAFKA_USER=petafs KAFKA_PASSWORD=petafs-dev-secret \
+	KAFKA_USER=petafs KAFKA_PASSWORD_FILE=docker/secrets/kafka_password \
 	KAFKA_SSL_CAFILE=docker/tls/out/ca.crt \
 	$(PY) src/producer/generate_stream.py --bootstrap localhost:19094,localhost:19194,localhost:19294 \
 	  --topic $(TOPIC) --eps $(or $(EPS),400) $(if $(DURATION),--duration $(DURATION),) \

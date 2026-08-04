@@ -48,9 +48,48 @@
 
 name: petafs-mh-ha
 
+# Credentials are FILES, not environment variables. `make secrets` generates
+# them into docker/secrets/ (gitignored, mode 600) and Compose mounts each at
+# /run/secrets/<name>. The difference is what a reader of the host can see:
+# an environment variable holding a password shows up in `docker inspect`, in
+# `docker compose config`, and in /proc/1/environ — the first two being exactly
+# what people paste into bug reports. A mounted file shows up in none of them.
+#
+# This is not a secret manager: the file still sits on a host filesystem and any
+# process in the container can read it. It is the interface a secret manager
+# plugs into — point the same paths at a K8s projected secret or a Vault agent's
+# tmpfs and nothing else changes.
+secrets:
+  redis_password:
+    file: ./secrets/redis_password
+  kafka_password:
+    file: ./secrets/kafka_password
+  tls_storepass:
+    file: ./secrets/tls_storepass
+  minio_root_password:
+    file: ./secrets/minio_root_password
+
 x-kafka-common: &kafka-common
   image: apache/kafka:4.3.1
   restart: unless-stopped
+  command:
+    - sh
+    - -c
+    - |
+      # Read the credentials from the mounted files and export them where the
+      # image's own runner expects them. Nothing here is visible to
+      # `docker inspect`, because none of it came from `environment:`.
+      KP=$$(cat /run/secrets/kafka_password)
+      SP=$$(cat /run/secrets/tls_storepass)
+      U="$${KAFKA_USER:-petafs}"
+      JAAS="org.apache.kafka.common.security.plain.PlainLoginModule required username=\"$$U\" password=\"$$KP\" user_$$U=\"$$KP\";"
+      export KAFKA_LISTENER_NAME_BROKER_PLAIN_SASL_JAAS_CONFIG="$$JAAS"
+      export KAFKA_LISTENER_NAME_HOST_PLAIN_SASL_JAAS_CONFIG="$$JAAS"
+      export KAFKA_SSL_KEYSTORE_PASSWORD="$$SP"
+      export KAFKA_SSL_KEY_PASSWORD="$$SP"
+      export KAFKA_SSL_TRUSTSTORE_PASSWORD="$$SP"
+      exec /etc/kafka/docker/run
+  secrets: [kafka_password, tls_storepass]
   environment: &kafka-env
     KAFKA_PROCESS_ROLES: broker,controller
     KAFKA_CONTROLLER_QUORUM_VOTERS: >-
@@ -59,17 +98,10 @@ x-kafka-common: &kafka-common
     KAFKA_INTER_BROKER_LISTENER_NAME: BROKER
     KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
     KAFKA_LISTENER_NAME_CONTROLLER_SSL_CLIENT_AUTH: required
-    KAFKA_SSL_KEYSTORE_PASSWORD: ${TLS_STOREPASS:-petafs-dev-secret}
-    KAFKA_SSL_KEY_PASSWORD: ${TLS_STOREPASS:-petafs-dev-secret}
     KAFKA_SSL_TRUSTSTORE_LOCATION: /tls/kafka.truststore.jks
-    KAFKA_SSL_TRUSTSTORE_PASSWORD: ${TLS_STOREPASS:-petafs-dev-secret}
     KAFKA_SSL_ENDPOINT_IDENTIFICATION_ALGORITHM: https
     KAFKA_SASL_ENABLED_MECHANISMS: PLAIN
     KAFKA_SASL_MECHANISM_INTER_BROKER_PROTOCOL: PLAIN
-    KAFKA_LISTENER_NAME_BROKER_PLAIN_SASL_JAAS_CONFIG: |
-      org.apache.kafka.common.security.plain.PlainLoginModule required username="${KAFKA_USER:-petafs}" password="${KAFKA_PASSWORD:-petafs-dev-secret}" user_${KAFKA_USER:-petafs}="${KAFKA_PASSWORD:-petafs-dev-secret}";
-    KAFKA_LISTENER_NAME_HOST_PLAIN_SASL_JAAS_CONFIG: |
-      org.apache.kafka.common.security.plain.PlainLoginModule required username="${KAFKA_USER:-petafs}" password="${KAFKA_PASSWORD:-petafs-dev-secret}" user_${KAFKA_USER:-petafs}="${KAFKA_PASSWORD:-petafs-dev-secret}";
     KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
     KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
     KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
@@ -91,7 +123,7 @@ x-kafka-healthcheck: &kafka-healthcheck
   test:
     - CMD-SHELL
     - |
-      printf 'security.protocol=SASL_SSL\nsasl.mechanism=PLAIN\nsasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="${KAFKA_USER:-petafs}" password="${KAFKA_PASSWORD:-petafs-dev-secret}";\nssl.truststore.location=/tls/kafka.truststore.jks\nssl.truststore.password=${TLS_STOREPASS:-petafs-dev-secret}\n' > /tmp/hc.properties
+      printf 'security.protocol=SASL_SSL\nsasl.mechanism=PLAIN\nsasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="%s" password="%s";\nssl.truststore.location=/tls/kafka.truststore.jks\nssl.truststore.password=%s\n' "$${KAFKA_USER:-petafs}" "$$(cat /run/secrets/kafka_password)" "$$(cat /run/secrets/tls_storepass)" > /tmp/hc.properties
       /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 --command-config /tmp/hc.properties >/dev/null 2>&1
   interval: 10s
   timeout: 10s
@@ -101,6 +133,7 @@ x-kafka-healthcheck: &kafka-healthcheck
 x-redis-common: &redis-common
   image: redis/redis-stack-server:7.4.0-v8
   restart: unless-stopped
+  secrets: [redis_password]
   extra_hosts:
     - "host.docker.internal:host-gateway"
 
@@ -198,11 +231,12 @@ services:
       - sh
       - -c
       - |
+        PW=$$(cat /run/secrets/redis_password)
         CONF=/data/redis.conf
         if [ ! -f "$$CONF" ]; then
           cat > "$$CONF" <<EOF
-        requirepass ${REDIS_PASSWORD:-petafs-dev-secret}
-        masterauth ${REDIS_PASSWORD:-petafs-dev-secret}
+        requirepass $$PW
+        masterauth $$PW
         appendonly yes
         dir /data
         port 0
@@ -222,7 +256,7 @@ services:
       - redis-primary-data:/data
       - ./tls/out:/tls:ro
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli --tls --cacert /tls/ca.crt -a ${REDIS_PASSWORD:-petafs-dev-secret} ping | grep -q PONG"]
+      test: ["CMD-SHELL", "redis-cli --tls --cacert /tls/ca.crt -a \"$$(cat /run/secrets/redis_password)\" ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
       retries: 12
@@ -236,6 +270,7 @@ services:
       - sh
       - -c
       - |
+        PW=$$(cat /run/secrets/redis_password)
         CONF=/data/sentinel.conf
         if [ ! -f "$$CONF" ]; then
           cat > "$$CONF" <<EOF
@@ -246,13 +281,13 @@ services:
         tls-ca-cert-file /tls/ca.crt
         tls-replication yes
         tls-auth-clients no
-        requirepass ${REDIS_PASSWORD:-petafs-dev-secret}
+        requirepass $$PW
         sentinel announce-ip ${NODE_A_HOST:-node-a}
         sentinel announce-port ${SENTINEL_A_PORT:-26379}
         sentinel resolve-hostnames yes
         sentinel announce-hostnames yes
         sentinel monitor mymaster ${NODE_A_HOST:-node-a} ${REDIS_A_PORT:-6379} 2
-        sentinel auth-pass mymaster ${REDIS_PASSWORD:-petafs-dev-secret}
+        sentinel auth-pass mymaster $$PW
         sentinel down-after-milliseconds mymaster 5000
         sentinel failover-timeout mymaster 10000
         dir /data
@@ -305,9 +340,11 @@ services:
       http://minio-a:${MINIO_A_PORT:-9000}/d1
       http://minio-b:${MINIO_B_PORT:-9000}/d1
       http://minio-c:${MINIO_C_PORT:-9000}/d1
+    secrets: [minio_root_password]
     environment: &minio-env
       MINIO_ROOT_USER: ${MINIO_USER:-petafs}
-      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD:-petafs-dev-secret}
+      # MinIO reads *_FILE natively, so the password never enters its env.
+      MINIO_ROOT_PASSWORD_FILE: /run/secrets/minio_root_password
       # 3 drives, 1 parity: tolerates exactly one node. That is the most a
       # three-node pool can offer, and it is the shape being tested.
       MINIO_STORAGE_CLASS_STANDARD: "EC:1"
@@ -330,6 +367,7 @@ services:
     profiles: ["a"]
     image: minio/mc:RELEASE.2025-04-16T18-13-26Z
     container_name: petafs-mhha-minio-init
+    secrets: [minio_root_password]
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -343,7 +381,7 @@ services:
       - sh
       - -c
       - |
-        mc alias set petafs http://minio-a:${MINIO_A_PORT:-9000} ${MINIO_USER:-petafs} ${MINIO_PASSWORD:-petafs-dev-secret} >/dev/null 2>&1
+        mc alias set petafs http://minio-a:${MINIO_A_PORT:-9000} "$${MINIO_USER:-petafs}" "$$(cat /run/secrets/minio_root_password)" >/dev/null 2>&1
         for i in $$(seq 1 60); do
           if mc mb --ignore-existing petafs/flink-checkpoints >/dev/null 2>&1 \
              && mc mb --ignore-existing petafs/flink-savepoints >/dev/null 2>&1 \
@@ -412,11 +450,12 @@ services:
       - sh
       - -c
       - |
+        PW=$$(cat /run/secrets/redis_password)
         CONF=/data/redis.conf
         if [ ! -f "$$CONF" ]; then
           cat > "$$CONF" <<EOF
-        requirepass ${REDIS_PASSWORD:-petafs-dev-secret}
-        masterauth ${REDIS_PASSWORD:-petafs-dev-secret}
+        requirepass $$PW
+        masterauth $$PW
         appendonly yes
         dir /data
         port 0
@@ -437,7 +476,7 @@ services:
       - redis-replica-data:/data
       - ./tls/out:/tls:ro
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli --tls --cacert /tls/ca.crt -a ${REDIS_PASSWORD:-petafs-dev-secret} ping | grep -q PONG"]
+      test: ["CMD-SHELL", "redis-cli --tls --cacert /tls/ca.crt -a \"$$(cat /run/secrets/redis_password)\" ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
       retries: 12
@@ -451,6 +490,7 @@ services:
       - sh
       - -c
       - |
+        PW=$$(cat /run/secrets/redis_password)
         CONF=/data/sentinel.conf
         if [ ! -f "$$CONF" ]; then
           cat > "$$CONF" <<EOF
@@ -461,13 +501,13 @@ services:
         tls-ca-cert-file /tls/ca.crt
         tls-replication yes
         tls-auth-clients no
-        requirepass ${REDIS_PASSWORD:-petafs-dev-secret}
+        requirepass $$PW
         sentinel announce-ip ${NODE_B_HOST:-node-b}
         sentinel announce-port ${SENTINEL_B_PORT:-26379}
         sentinel resolve-hostnames yes
         sentinel announce-hostnames yes
         sentinel monitor mymaster ${NODE_A_HOST:-node-a} ${REDIS_A_PORT:-6379} 2
-        sentinel auth-pass mymaster ${REDIS_PASSWORD:-petafs-dev-secret}
+        sentinel auth-pass mymaster $$PW
         sentinel down-after-milliseconds mymaster 5000
         sentinel failover-timeout mymaster 10000
         dir /data
@@ -490,6 +530,7 @@ services:
       http://minio-a:${MINIO_A_PORT:-9000}/d1
       http://minio-b:${MINIO_B_PORT:-9000}/d1
       http://minio-c:${MINIO_C_PORT:-9000}/d1
+    secrets: [minio_root_password]
     environment: *minio-env
     extra_hosts:
       - "minio-a:host-gateway"
@@ -512,6 +553,12 @@ services:
     container_name: petafs-mhha-jobmanager
     restart: unless-stopped
     command: jobmanager
+    entrypoint:
+      - /bin/bash
+      - -c
+      - export AWS_SECRET_ACCESS_KEY="$$(cat /run/secrets/minio_root_password)"; exec /docker-entrypoint.sh "$$@"
+      - --
+    secrets: [redis_password, kafka_password, tls_storepass, minio_root_password]
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
@@ -529,18 +576,17 @@ services:
     environment: &jm-env
       PYTHONPATH: /opt/project
       AWS_ACCESS_KEY_ID: ${MINIO_USER:-petafs}
-      AWS_SECRET_ACCESS_KEY: ${MINIO_PASSWORD:-petafs-dev-secret}
       REDIS_SENTINELS: >-
         ${NODE_A_HOST:-node-a}:${SENTINEL_A_PORT:-26379},${NODE_B_HOST:-node-b}:${SENTINEL_B_PORT:-26379},${NODE_C_HOST:-node-c}:${SENTINEL_C_PORT:-26379}
       REDIS_SENTINEL_MASTER: mymaster
-      REDIS_PASSWORD: ${REDIS_PASSWORD:-petafs-dev-secret}
+      REDIS_PASSWORD_FILE: /run/secrets/redis_password
       REDIS_TLS_CA: /tls/ca.crt
       KAFKA_SECURITY_PROTOCOL: SASL_SSL
       KAFKA_SSL_TRUSTSTORE: /tls/kafka.truststore.jks
-      TLS_STOREPASS: ${TLS_STOREPASS:-petafs-dev-secret}
+      TLS_STOREPASS_FILE: /run/secrets/tls_storepass
       KAFKA_SASL_MECHANISM: PLAIN
       KAFKA_USER: ${KAFKA_USER:-petafs}
-      KAFKA_PASSWORD: ${KAFKA_PASSWORD:-petafs-dev-secret}
+      KAFKA_PASSWORD_FILE: /run/secrets/kafka_password
       # NOTE: no `#` comments inside FLINK_PROPERTIES. The Flink entrypoint
       # appends each line to the config and strips whitespace, so a comment
       # becomes a junk key ("#Bindwideandadvertise..."). Harmless when the text
@@ -630,6 +676,12 @@ services:
     container_name: petafs-mhha-taskmanager-b
     restart: unless-stopped
     command: taskmanager
+    entrypoint:
+      - /bin/bash
+      - -c
+      - export AWS_SECRET_ACCESS_KEY="$$(cat /run/secrets/minio_root_password)"; exec /docker-entrypoint.sh "$$@"
+      - --
+    secrets: [redis_password, kafka_password, tls_storepass, minio_root_password]
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
@@ -639,18 +691,17 @@ services:
     environment:
       PYTHONPATH: /opt/project
       AWS_ACCESS_KEY_ID: ${MINIO_USER:-petafs}
-      AWS_SECRET_ACCESS_KEY: ${MINIO_PASSWORD:-petafs-dev-secret}
       REDIS_SENTINELS: >-
         ${NODE_A_HOST:-node-a}:${SENTINEL_A_PORT:-26379},${NODE_B_HOST:-node-b}:${SENTINEL_B_PORT:-26379},${NODE_C_HOST:-node-c}:${SENTINEL_C_PORT:-26379}
       REDIS_SENTINEL_MASTER: mymaster
-      REDIS_PASSWORD: ${REDIS_PASSWORD:-petafs-dev-secret}
+      REDIS_PASSWORD_FILE: /run/secrets/redis_password
       REDIS_TLS_CA: /tls/ca.crt
       KAFKA_SECURITY_PROTOCOL: SASL_SSL
       KAFKA_SSL_TRUSTSTORE: /tls/kafka.truststore.jks
-      TLS_STOREPASS: ${TLS_STOREPASS:-petafs-dev-secret}
+      TLS_STOREPASS_FILE: /run/secrets/tls_storepass
       KAFKA_SASL_MECHANISM: PLAIN
       KAFKA_USER: ${KAFKA_USER:-petafs}
-      KAFKA_PASSWORD: ${KAFKA_PASSWORD:-petafs-dev-secret}
+      KAFKA_PASSWORD_FILE: /run/secrets/kafka_password
       FLINK_PROPERTIES: |
         high-availability.type: zookeeper
         zookeeper.sasl.disable: true
@@ -737,6 +788,7 @@ services:
       - sh
       - -c
       - |
+        PW=$$(cat /run/secrets/redis_password)
         CONF=/data/sentinel.conf
         if [ ! -f "$$CONF" ]; then
           cat > "$$CONF" <<EOF
@@ -747,13 +799,13 @@ services:
         tls-ca-cert-file /tls/ca.crt
         tls-replication yes
         tls-auth-clients no
-        requirepass ${REDIS_PASSWORD:-petafs-dev-secret}
+        requirepass $$PW
         sentinel announce-ip ${NODE_C_HOST:-node-c}
         sentinel announce-port ${SENTINEL_C_PORT:-26379}
         sentinel resolve-hostnames yes
         sentinel announce-hostnames yes
         sentinel monitor mymaster ${NODE_A_HOST:-node-a} ${REDIS_A_PORT:-6379} 2
-        sentinel auth-pass mymaster ${REDIS_PASSWORD:-petafs-dev-secret}
+        sentinel auth-pass mymaster $$PW
         sentinel down-after-milliseconds mymaster 5000
         sentinel failover-timeout mymaster 10000
         dir /data
@@ -776,6 +828,7 @@ services:
       http://minio-a:${MINIO_A_PORT:-9000}/d1
       http://minio-b:${MINIO_B_PORT:-9000}/d1
       http://minio-c:${MINIO_C_PORT:-9000}/d1
+    secrets: [minio_root_password]
     environment: *minio-env
     extra_hosts:
       - "minio-a:host-gateway"
@@ -803,6 +856,12 @@ services:
     container_name: petafs-mhha-jobmanager-standby
     restart: unless-stopped
     command: jobmanager
+    entrypoint:
+      - /bin/bash
+      - -c
+      - export AWS_SECRET_ACCESS_KEY="$$(cat /run/secrets/minio_root_password)"; exec /docker-entrypoint.sh "$$@"
+      - --
+    secrets: [redis_password, kafka_password, tls_storepass, minio_root_password]
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
@@ -855,6 +914,12 @@ services:
     container_name: petafs-mhha-taskmanager-c
     restart: unless-stopped
     command: taskmanager
+    entrypoint:
+      - /bin/bash
+      - -c
+      - export AWS_SECRET_ACCESS_KEY="$$(cat /run/secrets/minio_root_password)"; exec /docker-entrypoint.sh "$$@"
+      - --
+    secrets: [redis_password, kafka_password, tls_storepass, minio_root_password]
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
@@ -864,18 +929,17 @@ services:
     environment:
       PYTHONPATH: /opt/project
       AWS_ACCESS_KEY_ID: ${MINIO_USER:-petafs}
-      AWS_SECRET_ACCESS_KEY: ${MINIO_PASSWORD:-petafs-dev-secret}
       REDIS_SENTINELS: >-
         ${NODE_A_HOST:-node-a}:${SENTINEL_A_PORT:-26379},${NODE_B_HOST:-node-b}:${SENTINEL_B_PORT:-26379},${NODE_C_HOST:-node-c}:${SENTINEL_C_PORT:-26379}
       REDIS_SENTINEL_MASTER: mymaster
-      REDIS_PASSWORD: ${REDIS_PASSWORD:-petafs-dev-secret}
+      REDIS_PASSWORD_FILE: /run/secrets/redis_password
       REDIS_TLS_CA: /tls/ca.crt
       KAFKA_SECURITY_PROTOCOL: SASL_SSL
       KAFKA_SSL_TRUSTSTORE: /tls/kafka.truststore.jks
-      TLS_STOREPASS: ${TLS_STOREPASS:-petafs-dev-secret}
+      TLS_STOREPASS_FILE: /run/secrets/tls_storepass
       KAFKA_SASL_MECHANISM: PLAIN
       KAFKA_USER: ${KAFKA_USER:-petafs}
-      KAFKA_PASSWORD: ${KAFKA_PASSWORD:-petafs-dev-secret}
+      KAFKA_PASSWORD_FILE: /run/secrets/kafka_password
       # No jobmanager.rpc.address here, deliberately: in HA mode the
       # TaskManager resolves the leader through ZooKeeper, so a hardcoded
       # address would be both unused and misleading about how failover works.

@@ -30,6 +30,7 @@ sys.path.insert(0, "/opt/project")
 from pyflink.datastream.functions import MapFunction  # noqa: E402
 
 from contracts.schema import FEATURES, ONLINE_TTL_SECONDS, TS_KEY  # noqa: E402
+from contracts.secrets import read_secret  # noqa: E402
 from src.flink.sinks.ann_index import ensure_index, index_mapping, vec_key  # noqa: E402
 from src.flink.sinks.feast_codec import decode_ts, encode_row  # noqa: E402
 
@@ -37,7 +38,9 @@ from src.flink.sinks.feast_codec import decode_ts, encode_row  # noqa: E402
 # Only the *host* mapping moved to 6380 to coexist with a system redis.
 REDIS_HOST = os.environ.get("REDIS_HOST", "redis")
 REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
-REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD") or None
+#: Read from `REDIS_PASSWORD_FILE` when the topology mounts one, so the value
+#: never reaches `docker inspect`. See contracts/secrets.py.
+REDIS_PASSWORD = read_secret("REDIS_PASSWORD") or None
 
 #: Sentinel discovery for the production topology. Writing to a fixed host would
 #: undo the failover the topology exists to provide: after a promotion the old

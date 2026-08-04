@@ -32,6 +32,7 @@ from contracts.events import (  # noqa: E402
     source_ddl_columns,
     watermark_clause,
 )
+from contracts.secrets import read_secret  # noqa: E402
 from contracts.schema import (  # noqa: E402
     WINDOW_SIZE_MINUTES,
     WINDOW_SLIDE_MINUTES,
@@ -46,11 +47,13 @@ SOURCE_TABLE = "transactions"
 KAFKA_SECURITY_PROTOCOL = os.environ.get("KAFKA_SECURITY_PROTOCOL", "")
 KAFKA_SASL_MECHANISM = os.environ.get("KAFKA_SASL_MECHANISM", "PLAIN")
 KAFKA_USER = os.environ.get("KAFKA_USER", "")
-KAFKA_PASSWORD = os.environ.get("KAFKA_PASSWORD", "")
+#: Passwords come from `${VAR}_FILE` when the topology mounts one, so they never
+#: appear in `docker inspect` or `docker compose config`. See contracts/secrets.py.
+KAFKA_PASSWORD = read_secret("KAFKA_PASSWORD", "") or ""
 #: Java clients verify the broker chain from a JKS truststore, not a PEM. Empty
 #: means SASL_PLAINTEXT or no auth at all.
 KAFKA_SSL_TRUSTSTORE = os.environ.get("KAFKA_SSL_TRUSTSTORE", "")
-KAFKA_SSL_TRUSTSTORE_PASSWORD = os.environ.get("TLS_STOREPASS", "")
+KAFKA_SSL_TRUSTSTORE_PASSWORD = read_secret("TLS_STOREPASS", "") or ""
 
 
 #: The Kafka connector is a SHADED fat jar, so its login modules live under a

@@ -67,7 +67,8 @@ docker/          docker-compose.yml, docker-compose.prod.yml, flink/Dockerfile,
                  docker-compose.multihost.yml     ← 3 nodes; multihost/sim.env
                  docker-compose.multihost-ha.yml  ← + ZK ensemble & standby JM
                  tls/generate-certs.sh, observability/
-contracts/       schema.py            ← single source of truth for feature names/dtypes
+contracts/       schema.py    ← single source of truth for feature names/dtypes
+                 secrets.py   ← ${VAR}_FILE beats ${VAR}; used by sink + producer
 src/producer/    generate_stream.py
 src/flink/       streaming_job.py, udfs/embeddings.py, sinks/feast_redis_sink.py
 src/feast_repo/  feature_store.yaml, definitions.py, data/*.parquet
@@ -77,6 +78,7 @@ scripts/         bootstrap.sh, seed_offline.py, smoke_test.sh, failure_drills.sh
                  multihost_ha_health.sh, multihost_ha_drill.sh
 tests/           test_feast_codec_roundtrip.py  ← the load-bearing test
 docs/            ARCHITECTURE.md, DECISIONS.md, SCALING.md, RUNBOOK.md, MULTIHOST.md
+docker/secrets/  generated credentials (gitignored) — `make secrets`
 Makefile
 ```
 
@@ -109,7 +111,8 @@ make smoke         # end-to-end: produce → flink → redis → feast read
 make test          # pytest, includes the codec round-trip
 make mh-tls && make mh-up   # 3-node topology as 3 isolated compose projects
 make mh-drill      # kill a WHOLE node; 24 assertions. See docs/MULTIHOST.md
-make mh-ha-up && make mh-ha-drill   # + ZK/standby JM; 14 assertions (MULTIHOST §5)
+make secrets       # generate docker/secrets/* — REQUIRED before mh-ha-up
+make mh-ha-up && make mh-ha-drill   # + ZK/standby JM; 21 assertions (MULTIHOST §5)
 # ⚠️ mh and mh-ha must not run at once, and neither alongside the dev stack.
 redis-cli -p 6380 --scan --pattern '*' | head         # raw Feast keys (binary) — note 6380
 open http://localhost:8081                            # Flink UI: watch backpressure + watermarks
@@ -234,6 +237,10 @@ Invariant 4. Override with `REDIS_HOST_PORT=6379`.
 - **`docker compose down -v` can silently skip the volumes** if a container was mid-restart, while still
   reporting success. Stale Kafka logs then survive and `--if-not-exists` keeps the old topic, so a
   retention change looks ignored. Sweep by name and verify.
+- **Credentials in the HA topology are MOUNTED FILES, not env vars** (`make secrets`). Anything reading
+  a password must go through `contracts/secrets.py` (`${VAR}_FILE` beats `${VAR}`). `tls_storepass` is
+  baked into the JKS keystores, so changing it means `make mh-tls`; Redis writes its password into its
+  own config file on first boot, so rotating means dropping the Redis volumes too.
 - **Compose `profiles` MERGE across `-f` files, they do not replace.** An overlay cannot move a service
   to a different node — it ends up in both profiles. That is why HA is a separate file, not an overlay.
 - **ZooKeeper tells clients which port to use and they believe it over their own config.** Curator

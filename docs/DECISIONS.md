@@ -445,3 +445,44 @@ redundancy until it returns, so a second failure in that window loses data. Four
 first comfortable configuration. A real deployment should still prefer S3/GCS — not for any property
 demonstrated here, but because running an object store is operational work that an API call avoids.
 `s3.endpoint` keeps that a credentials-and-URL change.
+
+---
+
+## ADR-015 — Credentials are mounted files, not environment variables
+
+**Decision.** The HA topology takes every credential from a file mounted at `/run/secrets/<name>`.
+`make secrets` generates them into `docker/secrets/` (gitignored, mode 600); nothing has a dev default
+any more. Asserted by `make mh-ha-drill`: **21/21**, three of which are about the credentials themselves.
+
+**Why files.** An environment variable holding a password is readable by anything that can ask the
+Docker daemon about the container — `docker inspect`, `docker compose config`, `/proc/1/environ` — and
+the middle one is exactly what people paste into bug reports. Removing the *dev defaults* matters at
+least as much: `${REDIS_PASSWORD:-petafs-dev-secret}` means an unconfigured deployment comes up
+working, with a password that is in the repository.
+
+**The drill asserts the negative AND the positive.** Grepping every running container's `docker inspect`
+output for each secret value, and `docker compose config` likewise, proves the credential is not
+exposed. On its own that check would also pass against a stack where nothing was wired up at all, so it
+is paired with an assertion that the file *is* present inside the container that needs it.
+
+**Four different mechanisms, because four different programs:**
+
+| | How it reads the secret |
+|---|---|
+| MinIO | `MINIO_ROOT_PASSWORD_FILE` — native `_FILE` support |
+| Redis / Sentinel | the entrypoint already writes a config file; it now reads the password first |
+| Kafka | `command` reads the files and exports the JAAS string before handing off to `/etc/kafka/docker/run` |
+| Flink / producer | `contracts/secrets.py` resolves `${VAR}_FILE` before `${VAR}`; `AWS_SECRET_ACCESS_KEY` is exported by an entrypoint wrapper because Flink's S3 filesystem only reads the process environment |
+
+**Scope, stated honestly.** This is done for `docker-compose.multihost-ha.yml` — the topology you would
+actually deploy — and NOT for `docker-compose.prod.yml` or `docker-compose.multihost.yml`, which still
+use environment variables with dev defaults. Those two are separately verified stacks (17/17 and 24/24),
+and converting their credential plumbing without re-running both suites would mean shipping unverified
+changes to working topologies. The mechanism is shared, so the conversion is mechanical when it happens;
+what is not shared is the evidence.
+
+**What it is not.** Nothing here rotates, expires, audits or seals anything. The file sits on a host
+filesystem and any process in the container can read it. It is the *interface* a real secret manager
+plugs into: point the same paths at a Kubernetes projected secret or a Vault agent's tmpfs and no
+service configuration changes. `make secrets-rotate` exists but is deliberately blunt — Redis persists
+its password into its own config file on first boot, so rotating means dropping the Redis volumes too.

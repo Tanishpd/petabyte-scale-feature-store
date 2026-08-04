@@ -38,6 +38,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from contracts.secrets import read_secret  # noqa: E402
 from contracts.events import (  # noqa: E402
     COUNTRIES,
     CURRENCIES,
@@ -249,7 +250,8 @@ def build_producer(bootstrap: str, acks: str, compression: str | None):
             security_protocol=os.environ["KAFKA_SECURITY_PROTOCOL"],
             sasl_mechanism=os.environ.get("KAFKA_SASL_MECHANISM", "PLAIN"),
             sasl_plain_username=os.environ.get("KAFKA_USER", ""),
-            sasl_plain_password=os.environ.get("KAFKA_PASSWORD", ""),
+            # `KAFKA_PASSWORD_FILE` wins when the topology mounts a secret.
+            sasl_plain_password=read_secret("KAFKA_PASSWORD", "") or "",
         )
         # kafka-python is a Python client: it wants a PEM CA file, not the JKS
         # truststore the Java side uses. Same CA, different packaging.
