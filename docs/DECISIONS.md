@@ -313,3 +313,53 @@ checkpoints completed before the kill, 778 KB state, 105 ms each.
 
 **Production.** `file://` on a shared volume is correct for a single-node local stack and wrong for a
 cluster — there, this becomes `s3://` or `gs://`, which is a one-line change to the same key.
+
+---
+
+## ADR-012 — A separate multi-host compose file, verified by isolated Compose projects
+
+**Decision.** Multi-host deployment lives in `docker-compose.multihost.yml` as a third topology
+alongside the dev and prod stacks, with one profile per node, and is verified locally by running the
+three profiles as **three Compose projects with three separate Docker networks**.
+
+**Why a separate file rather than an overlay of `docker-compose.prod.yml`.** The difference is not a
+handful of patched values. Losing Compose DNS re-points four independent discovery mechanisms — Kafka
+advertised listeners and the KRaft quorum, Redis `replicaof` plus Sentinel announcement, Flink's
+JobManager/TaskManager RPC addressing, and TLS SANs. Three of the four fail *silently* when left at
+their single-host settings: clients bootstrap and then hang, Sentinel publishes an address that does not
+route, TaskManagers retry registration with nothing logged on the JobManager side. An overlay that
+patched them piecemeal would read as a small delta over a file whose comments assert the opposite, and
+those comments are load-bearing. See [MULTIHOST.md](MULTIHOST.md) §2.
+
+**Why three Compose projects is a fair test.** Separate projects get separate networks, so there is no
+shared DNS: a container on node B cannot resolve `kafka1`, exactly as it could not across machines.
+Every cross-node connection leaves through a published port and returns over an address that resolves
+off-node — which is the property that actually breaks multi-host deployments. Drill 0 asserts the
+isolation before anything else runs; if the projects ever shared a network the suite would be measuring
+a single-host stack, and a green run would be worse than a red one.
+
+**What it does not test**: network partitions, cross-datacentre latency, hardware failure. Killing every
+container in a project with `down -t 0` is SIGKILL with no grace period and leaves that node's volumes
+intact — close to losing a machine, not identical to it.
+
+**The controller listener changed.** `docker-compose.prod.yml` leaves KRaft's CONTROLLER as PLAINTEXT,
+justified by it never leaving the Compose network. Across hosts that is no longer true, so here it is SSL
+with `ssl.client.auth=required` — mTLS between controllers. This avoids the bootstrap-ordering problem
+that ruled out SCRAM for the quorum, because certificates are files rather than credentials living in
+the metadata log the quorum is still forming. Asserted by probe, not by config: a client with no
+certificate gets `TLSV13_ALERT_CERTIFICATE_REQUIRED`.
+
+**Rejected: JobManager HA.** Flink 2.2.1 supports ZooKeeper HA out of the box — the shaded ZooKeeper 3
+and Curator 5 are inside `flink-dist-2.2.1.jar`, unlike 1.x where they are a separate jar to copy. It is
+still not enabled: a three-node ensemble plus a standby JobManager needs roughly 1.5 GiB more than this
+7.75 GiB Docker VM has, and the object store it would recover from is single-node MinIO anyway.
+Shipping HA config that has never been run is worse than a documented gap, so node A remains a single
+point of failure for the running job — and drill 3 asserts the resubmission so it stays a procedure
+rather than a surprise.
+
+**Verified.** `make mh-drill`, 24/24 from a cold start. Killing the whole node the job was executing on:
+rescheduled onto a surviving node and restored from `s3://flink-checkpoints/petafs/<job>/chk-4`, no data
+lost (48,985 → 60,389 records), features still being written (max TTL 1778 s of 1800). Killing node A:
+Sentinel promoted the Redis master across hosts, Kafka degraded to ISR 2 on all 6 partitions and stayed
+readable, and no split brain when A returned. The drill picks its victim by asking Flink where the job
+actually is, so it has killed node B (job **and** Redis master together) and node C on different runs.

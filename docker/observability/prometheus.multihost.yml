@@ -1,0 +1,36 @@
+# Prometheus for the multi-host topology.
+#
+# Prometheus does NOT expand environment variables in scrape targets — only in
+# external labels, and only behind a feature flag — so unlike every other piece
+# of this topology these addresses cannot be parameterised. They are written
+# out for the local simulation (docker/multihost/sim.env).
+#
+# On real hosts each Flink process has its own machine and the natural port, so
+# the target list becomes:
+#
+#   - targets: ["host-a.internal:9250"]   labels: {role: jobmanager,  node: a}
+#   - targets: ["host-b.internal:9250"]   labels: {role: taskmanager, node: b}
+#   - targets: ["host-c.internal:9250"]   labels: {role: taskmanager, node: c}
+#
+# In a deployment of any size this is service discovery (consul_sd, kubernetes_sd,
+# file_sd written by the orchestrator), not a static list — a static list stops
+# being maintainable at about the point you add the fourth TaskManager.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: flink
+    # The `node` label is what makes these metrics useful here: it is how you
+    # tell "the embedding operator is busy" from "everything on node C is
+    # gone", which look identical in an unlabelled aggregate.
+    static_configs:
+      - targets: ["host.docker.internal:9250"]
+        labels: {role: jobmanager, node: a}
+      - targets: ["host.docker.internal:19251"]
+        labels: {role: taskmanager, node: b}
+      - targets: ["host.docker.internal:19252"]
+        labels: {role: taskmanager, node: c}

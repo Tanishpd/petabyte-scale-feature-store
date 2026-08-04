@@ -124,9 +124,11 @@ of 1.8 KB was 2.3× optimistic.) The full argument is in [docs/SCALING.md](docs/
 
 ## Is this production ready?
 
-Two stacks. `docker-compose.yml` is the laptop demo. **`docker-compose.prod.yml`
+Three stacks. `docker-compose.yml` is the laptop demo. **`docker-compose.prod.yml`
 is a real topology** — `make prod-up`, and `make prod-drill` kills things to prove
-the claims below.
+the claims below. **`docker-compose.multihost.yml` spreads that same topology
+across three independent nodes** — `make mh-up`, and `make mh-drill` kills a whole
+node ([docs/MULTIHOST.md](docs/MULTIHOST.md)).
 
 **Closed, each verified by breaking it** (drills in `scripts/failure_drills.sh`):
 
@@ -141,11 +143,17 @@ the claims below.
 | Sentinel could split-brain | 3 sentinels, quorum 2, config-file Redis so promotions persist | Killed the master, restarted the old one: it rejoins as a replica, exactly one master, all 3 sentinels agree |
 | Everything in the clear | **TLS everywhere**: Kafka SASL_SSL, Redis + Sentinel TLS-only (`port 0`), replication encrypted | An unencrypted client *with valid credentials* is refused on both; the whole path producer→Kafka→Flink→Redis is encrypted |
 | Nothing proved any of it | `make prod-drill` — 17 assertions | **17/17 passing** against the live topology |
+| **Everything on one host** | **Three nodes, separate failure domains** — routable addressing throughout, mTLS on the KRaft quorum | Killed the whole node running the job: rescheduled onto another node, restored from `s3://.../chk-4`, zero data loss, features still writing. Killed the Redis primary's node: promoted across hosts. **24/24** ([MULTIHOST](docs/MULTIHOST.md)) |
 
 **Still open, honestly:**
 
-- **Single-host.** Three brokers on one machine survive a *process* failure, not
-  a *host* failure. Real fault tolerance needs separate failure domains.
+- **The JobManager and the object store are one node.** Losing that node keeps
+  the data — Redis fails over, Kafka keeps serving — but stops the *job*, which
+  does not restart itself. Closing it needs JobManager HA (ZooKeeper) and real
+  S3 rather than single-node MinIO. Flink 2.2.1 supports the former out of the
+  box; it is not enabled because it needs ~1.5 GiB more than this Docker VM has,
+  and untested HA config is worse than a named gap. The drill asserts the
+  resubmission so it stays a procedure, not a surprise.
 - **Secrets are compose env vars with dev defaults**, not a secret store.
 - **Feast internals dependency** ([ADR-003](docs/DECISIONS.md)). CI is the
   tripwire; a supported path would be `write_to_online_store`, at the cost of a hop.
@@ -153,11 +161,19 @@ the claims below.
   calls. Mitigated by refreshing the registry, root cause unknown
   ([SCALING §8](docs/SCALING.md)).
 
-So: **durability, availability, authentication and transport encryption are all
-real and tested. What remains is deployment topology**, which configuration
-cannot fix: everything runs on one host. Operationally it is
-a credible reference topology — 17/17 failure drills — but three brokers on one
-machine survive a process failure, not a datacentre one.
+So: **durability, availability, authentication, transport encryption and
+deployment topology are all real and tested** — 41 assertions across the two
+topologies, every one of them made by breaking something. What remains is one
+node that carries the JobManager and the object store, and both of its fixes are
+named above rather than faked.
+
+The multi-host claims are verified by running the three node profiles as three
+Compose projects on **separate Docker networks**, so there is no shared DNS and
+every address has to be routable — the property that actually breaks multi-host
+deployments. The first drill asserts that isolation before any other, because a
+suite that quietly measured a single-host stack would be worse than one that
+failed. It does not simulate network partitions or hardware failure; that
+boundary is drawn explicitly in [docs/MULTIHOST.md](docs/MULTIHOST.md) §3.
 
 ## Documentation
 
@@ -168,6 +184,7 @@ machine survive a process failure, not a datacentre one.
 | [docs/DECISIONS.md](docs/DECISIONS.md) | Why these versions, why direct-write, what was rejected |
 | [docs/SCALING.md](docs/SCALING.md) | The petabyte math, bottleneck ordering, what breaks at each 10× |
 | [docs/RUNBOOK.md](docs/RUNBOOK.md) | Production topology: drills, sizing, upgrades, alert response |
+| [docs/MULTIHOST.md](docs/MULTIHOST.md) | Three-node deployment: what changes without Compose DNS, and the host-loss drills |
 | [CLAUDE.md](CLAUDE.md) | Working context for AI coding sessions |
 
 ## Troubleshooting

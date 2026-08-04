@@ -32,7 +32,8 @@ endif
 .PHONY: help bootstrap build up down restart ps logs health topics sample tail-topic topic-count \
         produce submit apply seed registry read bench test smoke clean nuke \
         verify-seed verify-windows bench-embed similar \
-        prod-up prod-down prod-clean prod-ps prod-submit prod-drill prod-tls
+        prod-up prod-down prod-clean prod-ps prod-submit prod-drill prod-tls \
+        mh-up mh-down mh-clean mh-ps mh-health mh-tls mh-topics mh-produce mh-submit mh-drill
 
 help:  ## Show this help
 	@echo "Petabyte-Scale Feature Store — available targets:"
@@ -215,3 +216,72 @@ prod-drill:  ## Run the failure drills (kill a broker, kill the redis master)
 
 prod-tls:  ## Generate the local CA and service certs for the prod topology
 	bash docker/tls/generate-certs.sh
+
+# ------------------------------------------------------- multi-host topology ---
+# Three Compose projects, three isolated networks, one per simulated host.
+# Separate projects are the whole point: they get separate networks, so there is
+# no Compose DNS between nodes and every address has to be routable — the same
+# constraint as three real machines. See docs/MULTIHOST.md.
+
+MH_COMPOSE := docker compose -f docker/docker-compose.multihost.yml --env-file docker/multihost/sim.env
+MH_A       := $(MH_COMPOSE) -p petafs-a --profile a
+MH_B       := $(MH_COMPOSE) -p petafs-b --profile b
+MH_C       := $(MH_COMPOSE) -p petafs-c --profile c
+# BROKER listeners — what in-cluster clients (Flink) dial.
+MH_KAFKA   := host.docker.internal:19092,host.docker.internal:19192,host.docker.internal:19292
+# HOST listeners — what scripts on this Mac dial, because macOS does not
+# resolve host.docker.internal (verified). Same shape as Invariant 4.
+MH_KAFKA_HOST := localhost:19094,localhost:19194,localhost:19294
+
+mh-up:  ## Start the three-node topology (three isolated Compose projects)
+	@docker info >/dev/null 2>&1 || { echo "ERROR: Docker daemon not running."; exit 1; }
+	@test -f docker/tls/out/redis-node.crt || { echo "No certs — run 'make mh-tls' first."; exit 1; }
+	@echo ">>> brokers first: the JobManager gates on kafka1 being healthy, and"
+	@echo ">>> kafka1 cannot be healthy until the KRaft quorum has all three."
+	$(MH_A) up -d kafka1 minio
+	$(MH_B) up -d kafka2
+	$(MH_C) up -d kafka3
+	$(MH_A) up -d
+	$(MH_B) up -d
+	$(MH_C) up -d
+	@$(MAKE) --no-print-directory mh-health
+
+mh-tls:  ## Generate certs with the routable node names in their SANs
+	NODE_SANS=$(or $(NODE_SANS),host.docker.internal) bash docker/tls/generate-certs.sh
+
+mh-down:  ## Stop all three nodes (volumes kept)
+	-$(MH_A) down
+	-$(MH_B) down
+	-$(MH_C) down
+
+mh-clean:  ## Stop all three nodes and drop their volumes
+	-$(MH_A) down -v
+	-$(MH_B) down -v
+	-$(MH_C) down -v
+
+mh-ps:  ## Status of all three nodes
+	@for n in a b c; do echo "--- node $$n ---"; \
+	  docker compose -f docker/docker-compose.multihost.yml --env-file docker/multihost/sim.env \
+	    -p petafs-$$n --profile $$n ps --format 'table {{.Service}}\t{{.Status}}' 2>/dev/null; echo; done
+
+mh-health:  ## Cluster-formation summary across the three nodes
+	@bash scripts/multihost_health.sh
+
+mh-topics:  ## Create the transactions topic at RF=3 across the three nodes
+	@bash scripts/multihost_health.sh --create-topic $(TOPIC) $(PARTITIONS)
+
+mh-produce:  ## Produce into the multi-host cluster from this Mac (HOST listeners)
+	KAFKA_SECURITY_PROTOCOL=SASL_SSL KAFKA_SASL_MECHANISM=PLAIN \
+	KAFKA_USER=petafs KAFKA_PASSWORD=petafs-dev-secret \
+	KAFKA_SSL_CAFILE=docker/tls/out/ca.crt \
+	$(PY) src/producer/generate_stream.py --bootstrap $(MH_KAFKA_HOST) \
+	  --topic $(TOPIC) --eps $(or $(EPS),400) $(if $(DURATION),--duration $(DURATION),) \
+	  --acks all --users $(or $(USERS),400)
+
+mh-submit:  ## Submit the pipeline against the multi-host topology
+	$(MH_A) exec -T jobmanager flink run -d -py /opt/project/src/flink/streaming_job.py \
+	  --no-wait --sink redis --bootstrap $(MH_KAFKA) --topic $(TOPIC) \
+	  $(if $(FROM_START),--startup-mode earliest-offset,)
+
+mh-drill:  ## Kill an entire node and assert what survived
+	bash scripts/multihost_drill.sh

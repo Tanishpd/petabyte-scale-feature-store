@@ -3,6 +3,11 @@
 Covers `docker/docker-compose.prod.yml`. The laptop stack is `docker-compose.yml`
 and none of this applies to it.
 
+For the same topology spread across **three separate hosts** — routable
+addressing, mTLS on the KRaft quorum, and drills that kill a whole node — see
+[MULTIHOST.md](MULTIHOST.md). Everything below still applies there; what changes
+is every discovery address, which is exactly why it is a separate file.
+
 ```bash
 make prod-up        # 3 brokers, MinIO, Redis HA, Prometheus
 make prod-submit    # submit the pipeline

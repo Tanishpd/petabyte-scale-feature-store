@@ -12,6 +12,30 @@ DAYS=${DAYS:-825}
 rm -rf "$OUT" && mkdir -p "$OUT"
 cd "$OUT"
 
+# Extra SANs for the multi-host topology. On one host every service is reached
+# by its compose service name, so the SANs below are enough. Across hosts the
+# address a peer dials is the *node's* routable name, and a cert without it
+# fails hostname verification — which presents as a handshake error at the
+# client and nothing at all in the server log.
+#
+#   NODE_SANS=host-a.internal,host-b.internal,10.0.0.11 make prod-tls
+#
+# Entries that parse as IPv4 become IP: SANs, everything else DNS:. Both are
+# added to every cert: after a Redis failover or a Kafka leadership move, a
+# client can legitimately end up talking to any node.
+NODE_SANS=${NODE_SANS:-host.docker.internal}
+extra_sans=""
+IFS=',' ; for h in $NODE_SANS; do
+  h=$(printf '%s' "$h" | tr -d '[:space:]')
+  [ -z "$h" ] && continue
+  case "$h" in
+    *[0-9].[0-9]*) case "$h" in *[!0-9.]*) extra_sans="${extra_sans}DNS:${h}," ;;
+                                        *) extra_sans="${extra_sans}IP:${h}," ;; esac ;;
+    *) extra_sans="${extra_sans}DNS:${h}," ;;
+  esac
+done
+unset IFS
+
 # --- CA ---------------------------------------------------------------------
 openssl req -new -x509 -nodes -days "$DAYS" -newkey rsa:2048 \
   -keyout ca.key -out ca.crt -subj "/CN=petafs-local-ca" 2>/dev/null
@@ -21,7 +45,7 @@ gen() {
   local name="$1"; shift
   local sans=""
   for h in "$@"; do sans="${sans}DNS:${h},"; done
-  sans="${sans}DNS:localhost,IP:127.0.0.1"
+  sans="${sans}${extra_sans}DNS:localhost,IP:127.0.0.1"
 
   openssl req -new -nodes -newkey rsa:2048 \
     -keyout "${name}.key" -out "${name}.csr" -subj "/CN=${name}" 2>/dev/null
@@ -35,6 +59,15 @@ gen redis-primary  redis-primary
 gen redis-replica  redis-replica
 gen sentinel       redis-sentinel-1 redis-sentinel-2 redis-sentinel-3
 gen client         client
+
+# One cert every Redis node presents, covering both node names. Roles swap on
+# failover, so a per-role cert is wrong by construction: the promoted replica
+# would present a cert naming it a replica while Sentinel announces it as the
+# master. redis-py verifies the hostname (ssl_check_hostname defaults to True
+# in redis-py 7.x), so that mismatch breaks writes right after a promotion —
+# the one moment the failover was supposed to cover.
+gen redis-node     redis-primary redis-replica \
+                   redis-sentinel-1 redis-sentinel-2 redis-sentinel-3
 
 # --- Kafka: same CA, packaged as JKS ---------------------------------------
 # Redis takes PEM; Kafka is Java and takes keystores. Each broker's cert covers

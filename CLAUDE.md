@@ -63,15 +63,18 @@ Note this fallback does **not** escape the aarch64 problem in Invariant 7 — no
 ## Layout (target)
 
 ```
-docker/          docker-compose.yml, flink/Dockerfile
+docker/          docker-compose.yml, docker-compose.prod.yml, flink/Dockerfile,
+                 docker-compose.multihost.yml  ← 3 nodes; multihost/sim.env,
+                 tls/generate-certs.sh, observability/
 contracts/       schema.py            ← single source of truth for feature names/dtypes
 src/producer/    generate_stream.py
 src/flink/       streaming_job.py, udfs/embeddings.py, sinks/feast_redis_sink.py
 src/feast_repo/  feature_store.yaml, definitions.py, data/*.parquet
 src/serving/     online_read.py, benchmark.py
-scripts/         bootstrap.sh, seed_offline.py, smoke_test.sh
+scripts/         bootstrap.sh, seed_offline.py, smoke_test.sh, failure_drills.sh,
+                 multihost_health.sh, multihost_drill.sh
 tests/           test_feast_codec_roundtrip.py  ← the load-bearing test
-docs/            ARCHITECTURE.md, DECISIONS.md, SCALING.md
+docs/            ARCHITECTURE.md, DECISIONS.md, SCALING.md, RUNBOOK.md, MULTIHOST.md
 Makefile
 ```
 
@@ -102,6 +105,8 @@ make health        # re-check: container status + kafka/redis/flink reachability
 make topics        # create `transactions` with retention caps
 make smoke         # end-to-end: produce → flink → redis → feast read
 make test          # pytest, includes the codec round-trip
+make mh-tls && make mh-up   # 3-node topology as 3 isolated compose projects
+make mh-drill      # kill a WHOLE node; 24 assertions. See docs/MULTIHOST.md
 redis-cli -p 6380 --scan --pattern '*' | head         # raw Feast keys (binary) — note 6380
 open http://localhost:8081                            # Flink UI: watch backpressure + watermarks
 ```
@@ -179,3 +184,28 @@ Invariant 4. Override with `REDIS_HOST_PORT=6379`.
 - HOP window output is append-only → `to_data_stream()` works without retraction handling. If the
   aggregation is ever changed to a non-windowed `GROUP BY`, the stream becomes a changelog and the sink
   must handle retract messages.
+
+### Multi-host (docs/MULTIHOST.md)
+
+- **Docker Desktop containers cannot reach this Mac's LAN IP** (192.168.x.x times out) — only
+  `host.docker.internal`, which in turn does **not** resolve on the macOS host. So container-side clients
+  use `host.docker.internal:<port>` and host-side scripts need a separate Kafka listener advertised as
+  `localhost:<port>`. Same shape as Invariant 4, one level out.
+- **`blob.server.port` has no bind-port counterpart.** `taskmanager.rpc.port`/`.bind-port` and
+  `taskmanager.data.port`/`.bind-port` let a TaskManager bind one port and advertise another, which is
+  what lets two of them run on one machine. The blob server advertises whatever it binds, so the
+  JobManager's ports must be published 1:1 or TaskManagers fail to fetch job artifacts.
+- **ZooKeeper HA needs no extra jar in Flink 2.x.** `flink-dist-2.2.1.jar` bundles shaded ZooKeeper 3 and
+  Curator 5 (in 1.x these were a separate jar to copy into `lib/`). Not enabled — it does not fit in the
+  7.75 GiB Docker VM alongside everything else.
+- **The Kafka CLI answers an unauthenticated call with silence, not an error.** Drills that recreate a
+  node give it a fresh `/tmp`, so a credentials file written once at startup vanishes and
+  `kafka-get-offsets.sh` starts returning empty — a topic with 163k records reads as 0. Rewrite the
+  properties file on every call.
+- **Feast's Redis keys are binary.** Any probe that scans keys out to the shell and passes them back
+  (`TTL`, `HGET`, …) mangles every one and gets `-2`/nil, which looks like "the pipeline stopped" rather
+  than "the probe is broken". Use a Lua `EVAL` so keys never leave Redis.
+- **A master has no `master_link_status`.** Never hardcode which container is the replica — roles swap on
+  failover and the field simply disappears, reporting a healthy link as absent.
+- **A dead broker lingers in cluster metadata** until its session expires, so a broker count taken right
+  after a kill still reads the old number. Assert ISR shrank, not that the count dropped.

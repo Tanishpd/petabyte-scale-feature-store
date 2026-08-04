@@ -1,0 +1,670 @@
+# Multi-host topology — the same services as docker-compose.prod.yml, spread
+# across three independent failure domains.
+#
+#   ONE FILE, THREE HOSTS. Each host runs its own profile:
+#
+#     host-a$  docker compose -f docker-compose.multihost.yml --profile a up -d
+#     host-b$  docker compose -f docker-compose.multihost.yml --profile b up -d
+#     host-c$  docker compose -f docker-compose.multihost.yml --profile c up -d
+#
+#   with an .env naming the three routable addresses. See docs/MULTIHOST.md.
+#
+# WHY THIS FILE EXISTS AT ALL
+# ---------------------------
+# docker-compose.prod.yml is a real topology in every respect except one: every
+# service finds every other service through Compose's built-in DNS on a shared
+# bridge network. That single network is also a single host. Three brokers on
+# one machine survive a *process* failure, not a *host* failure, and no amount
+# of replication config changes that.
+#
+# The moment the services are actually on different machines, Compose DNS is
+# gone and every address has to be one a peer can route to. That is not a
+# cosmetic change — it touches every discovery mechanism in the stack:
+#
+#   Kafka       advertised.listeners and controller.quorum.voters must carry
+#               routable addresses, not `kafka1`
+#   Redis       `replicaof` and Sentinel must announce routable addresses, or
+#               the primary reports a container-private IP for its replica and
+#               clients discover an address that does not exist off-node
+#   Flink       the JobManager and every TaskManager must advertise a routable
+#               host and a FIXED port; the defaults are ephemeral ports on
+#               whatever the container thinks its hostname is
+#   TLS         every certificate needs the routable name in its SANs, or the
+#               handshake fails hostname verification
+#
+# Each of those is a silent failure in a different way, which is why this is a
+# separate file rather than an overlay of two-line patches.
+#
+# THE CONTROLLER LISTENER IS NO LONGER "INTERNAL"
+# -----------------------------------------------
+# docker-compose.prod.yml leaves CONTROLLER as PLAINTEXT and justifies it with
+# "never exposed outside the compose network". Across hosts that justification
+# is gone — the KRaft quorum now crosses the network like everything else. Here
+# CONTROLLER is SSL with `ssl.client.auth=required`, i.e. mTLS between
+# controllers. This does NOT have the bootstrap-ordering problem that ruled out
+# SCRAM: certificates are files on disk, not credentials living in the metadata
+# log the quorum is still forming.
+
+name: petafs-mh
+
+# ---------------------------------------------------------------------------
+# Addressing. Defaults are the natural ports, i.e. what a genuine three-machine
+# deployment uses — each host gets 9092/9093/6379/26379 to itself.
+#
+# The local simulation (docker/multihost/sim.env) overrides them, because three
+# "hosts" sharing one Docker Desktop cannot all publish 9092. Node identity is
+# the (address, port) pair either way, so only the values differ — never the
+# shape of the config.
+# ---------------------------------------------------------------------------
+x-kafka-common: &kafka-common
+  image: apache/kafka:4.3.1
+  restart: unless-stopped
+  environment: &kafka-env
+    KAFKA_PROCESS_ROLES: broker,controller
+    # Routable addresses, not service names. This is the line that makes the
+    # KRaft quorum span machines; `1@kafka1:9093` resolves on exactly one host.
+    KAFKA_CONTROLLER_QUORUM_VOTERS: >-
+      1@${NODE_A_HOST:-node-a}:${KAFKA_A_CTRL_PORT:-9093},2@${NODE_B_HOST:-node-b}:${KAFKA_B_CTRL_PORT:-9093},3@${NODE_C_HOST:-node-c}:${KAFKA_C_CTRL_PORT:-9093}
+    # Three listeners, three jobs:
+    #   BROKER  peers and in-cluster clients (Flink), routable address
+    #   HOST    scripts running on the machine that owns the container
+    #   CONTROLLER  the KRaft quorum — mTLS, see the header
+    KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: BROKER:SASL_SSL,HOST:SASL_SSL,CONTROLLER:SSL
+    KAFKA_INTER_BROKER_LISTENER_NAME: BROKER
+    KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+    # mTLS on the quorum: each controller must present a cert the others trust.
+    # Without this, anything that can reach the port can join the quorum.
+    KAFKA_LISTENER_NAME_CONTROLLER_SSL_CLIENT_AUTH: required
+    KAFKA_SSL_KEYSTORE_PASSWORD: ${TLS_STOREPASS:-petafs-dev-secret}
+    KAFKA_SSL_KEY_PASSWORD: ${TLS_STOREPASS:-petafs-dev-secret}
+    KAFKA_SSL_TRUSTSTORE_LOCATION: /tls/kafka.truststore.jks
+    KAFKA_SSL_TRUSTSTORE_PASSWORD: ${TLS_STOREPASS:-petafs-dev-secret}
+    # Verify the peer hostname against the cert SANs. Empty (the Kafka default)
+    # encrypts the transport while accepting any certificate — which across
+    # hosts means any machine that can reach the port can impersonate a broker.
+    KAFKA_SSL_ENDPOINT_IDENTIFICATION_ALGORITHM: https
+    KAFKA_SASL_ENABLED_MECHANISMS: PLAIN
+    KAFKA_SASL_MECHANISM_INTER_BROKER_PROTOCOL: PLAIN
+    KAFKA_LISTENER_NAME_BROKER_PLAIN_SASL_JAAS_CONFIG: |
+      org.apache.kafka.common.security.plain.PlainLoginModule required username="${KAFKA_USER:-petafs}" password="${KAFKA_PASSWORD:-petafs-dev-secret}" user_${KAFKA_USER:-petafs}="${KAFKA_PASSWORD:-petafs-dev-secret}";
+    KAFKA_LISTENER_NAME_HOST_PLAIN_SASL_JAAS_CONFIG: |
+      org.apache.kafka.common.security.plain.PlainLoginModule required username="${KAFKA_USER:-petafs}" password="${KAFKA_PASSWORD:-petafs-dev-secret}" user_${KAFKA_USER:-petafs}="${KAFKA_PASSWORD:-petafs-dev-secret}";
+    KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+    KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+    KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+    KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+    KAFKA_MIN_INSYNC_REPLICAS: 2
+    KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    KAFKA_LOG_DIRS: /var/lib/kafka/data
+    KAFKA_NUM_PARTITIONS: 6
+    # Deliberately small so three brokers plus a Flink cluster fit in one 8 GiB
+    # Docker VM for the drills. Production wants 6+ GiB. See docs/RUNBOOK.md §2.
+    KAFKA_HEAP_OPTS: -Xmx448m -Xms448m
+    CLUSTER_ID: ${CLUSTER_ID:-petafs-mh-cluster-1}
+  volumes:
+    - ./tls/out:/tls:ro
+  extra_hosts:
+    # Lets the local simulation address "other hosts" as host.docker.internal on
+    # engines where that name is not built in. Harmless in a real deployment,
+    # where NODE_*_HOST are real DNS names.
+    - "host.docker.internal:host-gateway"
+
+x-kafka-healthcheck: &kafka-healthcheck
+  # Must authenticate AND use TLS. An unauthenticated healthcheck against a
+  # SASL_SSL broker fails forever: every broker reports unhealthy and anything
+  # gated on `depends_on: service_healthy` never starts. The symptom reads as
+  # "Flink won't come up", not "auth is misconfigured".
+  test:
+    - CMD-SHELL
+    - |
+      printf 'security.protocol=SASL_SSL\nsasl.mechanism=PLAIN\nsasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="${KAFKA_USER:-petafs}" password="${KAFKA_PASSWORD:-petafs-dev-secret}";\nssl.truststore.location=/tls/kafka.truststore.jks\nssl.truststore.password=${TLS_STOREPASS:-petafs-dev-secret}\n' > /tmp/hc.properties
+      /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 --command-config /tmp/hc.properties >/dev/null 2>&1
+  interval: 10s
+  timeout: 10s
+  retries: 24
+  start_period: 45s
+
+# Redis nodes are symmetric apart from the initial `replicaof`. They have to be:
+# roles swap on failover, and a config that is only correct for the node that
+# happens to be primary today breaks the first time Sentinel promotes.
+x-redis-common: &redis-common
+  image: redis/redis-stack-server:7.4.0-v8
+  restart: unless-stopped
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+
+services:
+
+  # ======================================================================
+  # NODE A — Kafka 1, Redis primary, Sentinel 1, MinIO, JobManager
+  #
+  # The JobManager and MinIO sit together deliberately: they are the two
+  # remaining singletons, so co-locating them means exactly one of the three
+  # nodes is special instead of two. See docs/MULTIHOST.md §"What still fails".
+  # ======================================================================
+
+  kafka1:
+    <<: *kafka-common
+    profiles: ["a"]
+    container_name: petafs-mh-kafka1
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 1
+      KAFKA_SSL_KEYSTORE_LOCATION: /tls/kafka1.keystore.jks
+      KAFKA_LISTENERS: BROKER://0.0.0.0:9092,HOST://0.0.0.0:9094,CONTROLLER://0.0.0.0:9093
+      # BROKER is what peers and Flink dial. HOST is for scripts on this
+      # machine, which cannot necessarily resolve the routable name.
+      KAFKA_ADVERTISED_LISTENERS: >-
+        BROKER://${NODE_A_HOST:-node-a}:${KAFKA_A_BROKER_PORT:-9092},HOST://localhost:${KAFKA_A_HOST_PORT:-9094}
+    ports:
+      - "${KAFKA_A_BROKER_PORT:-9092}:9092"
+      - "${KAFKA_A_CTRL_PORT:-9093}:9093"
+      - "${KAFKA_A_HOST_PORT:-9094}:9094"
+    volumes:
+      - kafka1-data:/var/lib/kafka/data
+      - ./tls/out:/tls:ro
+    healthcheck: *kafka-healthcheck
+
+  redis-primary:
+    <<: *redis-common
+    profiles: ["a"]
+    container_name: petafs-mh-redis-primary
+    # A config FILE, not command-line args: Redis persists a Sentinel-driven
+    # promotion with CONFIG REWRITE, which only works against a file.
+    entrypoint:
+      - sh
+      - -c
+      - |
+        CONF=/data/redis.conf
+        if [ ! -f "$$CONF" ]; then
+          cat > "$$CONF" <<EOF
+        requirepass ${REDIS_PASSWORD:-petafs-dev-secret}
+        masterauth ${REDIS_PASSWORD:-petafs-dev-secret}
+        appendonly yes
+        dir /data
+        port 0
+        tls-port 6379
+        tls-cert-file /tls/redis-node.crt
+        tls-key-file /tls/redis-node.key
+        tls-ca-cert-file /tls/ca.crt
+        tls-replication yes
+        tls-auth-clients no
+        # THE multi-host line for Redis. Without it the primary reports this
+        # node's container-private IP as the replica address, Sentinel
+        # publishes that to clients, and every client off this host discovers
+        # an address that does not route. Announcing a hostname rather than an
+        # IP also survives the network being recreated — the trap documented in
+        # RUNBOOK §4.
+        replica-announce-ip ${NODE_A_HOST:-node-a}
+        replica-announce-port ${REDIS_A_PORT:-6379}
+        EOF
+        fi
+        exec redis-server "$$CONF"
+    ports: ["${REDIS_A_PORT:-6379}:6379"]
+    volumes:
+      - redis-primary-data:/data
+      - ./tls/out:/tls:ro
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --tls --cacert /tls/ca.crt -a ${REDIS_PASSWORD:-petafs-dev-secret} ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+  redis-sentinel-1:
+    <<: *redis-common
+    profiles: ["a"]
+    container_name: petafs-mh-redis-sentinel-1
+    entrypoint:
+      - sh
+      - -c
+      - |
+        CONF=/data/sentinel.conf
+        if [ ! -f "$$CONF" ]; then
+          cat > "$$CONF" <<EOF
+        port 0
+        tls-port 26379
+        tls-cert-file /tls/redis-node.crt
+        tls-key-file /tls/redis-node.key
+        tls-ca-cert-file /tls/ca.crt
+        tls-replication yes
+        tls-auth-clients no
+        requirepass ${REDIS_PASSWORD:-petafs-dev-secret}
+        # Sentinels find each other by gossiping over the master's pub/sub
+        # channel, advertising the address below. Default is the container IP,
+        # which no other host can reach — the sentinels would each report
+        # num-other-sentinels:0 and never form the quorum, while looking fine
+        # individually.
+        sentinel announce-ip ${NODE_A_HOST:-node-a}
+        sentinel announce-port ${SENTINEL_A_PORT:-26379}
+        sentinel resolve-hostnames yes
+        sentinel announce-hostnames yes
+        sentinel monitor mymaster ${NODE_A_HOST:-node-a} ${REDIS_A_PORT:-6379} 2
+        sentinel auth-pass mymaster ${REDIS_PASSWORD:-petafs-dev-secret}
+        sentinel down-after-milliseconds mymaster 5000
+        sentinel failover-timeout mymaster 10000
+        dir /data
+        EOF
+        fi
+        exec redis-sentinel "$$CONF"
+    ports: ["${SENTINEL_A_PORT:-26379}:26379"]
+    volumes:
+      - redis-sentinel-1-data:/data
+      - ./tls/out:/tls:ro
+    depends_on:
+      redis-primary:
+        condition: service_healthy
+
+  minio:
+    profiles: ["a"]
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    container_name: petafs-mh-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_USER:-petafs}
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD:-petafs-dev-secret}
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local || curl -fs http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  minio-init:
+    profiles: ["a"]
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    container_name: petafs-mh-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "mc alias set petafs http://minio:9000 ${MINIO_USER:-petafs} ${MINIO_PASSWORD:-petafs-dev-secret}
+      && mc mb --ignore-existing petafs/flink-checkpoints
+      && mc mb --ignore-existing petafs/flink-savepoints
+      && echo 'buckets ready'"
+
+  jobmanager:
+    profiles: ["a"]
+    image: petafs/flink:2.2.1
+    container_name: petafs-mh-jobmanager
+    restart: unless-stopped
+    command: jobmanager
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      # Published 1:1, unlike the TaskManagers below. Only one node runs a
+      # JobManager, so there is no collision to resolve — and `blob.server.port`
+      # has no separate bind-port setting, so its published port MUST equal the
+      # port it binds to or TaskManagers cannot fetch job artifacts.
+      - "${JM_REST_PORT:-8081}:8081"
+      - "${JM_RPC_PORT:-6123}:6123"
+      - "${JM_BLOB_PORT:-6124}:6124"
+      - "${JM_METRICS_PORT:-9250}:9250"
+    environment:
+      PYTHONPATH: /opt/project
+      AWS_ACCESS_KEY_ID: ${MINIO_USER:-petafs}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_PASSWORD:-petafs-dev-secret}
+      # All three sentinels, each at its own node address. One entry per
+      # failure domain is the whole point: a sentinel list that names only the
+      # local node cannot survive that node.
+      REDIS_SENTINELS: >-
+        ${NODE_A_HOST:-node-a}:${SENTINEL_A_PORT:-26379},${NODE_B_HOST:-node-b}:${SENTINEL_B_PORT:-26379},${NODE_C_HOST:-node-c}:${SENTINEL_C_PORT:-26379}
+      REDIS_SENTINEL_MASTER: mymaster
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-petafs-dev-secret}
+      REDIS_TLS_CA: /tls/ca.crt
+      KAFKA_SECURITY_PROTOCOL: SASL_SSL
+      KAFKA_SSL_TRUSTSTORE: /tls/kafka.truststore.jks
+      TLS_STOREPASS: ${TLS_STOREPASS:-petafs-dev-secret}
+      KAFKA_SASL_MECHANISM: PLAIN
+      KAFKA_USER: ${KAFKA_USER:-petafs}
+      KAFKA_PASSWORD: ${KAFKA_PASSWORD:-petafs-dev-secret}
+      FLINK_PROPERTIES: |
+        # Bind wide, advertise routable. On one host these collapse to the same
+        # thing and the defaults work; across hosts a JobManager that advertises
+        # its container hostname is unreachable and TaskManagers hang in
+        # registration with nothing logged on the JobManager side.
+        jobmanager.rpc.address: ${NODE_A_HOST:-node-a}
+        jobmanager.rpc.port: ${JM_RPC_PORT:-6123}
+        jobmanager.bind-host: 0.0.0.0
+        rest.address: ${NODE_A_HOST:-node-a}
+        rest.bind-address: 0.0.0.0
+        rest.port: 8081
+        blob.server.port: 6124
+        jobmanager.memory.process.size: 900m
+        parallelism.default: 1
+        state.backend.type: rocksdb
+        state.backend.incremental: true
+        execution.checkpointing.dir: s3://flink-checkpoints/petafs
+        execution.checkpointing.savepoint-dir: s3://flink-savepoints/petafs
+        execution.checkpointing.interval: 30s
+        execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+        execution.checkpointing.num-retained: 5
+        execution.checkpointing.unaligned.enabled: true
+        restart-strategy.type: exponential-delay
+        restart-strategy.exponential-delay.initial-backoff: 5s
+        restart-strategy.exponential-delay.max-backoff: 30s
+        metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prom.port: 9250
+        s3.endpoint: http://${NODE_A_HOST:-node-a}:${MINIO_PORT:-9000}
+        s3.path.style.access: true
+    volumes:
+      - ../src:/opt/project/src:ro
+      - ../contracts:/opt/project/contracts:ro
+      - ./tls/out:/tls:ro
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+      kafka1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8081/overview >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 24
+      start_period: 30s
+
+  prometheus:
+    # Off by default — it is ~200 MB of a tight memory budget and proves
+    # nothing about the topology. `--profile a --profile obs` to include it.
+    profiles: ["obs"]
+    image: prom/prometheus:v3.2.1
+    container_name: petafs-mh-prometheus
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=6h
+    volumes:
+      - ./observability/prometheus.multihost.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports: ["${PROM_PORT:-9090}:9090"]
+
+  # ======================================================================
+  # NODE B — Kafka 2, Redis replica, Sentinel 2, TaskManager
+  # ======================================================================
+
+  kafka2:
+    <<: *kafka-common
+    profiles: ["b"]
+    container_name: petafs-mh-kafka2
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 2
+      KAFKA_SSL_KEYSTORE_LOCATION: /tls/kafka2.keystore.jks
+      KAFKA_LISTENERS: BROKER://0.0.0.0:9092,HOST://0.0.0.0:9094,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: >-
+        BROKER://${NODE_B_HOST:-node-b}:${KAFKA_B_BROKER_PORT:-9092},HOST://localhost:${KAFKA_B_HOST_PORT:-9094}
+    ports:
+      - "${KAFKA_B_BROKER_PORT:-9092}:9092"
+      - "${KAFKA_B_CTRL_PORT:-9093}:9093"
+      - "${KAFKA_B_HOST_PORT:-9094}:9094"
+    volumes:
+      - kafka2-data:/var/lib/kafka/data
+      - ./tls/out:/tls:ro
+    healthcheck: *kafka-healthcheck
+
+  redis-replica:
+    <<: *redis-common
+    profiles: ["b"]
+    container_name: petafs-mh-redis-replica
+    entrypoint:
+      - sh
+      - -c
+      - |
+        CONF=/data/redis.conf
+        if [ ! -f "$$CONF" ]; then
+          cat > "$$CONF" <<EOF
+        requirepass ${REDIS_PASSWORD:-petafs-dev-secret}
+        masterauth ${REDIS_PASSWORD:-petafs-dev-secret}
+        appendonly yes
+        dir /data
+        port 0
+        tls-port 6379
+        tls-cert-file /tls/redis-node.crt
+        tls-key-file /tls/redis-node.key
+        tls-ca-cert-file /tls/ca.crt
+        tls-replication yes
+        tls-auth-clients no
+        replica-announce-ip ${NODE_B_HOST:-node-b}
+        replica-announce-port ${REDIS_B_PORT:-6379}
+        # A hostname, not an IP. Written once into the config file and then
+        # owned by Sentinel; RUNBOOK §4 has the story of the IP version.
+        replicaof ${NODE_A_HOST:-node-a} ${REDIS_A_PORT:-6379}
+        EOF
+        fi
+        exec redis-server "$$CONF"
+    ports: ["${REDIS_B_PORT:-6379}:6379"]
+    volumes:
+      - redis-replica-data:/data
+      - ./tls/out:/tls:ro
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --tls --cacert /tls/ca.crt -a ${REDIS_PASSWORD:-petafs-dev-secret} ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+  redis-sentinel-2:
+    <<: *redis-common
+    profiles: ["b"]
+    container_name: petafs-mh-redis-sentinel-2
+    entrypoint:
+      - sh
+      - -c
+      - |
+        CONF=/data/sentinel.conf
+        if [ ! -f "$$CONF" ]; then
+          cat > "$$CONF" <<EOF
+        port 0
+        tls-port 26379
+        tls-cert-file /tls/redis-node.crt
+        tls-key-file /tls/redis-node.key
+        tls-ca-cert-file /tls/ca.crt
+        tls-replication yes
+        tls-auth-clients no
+        requirepass ${REDIS_PASSWORD:-petafs-dev-secret}
+        sentinel announce-ip ${NODE_B_HOST:-node-b}
+        sentinel announce-port ${SENTINEL_B_PORT:-26379}
+        sentinel resolve-hostnames yes
+        sentinel announce-hostnames yes
+        sentinel monitor mymaster ${NODE_A_HOST:-node-a} ${REDIS_A_PORT:-6379} 2
+        sentinel auth-pass mymaster ${REDIS_PASSWORD:-petafs-dev-secret}
+        sentinel down-after-milliseconds mymaster 5000
+        sentinel failover-timeout mymaster 10000
+        dir /data
+        EOF
+        fi
+        exec redis-sentinel "$$CONF"
+    ports: ["${SENTINEL_B_PORT:-26379}:26379"]
+    volumes:
+      - redis-sentinel-2-data:/data
+      - ./tls/out:/tls:ro
+
+  taskmanager-b:
+    profiles: ["b"]
+    image: petafs/flink:2.2.1
+    container_name: petafs-mh-taskmanager-b
+    restart: unless-stopped
+    command: taskmanager
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      # Unlike the JobManager, TaskManagers exist on more than one node, so in
+      # the single-machine simulation their published ports must differ. Flink
+      # supports that with the bind-port/port split below: bind 6122 inside the
+      # container, advertise whatever the world reaches it on.
+      - "${TM_B_RPC_PORT:-6122}:6122"
+      - "${TM_B_DATA_PORT:-6121}:6121"
+      - "${TM_B_METRICS_PORT:-9250}:9250"
+    environment:
+      PYTHONPATH: /opt/project
+      AWS_ACCESS_KEY_ID: ${MINIO_USER:-petafs}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_PASSWORD:-petafs-dev-secret}
+      REDIS_SENTINELS: >-
+        ${NODE_A_HOST:-node-a}:${SENTINEL_A_PORT:-26379},${NODE_B_HOST:-node-b}:${SENTINEL_B_PORT:-26379},${NODE_C_HOST:-node-c}:${SENTINEL_C_PORT:-26379}
+      REDIS_SENTINEL_MASTER: mymaster
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-petafs-dev-secret}
+      REDIS_TLS_CA: /tls/ca.crt
+      KAFKA_SECURITY_PROTOCOL: SASL_SSL
+      KAFKA_SSL_TRUSTSTORE: /tls/kafka.truststore.jks
+      TLS_STOREPASS: ${TLS_STOREPASS:-petafs-dev-secret}
+      KAFKA_SASL_MECHANISM: PLAIN
+      KAFKA_USER: ${KAFKA_USER:-petafs}
+      KAFKA_PASSWORD: ${KAFKA_PASSWORD:-petafs-dev-secret}
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: ${NODE_A_HOST:-node-a}
+        jobmanager.rpc.port: ${JM_RPC_PORT:-6123}
+        taskmanager.host: ${NODE_B_HOST:-node-b}
+        taskmanager.bind-host: 0.0.0.0
+        taskmanager.rpc.port: ${TM_B_RPC_PORT:-6122}
+        taskmanager.rpc.bind-port: 6122
+        taskmanager.data.port: ${TM_B_DATA_PORT:-6121}
+        taskmanager.data.bind-port: 6121
+        taskmanager.memory.process.size: 1600m
+        taskmanager.numberOfTaskSlots: 1
+        state.backend.type: rocksdb
+        state.backend.incremental: true
+        execution.checkpointing.dir: s3://flink-checkpoints/petafs
+        execution.checkpointing.savepoint-dir: s3://flink-savepoints/petafs
+        metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prom.port: 9250
+        s3.endpoint: http://${NODE_A_HOST:-node-a}:${MINIO_PORT:-9000}
+        s3.path.style.access: true
+    volumes:
+      - ../src:/opt/project/src:ro
+      - ../contracts:/opt/project/contracts:ro
+      - ./tls/out:/tls:ro
+
+  # ======================================================================
+  # NODE C — Kafka 3, Sentinel 3, TaskManager
+  #
+  # No Redis data node here. Two data nodes plus three sentinels is the
+  # standard Sentinel shape: the third vote must live somewhere that is not
+  # either data node, or losing a data node also loses the quorum that was
+  # supposed to react to it.
+  # ======================================================================
+
+  kafka3:
+    <<: *kafka-common
+    profiles: ["c"]
+    container_name: petafs-mh-kafka3
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 3
+      KAFKA_SSL_KEYSTORE_LOCATION: /tls/kafka3.keystore.jks
+      KAFKA_LISTENERS: BROKER://0.0.0.0:9092,HOST://0.0.0.0:9094,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: >-
+        BROKER://${NODE_C_HOST:-node-c}:${KAFKA_C_BROKER_PORT:-9092},HOST://localhost:${KAFKA_C_HOST_PORT:-9094}
+    ports:
+      - "${KAFKA_C_BROKER_PORT:-9092}:9092"
+      - "${KAFKA_C_CTRL_PORT:-9093}:9093"
+      - "${KAFKA_C_HOST_PORT:-9094}:9094"
+    volumes:
+      - kafka3-data:/var/lib/kafka/data
+      - ./tls/out:/tls:ro
+    healthcheck: *kafka-healthcheck
+
+  redis-sentinel-3:
+    <<: *redis-common
+    profiles: ["c"]
+    container_name: petafs-mh-redis-sentinel-3
+    entrypoint:
+      - sh
+      - -c
+      - |
+        CONF=/data/sentinel.conf
+        if [ ! -f "$$CONF" ]; then
+          cat > "$$CONF" <<EOF
+        port 0
+        tls-port 26379
+        tls-cert-file /tls/redis-node.crt
+        tls-key-file /tls/redis-node.key
+        tls-ca-cert-file /tls/ca.crt
+        tls-replication yes
+        tls-auth-clients no
+        requirepass ${REDIS_PASSWORD:-petafs-dev-secret}
+        sentinel announce-ip ${NODE_C_HOST:-node-c}
+        sentinel announce-port ${SENTINEL_C_PORT:-26379}
+        sentinel resolve-hostnames yes
+        sentinel announce-hostnames yes
+        sentinel monitor mymaster ${NODE_A_HOST:-node-a} ${REDIS_A_PORT:-6379} 2
+        sentinel auth-pass mymaster ${REDIS_PASSWORD:-petafs-dev-secret}
+        sentinel down-after-milliseconds mymaster 5000
+        sentinel failover-timeout mymaster 10000
+        dir /data
+        EOF
+        fi
+        exec redis-sentinel "$$CONF"
+    ports: ["${SENTINEL_C_PORT:-26379}:26379"]
+    volumes:
+      - redis-sentinel-3-data:/data
+      - ./tls/out:/tls:ro
+
+  taskmanager-c:
+    profiles: ["c"]
+    image: petafs/flink:2.2.1
+    container_name: petafs-mh-taskmanager-c
+    restart: unless-stopped
+    command: taskmanager
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${TM_C_RPC_PORT:-6122}:6122"
+      - "${TM_C_DATA_PORT:-6121}:6121"
+      - "${TM_C_METRICS_PORT:-9250}:9250"
+    environment:
+      PYTHONPATH: /opt/project
+      AWS_ACCESS_KEY_ID: ${MINIO_USER:-petafs}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_PASSWORD:-petafs-dev-secret}
+      REDIS_SENTINELS: >-
+        ${NODE_A_HOST:-node-a}:${SENTINEL_A_PORT:-26379},${NODE_B_HOST:-node-b}:${SENTINEL_B_PORT:-26379},${NODE_C_HOST:-node-c}:${SENTINEL_C_PORT:-26379}
+      REDIS_SENTINEL_MASTER: mymaster
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-petafs-dev-secret}
+      REDIS_TLS_CA: /tls/ca.crt
+      KAFKA_SECURITY_PROTOCOL: SASL_SSL
+      KAFKA_SSL_TRUSTSTORE: /tls/kafka.truststore.jks
+      TLS_STOREPASS: ${TLS_STOREPASS:-petafs-dev-secret}
+      KAFKA_SASL_MECHANISM: PLAIN
+      KAFKA_USER: ${KAFKA_USER:-petafs}
+      KAFKA_PASSWORD: ${KAFKA_PASSWORD:-petafs-dev-secret}
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: ${NODE_A_HOST:-node-a}
+        jobmanager.rpc.port: ${JM_RPC_PORT:-6123}
+        taskmanager.host: ${NODE_C_HOST:-node-c}
+        taskmanager.bind-host: 0.0.0.0
+        taskmanager.rpc.port: ${TM_C_RPC_PORT:-6122}
+        taskmanager.rpc.bind-port: 6122
+        taskmanager.data.port: ${TM_C_DATA_PORT:-6121}
+        taskmanager.data.bind-port: 6121
+        taskmanager.memory.process.size: 1600m
+        taskmanager.numberOfTaskSlots: 1
+        state.backend.type: rocksdb
+        state.backend.incremental: true
+        execution.checkpointing.dir: s3://flink-checkpoints/petafs
+        execution.checkpointing.savepoint-dir: s3://flink-savepoints/petafs
+        metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prom.port: 9250
+        s3.endpoint: http://${NODE_A_HOST:-node-a}:${MINIO_PORT:-9000}
+        s3.path.style.access: true
+    volumes:
+      - ../src:/opt/project/src:ro
+      - ../contracts:/opt/project/contracts:ro
+      - ./tls/out:/tls:ro
+
+volumes:
+  kafka1-data:
+  kafka2-data:
+  kafka3-data:
+  redis-primary-data:
+  redis-replica-data:
+  redis-sentinel-1-data:
+  redis-sentinel-2-data:
+  redis-sentinel-3-data:
+  minio-data:
