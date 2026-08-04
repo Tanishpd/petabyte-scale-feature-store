@@ -124,11 +124,14 @@ of 1.8 KB was 2.3× optimistic.) The full argument is in [docs/SCALING.md](docs/
 
 ## Is this production ready?
 
-Three stacks. `docker-compose.yml` is the laptop demo. **`docker-compose.prod.yml`
-is a real topology** — `make prod-up`, and `make prod-drill` kills things to prove
-the claims below. **`docker-compose.multihost.yml` spreads that same topology
-across three independent nodes** — `make mh-up`, and `make mh-drill` kills a whole
-node ([docs/MULTIHOST.md](docs/MULTIHOST.md)).
+Four stacks, each one closing what the previous could not. `docker-compose.yml`
+is the laptop demo. **`docker-compose.prod.yml`** is a real topology —
+`make prod-up`, and `make prod-drill` kills things to prove the claims below.
+**`docker-compose.multihost.yml`** spreads that across three independent nodes
+(`make mh-up`, `make mh-drill` kills a whole node). **`docker-compose.multihost-ha.yml`**
+adds a ZooKeeper ensemble and a standby JobManager, so losing the node running
+the pipeline no longer stops the pipeline (`make mh-ha-up`, `make mh-ha-drill`).
+Both are in [docs/MULTIHOST.md](docs/MULTIHOST.md).
 
 **Closed, each verified by breaking it** (drills in `scripts/failure_drills.sh`):
 
@@ -144,16 +147,17 @@ node ([docs/MULTIHOST.md](docs/MULTIHOST.md)).
 | Everything in the clear | **TLS everywhere**: Kafka SASL_SSL, Redis + Sentinel TLS-only (`port 0`), replication encrypted | An unencrypted client *with valid credentials* is refused on both; the whole path producer→Kafka→Flink→Redis is encrypted |
 | Nothing proved any of it | `make prod-drill` — 17 assertions | **17/17 passing** against the live topology |
 | **Everything on one host** | **Three nodes, separate failure domains** — routable addressing throughout, mTLS on the KRaft quorum | Killed the whole node running the job: rescheduled onto another node, restored from `s3://.../chk-4`, zero data loss, features still writing. Killed the Redis primary's node: promoted across hosts. **24/24** ([MULTIHOST](docs/MULTIHOST.md)) |
+| **The JobManager was a single point of failure** | **ZooKeeper ensemble + standby JobManager** — leadership is a ZK latch, job graph lives in object storage | Killed the whole node holding the *leading* JobManager: leadership moved automatically, the pipeline recovered **with no resubmission and the same job id**, restored from `s3://.../chk-32`, features resumed. **14/14**, run in both failover directions |
 
 **Still open, honestly:**
 
-- **The JobManager and the object store are one node.** Losing that node keeps
-  the data — Redis fails over, Kafka keeps serving — but stops the *job*, which
-  does not restart itself. Closing it needs JobManager HA (ZooKeeper) and real
-  S3 rather than single-node MinIO. Flink 2.2.1 supports the former out of the
-  box; it is not enabled because it needs ~1.5 GiB more than this Docker VM has,
-  and untested HA config is worse than a named gap. The drill asserts the
-  resubmission so it stays a procedure, not a surprise.
+- **The object store is one node.** MinIO runs on a single node and Flink takes
+  a single `s3.endpoint`. Distributed MinIO would fix durability but not
+  endpoint availability — that needs a load balancer or DNS failover, which is
+  exactly what a managed object store already provides. Swapping in S3/GCS is a
+  credentials-and-URL change and is already how `s3.endpoint` is wired; building
+  an LB tier on a laptop to simulate it would be theatre. Named, not
+  half-closed.
 - **Secrets are compose env vars with dev defaults**, not a secret store.
 - **Feast internals dependency** ([ADR-003](docs/DECISIONS.md)). CI is the
   tripwire; a supported path would be `write_to_online_store`, at the cost of a hop.
@@ -161,11 +165,10 @@ node ([docs/MULTIHOST.md](docs/MULTIHOST.md)).
   calls. Mitigated by refreshing the registry, root cause unknown
   ([SCALING §8](docs/SCALING.md)).
 
-So: **durability, availability, authentication, transport encryption and
-deployment topology are all real and tested** — 41 assertions across the two
-topologies, every one of them made by breaking something. What remains is one
-node that carries the JobManager and the object store, and both of its fixes are
-named above rather than faked.
+So: **durability, availability, authentication, transport encryption, deployment
+topology and control-plane failover are all real and tested** — 55 assertions
+across the three topologies, every one of them made by breaking something. What
+remains is the object store, and its fix is named above rather than faked.
 
 The multi-host claims are verified by running the three node profiles as three
 Compose projects on **separate Docker networks**, so there is no shared DNS and

@@ -349,13 +349,12 @@ that ruled out SCRAM for the quorum, because certificates are files rather than 
 the metadata log the quorum is still forming. Asserted by probe, not by config: a client with no
 certificate gets `TLSV13_ALERT_CERTIFICATE_REQUIRED`.
 
-**Rejected: JobManager HA.** Flink 2.2.1 supports ZooKeeper HA out of the box — the shaded ZooKeeper 3
-and Curator 5 are inside `flink-dist-2.2.1.jar`, unlike 1.x where they are a separate jar to copy. It is
-still not enabled: a three-node ensemble plus a standby JobManager needs roughly 1.5 GiB more than this
-7.75 GiB Docker VM has, and the object store it would recover from is single-node MinIO anyway.
-Shipping HA config that has never been run is worse than a documented gap, so node A remains a single
-point of failure for the running job — and drill 3 asserts the resubmission so it stays a procedure
-rather than a surprise.
+**Deferred at the time: JobManager HA.** ~~a three-node ensemble plus a standby needs roughly 1.5 GiB
+more than this 7.75 GiB Docker VM has~~ — **that estimate was wrong and ADR-013 supersedes it.** The
+whole HA topology measures 5.4 GiB. The figure had been reasoned rather than measured; what actually
+constrains this box is Kafka's retention setting, not the HA services. Node A remains the single
+JobManager in *this* file, and drill 3 asserts the resubmission so it stays a procedure rather than a
+surprise; `docker-compose.multihost-ha.yml` removes the need for it entirely.
 
 **Verified.** `make mh-drill`, 24/24 from a cold start. Killing the whole node the job was executing on:
 rescheduled onto a surviving node and restored from `s3://flink-checkpoints/petafs/<job>/chk-4`, no data
@@ -363,3 +362,48 @@ lost (48,985 → 60,389 records), features still being written (max TTL 1778 s o
 Sentinel promoted the Redis master across hosts, Kafka degraded to ISR 2 on all 6 partitions and stayed
 readable, and no split brain when A returned. The drill picks its victim by asking Flink where the job
 actually is, so it has killed node B (job **and** Redis master together) and node C on different runs.
+
+---
+
+## ADR-013 — JobManager HA via ZooKeeper, and why the object store stays a named gap
+
+**Decision.** `docker-compose.multihost-ha.yml` adds a three-node ZooKeeper ensemble and a second
+JobManager to the multi-host topology, with the layout rearranged so the leading JobManager never shares
+a node with the checkpoint store. Verified by `make mh-ha-drill`: **14/14**, run in both failover
+directions.
+
+**Supersedes ADR-012's rejection.** That ADR deferred HA on the grounds that an ensemble plus a standby
+needed "roughly 1.5 GiB more than this 7.75 GiB Docker VM has". The figure was reasoned, not measured,
+and it was wrong: the entire HA topology — 3 brokers, 3 ZooKeepers, 2 JobManagers, 2 TaskManagers, Redis
+HA, MinIO — measures **5.4 GiB with the pipeline running**. The real constraint on this machine turned
+out to be Kafka's *retention* setting, not the HA services: a broker's resident size is dominated by
+mmap'd log segments, so an uncapped topic grew the three brokers from ~390 MiB to ~1.4 GiB each and
+starved Flink into `Could not create actor system`. Capping retention fixed it and the second
+TaskManager then registered in 30 s.
+
+**No extra jar.** Flink 2.2.1 bundles shaded ZooKeeper 3 and Curator 5 inside `flink-dist-2.2.1.jar`. In
+1.x these were a separate artifact to copy into `lib/`, which is what most surviving documentation says.
+
+**Two settings that are silent traps:**
+
+1. **`high-availability.jobmanager.port`.** In HA mode `jobmanager.rpc.port` is ignored and this one
+   takes over — defaulting to `0`, a random port. The JobManager publishes an ephemeral port into
+   ZooKeeper, the TaskManager dials a port Docker never published, and it retries forever with
+   `Could not resolve ResourceManager address ...:42335`. On one host it works by accident.
+2. **The leader is not "whichever REST answers 200".** Both JobManagers answer 200 in steady state with
+   identical job lists, because a non-leader proxies to the leader. A 503 appears only during startup —
+   long enough for a check written then to look right and never discriminate again. The authority is
+   ZooKeeper: `/flink/<cluster-id>/leader/rest_server/connection_info`.
+
+**Rejected: distributed MinIO.** It would close the durability half of the object-store gap and not the
+other half. Flink takes a single `s3.endpoint`, so the endpoint itself must be highly available — a load
+balancer or DNS failover in front of the cluster. That is precisely what a managed object store already
+is; S3 and GCS hand you a regional endpoint with the availability solved. Swapping MinIO for either is a
+credentials-and-URL change, already how `s3.endpoint` is wired. Building an LB tier on a laptop to
+simulate something whose real answer is "use the managed service" would be theatre, so the object store
+stays a **named** gap rather than a half-closed one.
+
+**Also rejected: an overlay on docker-compose.multihost.yml.** HA needs a different node layout, and
+Compose cannot express that as an overlay — `profiles` MERGES rather than replaces, so an overlay
+declaring `profiles: [b]` on a service the base file put in `a` lands it in both. Verified with
+`docker compose config`, not assumed. Same reasoning that produced a separate file in ADR-012.

@@ -1,0 +1,792 @@
+# Multi-host topology WITH JobManager high availability.
+#
+#   host-a$  docker compose -f docker-compose.multihost-ha.yml --profile a up -d
+#   host-b$  ... --profile b up -d
+#   host-c$  ... --profile c up -d
+#
+# This is a superset of docker-compose.multihost.yml: same routable addressing,
+# same mTLS KRaft quorum, same Redis Sentinel setup, plus a ZooKeeper ensemble
+# and a standby JobManager. On three real hosts you would run THIS file and not
+# the other one.
+#
+# WHY IT IS A SEPARATE FILE AND NOT AN OVERLAY
+# --------------------------------------------
+# HA needs a different node layout — the active JobManager must not sit on the
+# node holding the checkpoint store, or losing it takes the thing the standby
+# would recover from. Compose overlays cannot move a service between nodes:
+# `profiles` MERGES rather than replaces, so an overlay saying `profiles: [b]`
+# on a service the base file put in profile `a` lands it in BOTH. Verified, not
+# assumed. Relocating therefore requires its own file. Same reasoning as
+# ADR-012.
+#
+# LAYOUT — nothing critical shares a node with its own failover target
+# --------------------------------------------------------------------
+#   node A   kafka1, redis primary, sentinel 1, zk 1, MinIO
+#   node B   kafka2, redis replica,  sentinel 2, zk 2, JobManager (starts active)
+#   node C   kafka3,                 sentinel 3, zk 3, JobManager (standby),
+#                                                      TaskManager
+#
+# Killing node B kills the leading JobManager. The standby on C takes
+# leadership, recovers the job from the HA store on A, and redeploys onto the
+# TaskManager on C — with no human involved. That is the assertion the whole
+# file exists to support, and `make mh-ha-drill` makes it.
+#
+# ⚠️ SIZING. This machine has 8 GiB of RAM total and Docker holds 7.75 GiB of
+# it, and the whole topology — 3 brokers, 3 ZooKeepers, 2 JobManagers, 2
+# TaskManagers, Redis HA and MinIO — measures 5.4 GiB with the pipeline
+# running. It fits, but only because the topic's retention is capped: an
+# uncapped topic grows the brokers past 1.4 GiB each and starves Flink. See
+# scripts/multihost_ha_health.sh --create-topic and docs/MULTIHOST.md §5.
+
+name: petafs-mh-ha
+
+x-kafka-common: &kafka-common
+  image: apache/kafka:4.3.1
+  restart: unless-stopped
+  environment: &kafka-env
+    KAFKA_PROCESS_ROLES: broker,controller
+    KAFKA_CONTROLLER_QUORUM_VOTERS: >-
+      1@${NODE_A_HOST:-node-a}:${KAFKA_A_CTRL_PORT:-9093},2@${NODE_B_HOST:-node-b}:${KAFKA_B_CTRL_PORT:-9093},3@${NODE_C_HOST:-node-c}:${KAFKA_C_CTRL_PORT:-9093}
+    KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: BROKER:SASL_SSL,HOST:SASL_SSL,CONTROLLER:SSL
+    KAFKA_INTER_BROKER_LISTENER_NAME: BROKER
+    KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+    KAFKA_LISTENER_NAME_CONTROLLER_SSL_CLIENT_AUTH: required
+    KAFKA_SSL_KEYSTORE_PASSWORD: ${TLS_STOREPASS:-petafs-dev-secret}
+    KAFKA_SSL_KEY_PASSWORD: ${TLS_STOREPASS:-petafs-dev-secret}
+    KAFKA_SSL_TRUSTSTORE_LOCATION: /tls/kafka.truststore.jks
+    KAFKA_SSL_TRUSTSTORE_PASSWORD: ${TLS_STOREPASS:-petafs-dev-secret}
+    KAFKA_SSL_ENDPOINT_IDENTIFICATION_ALGORITHM: https
+    KAFKA_SASL_ENABLED_MECHANISMS: PLAIN
+    KAFKA_SASL_MECHANISM_INTER_BROKER_PROTOCOL: PLAIN
+    KAFKA_LISTENER_NAME_BROKER_PLAIN_SASL_JAAS_CONFIG: |
+      org.apache.kafka.common.security.plain.PlainLoginModule required username="${KAFKA_USER:-petafs}" password="${KAFKA_PASSWORD:-petafs-dev-secret}" user_${KAFKA_USER:-petafs}="${KAFKA_PASSWORD:-petafs-dev-secret}";
+    KAFKA_LISTENER_NAME_HOST_PLAIN_SASL_JAAS_CONFIG: |
+      org.apache.kafka.common.security.plain.PlainLoginModule required username="${KAFKA_USER:-petafs}" password="${KAFKA_PASSWORD:-petafs-dev-secret}" user_${KAFKA_USER:-petafs}="${KAFKA_PASSWORD:-petafs-dev-secret}";
+    KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+    KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+    KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+    KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+    KAFKA_MIN_INSYNC_REPLICAS: 2
+    KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    KAFKA_LOG_DIRS: /var/lib/kafka/data
+    KAFKA_NUM_PARTITIONS: 6
+    # Trimmed from the base file's 448m to make room for ZooKeeper and the
+    # second JobManager. Not production sizing; see docs/RUNBOOK.md §2.
+    KAFKA_HEAP_OPTS: -Xmx320m -Xms320m
+    CLUSTER_ID: ${CLUSTER_ID:-petafs-mh-cluster-1}
+  volumes:
+    - ./tls/out:/tls:ro
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+
+x-kafka-healthcheck: &kafka-healthcheck
+  test:
+    - CMD-SHELL
+    - |
+      printf 'security.protocol=SASL_SSL\nsasl.mechanism=PLAIN\nsasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="${KAFKA_USER:-petafs}" password="${KAFKA_PASSWORD:-petafs-dev-secret}";\nssl.truststore.location=/tls/kafka.truststore.jks\nssl.truststore.password=${TLS_STOREPASS:-petafs-dev-secret}\n' > /tmp/hc.properties
+      /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 --command-config /tmp/hc.properties >/dev/null 2>&1
+  interval: 10s
+  timeout: 10s
+  retries: 24
+  start_period: 45s
+
+x-redis-common: &redis-common
+  image: redis/redis-stack-server:7.4.0-v8
+  restart: unless-stopped
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+
+# ZooKeeper is what makes JobManager HA possible: it holds the leader latch and
+# the pointers to the job graph in the HA store. Three of them, one per node —
+# a single ZooKeeper would just move the single point of failure rather than
+# remove it, and a two-node ensemble cannot form a majority after losing one.
+#
+# Flink 2.x needs NO extra jar for this: flink-dist-2.2.1.jar already bundles
+# shaded ZooKeeper 3 and Curator 5. In Flink 1.x they were a separate jar you
+# had to copy into lib/, which is the instruction most tutorials still give.
+x-zk-common: &zk-common
+  image: zookeeper:3.9
+  restart: unless-stopped
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  environment: &zk-env
+    ZOO_TICK_TIME: "2000"
+    ZOO_INIT_LIMIT: "10"
+    ZOO_SYNC_LIMIT: "5"
+    ZOO_STANDALONE_ENABLED: "false"
+    ZOO_4LW_COMMANDS_WHITELIST: "srvr,stat,mntr,ruok,conf"
+    # 96 MiB heap. ZooKeeper's job here is a few kilobytes of leader-election
+    # metadata; the default heap is sized for a real coordination workload and
+    # is pure waste against this memory budget.
+    JVMFLAGS: "-Xmx96m -Xms96m"
+
+services:
+
+  # ======================================================================
+  # NODE A — kafka1, Redis primary, sentinel 1, zk 1, MinIO
+  #
+  # The checkpoint/HA store lives here and the active JobManager does NOT.
+  # That separation is the entire point of the layout: the standby has to be
+  # able to reach the thing it recovers from after the leader's node is gone.
+  # ======================================================================
+
+  kafka1:
+    <<: *kafka-common
+    profiles: ["a"]
+    container_name: petafs-mhha-kafka1
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 1
+      KAFKA_SSL_KEYSTORE_LOCATION: /tls/kafka1.keystore.jks
+      KAFKA_LISTENERS: BROKER://0.0.0.0:9092,HOST://0.0.0.0:9094,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: >-
+        BROKER://${NODE_A_HOST:-node-a}:${KAFKA_A_BROKER_PORT:-9092},HOST://localhost:${KAFKA_A_HOST_PORT:-9094}
+    ports:
+      - "${KAFKA_A_BROKER_PORT:-9092}:9092"
+      - "${KAFKA_A_CTRL_PORT:-9093}:9093"
+      - "${KAFKA_A_HOST_PORT:-9094}:9094"
+    volumes:
+      - kafka1-data:/var/lib/kafka/data
+      - ./tls/out:/tls:ro
+    healthcheck: *kafka-healthcheck
+
+  zookeeper-1:
+    <<: *zk-common
+    profiles: ["a"]
+    container_name: petafs-mhha-zk1
+    environment:
+      <<: *zk-env
+      ZOO_MY_ID: "1"
+      # Its OWN entry binds 0.0.0.0; the peers are dialled at their routable
+      # addresses. Peer ports must be the PUBLISHED ones, since that is what
+      # the other machines actually connect to.
+      ZOO_SERVERS: >-
+        server.1=0.0.0.0:2888:3888;2181
+        server.2=${NODE_B_HOST:-node-b}:${ZK_B_PEER_PORT:-2888}:${ZK_B_ELECT_PORT:-3888};2181
+        server.3=${NODE_C_HOST:-node-c}:${ZK_C_PEER_PORT:-2888}:${ZK_C_ELECT_PORT:-3888};2181
+    ports:
+      - "${ZK_A_CLIENT_PORT:-2181}:2181"
+      - "${ZK_A_PEER_PORT:-2888}:2888"
+      - "${ZK_A_ELECT_PORT:-3888}:3888"
+    volumes:
+      - zk1-data:/data
+      - zk1-datalog:/datalog
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep -q imok"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  redis-primary:
+    <<: *redis-common
+    profiles: ["a"]
+    container_name: petafs-mhha-redis-primary
+    entrypoint:
+      - sh
+      - -c
+      - |
+        CONF=/data/redis.conf
+        if [ ! -f "$$CONF" ]; then
+          cat > "$$CONF" <<EOF
+        requirepass ${REDIS_PASSWORD:-petafs-dev-secret}
+        masterauth ${REDIS_PASSWORD:-petafs-dev-secret}
+        appendonly yes
+        dir /data
+        port 0
+        tls-port 6379
+        tls-cert-file /tls/redis-node.crt
+        tls-key-file /tls/redis-node.key
+        tls-ca-cert-file /tls/ca.crt
+        tls-replication yes
+        tls-auth-clients no
+        replica-announce-ip ${NODE_A_HOST:-node-a}
+        replica-announce-port ${REDIS_A_PORT:-6379}
+        EOF
+        fi
+        exec redis-server "$$CONF"
+    ports: ["${REDIS_A_PORT:-6379}:6379"]
+    volumes:
+      - redis-primary-data:/data
+      - ./tls/out:/tls:ro
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --tls --cacert /tls/ca.crt -a ${REDIS_PASSWORD:-petafs-dev-secret} ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+  redis-sentinel-1:
+    <<: *redis-common
+    profiles: ["a"]
+    container_name: petafs-mhha-redis-sentinel-1
+    entrypoint:
+      - sh
+      - -c
+      - |
+        CONF=/data/sentinel.conf
+        if [ ! -f "$$CONF" ]; then
+          cat > "$$CONF" <<EOF
+        port 0
+        tls-port 26379
+        tls-cert-file /tls/redis-node.crt
+        tls-key-file /tls/redis-node.key
+        tls-ca-cert-file /tls/ca.crt
+        tls-replication yes
+        tls-auth-clients no
+        requirepass ${REDIS_PASSWORD:-petafs-dev-secret}
+        sentinel announce-ip ${NODE_A_HOST:-node-a}
+        sentinel announce-port ${SENTINEL_A_PORT:-26379}
+        sentinel resolve-hostnames yes
+        sentinel announce-hostnames yes
+        sentinel monitor mymaster ${NODE_A_HOST:-node-a} ${REDIS_A_PORT:-6379} 2
+        sentinel auth-pass mymaster ${REDIS_PASSWORD:-petafs-dev-secret}
+        sentinel down-after-milliseconds mymaster 5000
+        sentinel failover-timeout mymaster 10000
+        dir /data
+        EOF
+        fi
+        exec redis-sentinel "$$CONF"
+    ports: ["${SENTINEL_A_PORT:-26379}:26379"]
+    volumes:
+      - redis-sentinel-1-data:/data
+      - ./tls/out:/tls:ro
+    depends_on:
+      redis-primary:
+        condition: service_healthy
+
+  minio:
+    profiles: ["a"]
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    container_name: petafs-mhha-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_USER:-petafs}
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD:-petafs-dev-secret}
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local || curl -fs http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  minio-init:
+    profiles: ["a"]
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    container_name: petafs-mhha-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "mc alias set petafs http://minio:9000 ${MINIO_USER:-petafs} ${MINIO_PASSWORD:-petafs-dev-secret}
+      && mc mb --ignore-existing petafs/flink-checkpoints
+      && mc mb --ignore-existing petafs/flink-savepoints
+      && mc mb --ignore-existing petafs/flink-ha
+      && echo 'buckets ready'"
+
+  # ======================================================================
+  # NODE B — kafka2, Redis replica, sentinel 2, zk 2, JobManager (active)
+  # ======================================================================
+
+  kafka2:
+    <<: *kafka-common
+    profiles: ["b"]
+    container_name: petafs-mhha-kafka2
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 2
+      KAFKA_SSL_KEYSTORE_LOCATION: /tls/kafka2.keystore.jks
+      KAFKA_LISTENERS: BROKER://0.0.0.0:9092,HOST://0.0.0.0:9094,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: >-
+        BROKER://${NODE_B_HOST:-node-b}:${KAFKA_B_BROKER_PORT:-9092},HOST://localhost:${KAFKA_B_HOST_PORT:-9094}
+    ports:
+      - "${KAFKA_B_BROKER_PORT:-9092}:9092"
+      - "${KAFKA_B_CTRL_PORT:-9093}:9093"
+      - "${KAFKA_B_HOST_PORT:-9094}:9094"
+    volumes:
+      - kafka2-data:/var/lib/kafka/data
+      - ./tls/out:/tls:ro
+    healthcheck: *kafka-healthcheck
+
+  zookeeper-2:
+    <<: *zk-common
+    profiles: ["b"]
+    container_name: petafs-mhha-zk2
+    environment:
+      <<: *zk-env
+      ZOO_MY_ID: "2"
+      ZOO_SERVERS: >-
+        server.1=${NODE_A_HOST:-node-a}:${ZK_A_PEER_PORT:-2888}:${ZK_A_ELECT_PORT:-3888};2181
+        server.2=0.0.0.0:2888:3888;2181
+        server.3=${NODE_C_HOST:-node-c}:${ZK_C_PEER_PORT:-2888}:${ZK_C_ELECT_PORT:-3888};2181
+    ports:
+      - "${ZK_B_CLIENT_PORT:-2181}:2181"
+      - "${ZK_B_PEER_PORT:-2888}:2888"
+      - "${ZK_B_ELECT_PORT:-3888}:3888"
+    volumes:
+      - zk2-data:/data
+      - zk2-datalog:/datalog
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep -q imok"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  redis-replica:
+    <<: *redis-common
+    profiles: ["b"]
+    container_name: petafs-mhha-redis-replica
+    entrypoint:
+      - sh
+      - -c
+      - |
+        CONF=/data/redis.conf
+        if [ ! -f "$$CONF" ]; then
+          cat > "$$CONF" <<EOF
+        requirepass ${REDIS_PASSWORD:-petafs-dev-secret}
+        masterauth ${REDIS_PASSWORD:-petafs-dev-secret}
+        appendonly yes
+        dir /data
+        port 0
+        tls-port 6379
+        tls-cert-file /tls/redis-node.crt
+        tls-key-file /tls/redis-node.key
+        tls-ca-cert-file /tls/ca.crt
+        tls-replication yes
+        tls-auth-clients no
+        replica-announce-ip ${NODE_B_HOST:-node-b}
+        replica-announce-port ${REDIS_B_PORT:-6379}
+        replicaof ${NODE_A_HOST:-node-a} ${REDIS_A_PORT:-6379}
+        EOF
+        fi
+        exec redis-server "$$CONF"
+    ports: ["${REDIS_B_PORT:-6379}:6379"]
+    volumes:
+      - redis-replica-data:/data
+      - ./tls/out:/tls:ro
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --tls --cacert /tls/ca.crt -a ${REDIS_PASSWORD:-petafs-dev-secret} ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+  redis-sentinel-2:
+    <<: *redis-common
+    profiles: ["b"]
+    container_name: petafs-mhha-redis-sentinel-2
+    entrypoint:
+      - sh
+      - -c
+      - |
+        CONF=/data/sentinel.conf
+        if [ ! -f "$$CONF" ]; then
+          cat > "$$CONF" <<EOF
+        port 0
+        tls-port 26379
+        tls-cert-file /tls/redis-node.crt
+        tls-key-file /tls/redis-node.key
+        tls-ca-cert-file /tls/ca.crt
+        tls-replication yes
+        tls-auth-clients no
+        requirepass ${REDIS_PASSWORD:-petafs-dev-secret}
+        sentinel announce-ip ${NODE_B_HOST:-node-b}
+        sentinel announce-port ${SENTINEL_B_PORT:-26379}
+        sentinel resolve-hostnames yes
+        sentinel announce-hostnames yes
+        sentinel monitor mymaster ${NODE_A_HOST:-node-a} ${REDIS_A_PORT:-6379} 2
+        sentinel auth-pass mymaster ${REDIS_PASSWORD:-petafs-dev-secret}
+        sentinel down-after-milliseconds mymaster 5000
+        sentinel failover-timeout mymaster 10000
+        dir /data
+        EOF
+        fi
+        exec redis-sentinel "$$CONF"
+    ports: ["${SENTINEL_B_PORT:-26379}:26379"]
+    volumes:
+      - redis-sentinel-2-data:/data
+      - ./tls/out:/tls:ro
+
+  jobmanager:
+    profiles: ["b"]
+    image: petafs/flink:2.2.1
+    container_name: petafs-mhha-jobmanager
+    restart: unless-stopped
+    command: jobmanager
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      # Published 1:1 using the SAME variable on both sides. With two
+      # JobManagers on one machine in the simulation their ports must differ,
+      # and blob.server.port has no bind-port counterpart — it advertises
+      # whatever it binds. So the two JMs bind DIFFERENT ports rather than
+      # binding the same one and remapping, which would leave the standby
+      # advertising a port nothing can reach. On real hosts both use the
+      # defaults and this collapses to 8081/6123/6124 on each machine.
+      - "${JM_B_REST_PORT:-8081}:${JM_B_REST_PORT:-8081}"
+      - "${JM_B_RPC_PORT:-6123}:${JM_B_RPC_PORT:-6123}"
+      - "${JM_B_BLOB_PORT:-6124}:${JM_B_BLOB_PORT:-6124}"
+      - "${JM_B_METRICS_PORT:-9250}:9250"
+    environment: &jm-env
+      PYTHONPATH: /opt/project
+      AWS_ACCESS_KEY_ID: ${MINIO_USER:-petafs}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_PASSWORD:-petafs-dev-secret}
+      REDIS_SENTINELS: >-
+        ${NODE_A_HOST:-node-a}:${SENTINEL_A_PORT:-26379},${NODE_B_HOST:-node-b}:${SENTINEL_B_PORT:-26379},${NODE_C_HOST:-node-c}:${SENTINEL_C_PORT:-26379}
+      REDIS_SENTINEL_MASTER: mymaster
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-petafs-dev-secret}
+      REDIS_TLS_CA: /tls/ca.crt
+      KAFKA_SECURITY_PROTOCOL: SASL_SSL
+      KAFKA_SSL_TRUSTSTORE: /tls/kafka.truststore.jks
+      TLS_STOREPASS: ${TLS_STOREPASS:-petafs-dev-secret}
+      KAFKA_SASL_MECHANISM: PLAIN
+      KAFKA_USER: ${KAFKA_USER:-petafs}
+      KAFKA_PASSWORD: ${KAFKA_PASSWORD:-petafs-dev-secret}
+      # NOTE: no `#` comments inside FLINK_PROPERTIES. The Flink entrypoint
+      # appends each line to the config and strips whitespace, so a comment
+      # becomes a junk key ("#Bindwideandadvertise..."). Harmless when the text
+      # has no colon and a silent config injection when it does.
+      #
+      # high-availability.type: zookeeper makes TaskManagers stop using
+      # jobmanager.rpc.address and look the CURRENT LEADER up in ZooKeeper
+      # instead. That indirection is the whole mechanism — it is what lets the
+      # JobManager's address change without reconfiguring anything.
+      #
+      # high-availability.jobmanager.port is the one that bites: in HA mode
+      # `jobmanager.rpc.port` is IGNORED, and this one defaults to 0, i.e. a
+      # random port. The JobManager then publishes an ephemeral port into
+      # ZooKeeper, the TaskManager reads it and tries to dial a port Docker
+      # never published, and you get "Could not resolve ResourceManager
+      # address ...:42335" forever. On one host it works by accident because
+      # there is no port mapping in the way.
+      FLINK_PROPERTIES: |
+        high-availability.type: zookeeper
+        high-availability.zookeeper.quorum: ${NODE_A_HOST:-node-a}:${ZK_A_CLIENT_PORT:-2181},${NODE_B_HOST:-node-b}:${ZK_B_CLIENT_PORT:-2181},${NODE_C_HOST:-node-c}:${ZK_C_CLIENT_PORT:-2181}
+        high-availability.zookeeper.path.root: /flink
+        high-availability.cluster-id: /petafs-mh-ha
+        high-availability.storageDir: s3://flink-ha/petafs
+        high-availability.jobmanager.port: ${JM_B_RPC_PORT:-6123}
+        jobmanager.rpc.address: ${NODE_B_HOST:-node-b}
+        jobmanager.rpc.port: ${JM_B_RPC_PORT:-6123}
+        jobmanager.bind-host: 0.0.0.0
+        rest.address: ${NODE_B_HOST:-node-b}
+        rest.bind-address: 0.0.0.0
+        rest.port: ${JM_B_REST_PORT:-8081}
+        blob.server.port: ${JM_B_BLOB_PORT:-6124}
+        jobmanager.memory.process.size: 700m
+        parallelism.default: 1
+        state.backend.type: rocksdb
+        state.backend.incremental: true
+        execution.checkpointing.dir: s3://flink-checkpoints/petafs
+        execution.checkpointing.savepoint-dir: s3://flink-savepoints/petafs
+        execution.checkpointing.interval: 30s
+        execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+        execution.checkpointing.num-retained: 5
+        execution.checkpointing.unaligned.enabled: true
+        restart-strategy.type: exponential-delay
+        restart-strategy.exponential-delay.initial-backoff: 5s
+        restart-strategy.exponential-delay.max-backoff: 30s
+        metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prom.port: 9250
+        s3.endpoint: http://${NODE_A_HOST:-node-a}:${MINIO_PORT:-9000}
+        s3.path.style.access: true
+    volumes:
+      - ../src:/opt/project/src:ro
+      - ../contracts:/opt/project/contracts:ro
+      - ./tls/out:/tls:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:${JM_B_REST_PORT:-8081}/overview >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 24
+      start_period: 40s
+
+  taskmanager-b:
+    # A TaskManager per compute node, so the HA drill works whichever node is
+    # leading. Without this, the single TaskManager lives on node C and killing
+    # node C leaves the new leader with no slot to schedule on — the failover
+    # would "fail" for a reason that has nothing to do with HA.
+    #
+    # This nearly got dropped on a false measurement, worth recording: with the
+    # topic left at the default 2 GiB retention, the three brokers grew from
+    # ~390 MiB to ~1.4 GiB EACH (a broker's resident size is dominated by
+    # mmap'd log segments, not by KAFKA_HEAP_OPTS), the box hit 7.5 of 7.75
+    # GiB, and this TaskManager died with "Could not create actor system /
+    # Futures timed out after [10000 milliseconds]". The obvious conclusion —
+    # "an 8 GiB laptop cannot run two TaskManagers alongside HA" — was wrong.
+    # With retention capped (see scripts/multihost_ha_health.sh --create-topic)
+    # it registers in 30 s and the whole topology sits at 5.4 GiB.
+    profiles: ["b"]
+    image: petafs/flink:2.2.1
+    container_name: petafs-mhha-taskmanager-b
+    restart: unless-stopped
+    command: taskmanager
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${TM_B_RPC_PORT:-6122}:6122"
+      - "${TM_B_DATA_PORT:-6121}:6121"
+      - "${TM_B_METRICS_PORT:-9251}:9250"
+    environment:
+      PYTHONPATH: /opt/project
+      AWS_ACCESS_KEY_ID: ${MINIO_USER:-petafs}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_PASSWORD:-petafs-dev-secret}
+      REDIS_SENTINELS: >-
+        ${NODE_A_HOST:-node-a}:${SENTINEL_A_PORT:-26379},${NODE_B_HOST:-node-b}:${SENTINEL_B_PORT:-26379},${NODE_C_HOST:-node-c}:${SENTINEL_C_PORT:-26379}
+      REDIS_SENTINEL_MASTER: mymaster
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-petafs-dev-secret}
+      REDIS_TLS_CA: /tls/ca.crt
+      KAFKA_SECURITY_PROTOCOL: SASL_SSL
+      KAFKA_SSL_TRUSTSTORE: /tls/kafka.truststore.jks
+      TLS_STOREPASS: ${TLS_STOREPASS:-petafs-dev-secret}
+      KAFKA_SASL_MECHANISM: PLAIN
+      KAFKA_USER: ${KAFKA_USER:-petafs}
+      KAFKA_PASSWORD: ${KAFKA_PASSWORD:-petafs-dev-secret}
+      FLINK_PROPERTIES: |
+        high-availability.type: zookeeper
+        high-availability.zookeeper.quorum: ${NODE_A_HOST:-node-a}:${ZK_A_CLIENT_PORT:-2181},${NODE_B_HOST:-node-b}:${ZK_B_CLIENT_PORT:-2181},${NODE_C_HOST:-node-c}:${ZK_C_CLIENT_PORT:-2181}
+        high-availability.zookeeper.path.root: /flink
+        high-availability.cluster-id: /petafs-mh-ha
+        high-availability.storageDir: s3://flink-ha/petafs
+        taskmanager.host: ${NODE_B_HOST:-node-b}
+        taskmanager.bind-host: 0.0.0.0
+        taskmanager.rpc.port: ${TM_B_RPC_PORT:-6122}
+        taskmanager.rpc.bind-port: 6122
+        taskmanager.data.port: ${TM_B_DATA_PORT:-6121}
+        taskmanager.data.bind-port: 6121
+        taskmanager.memory.process.size: 1400m
+        taskmanager.numberOfTaskSlots: 1
+        state.backend.type: rocksdb
+        state.backend.incremental: true
+        execution.checkpointing.dir: s3://flink-checkpoints/petafs
+        execution.checkpointing.savepoint-dir: s3://flink-savepoints/petafs
+        metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prom.port: 9250
+        s3.endpoint: http://${NODE_A_HOST:-node-a}:${MINIO_PORT:-9000}
+        s3.path.style.access: true
+    volumes:
+      - ../src:/opt/project/src:ro
+      - ../contracts:/opt/project/contracts:ro
+      - ./tls/out:/tls:ro
+
+  # ======================================================================
+  # NODE C — kafka3, sentinel 3, zk 3, JobManager (standby), TaskManager
+  # ======================================================================
+
+  kafka3:
+    <<: *kafka-common
+    profiles: ["c"]
+    container_name: petafs-mhha-kafka3
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 3
+      KAFKA_SSL_KEYSTORE_LOCATION: /tls/kafka3.keystore.jks
+      KAFKA_LISTENERS: BROKER://0.0.0.0:9092,HOST://0.0.0.0:9094,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: >-
+        BROKER://${NODE_C_HOST:-node-c}:${KAFKA_C_BROKER_PORT:-9092},HOST://localhost:${KAFKA_C_HOST_PORT:-9094}
+    ports:
+      - "${KAFKA_C_BROKER_PORT:-9092}:9092"
+      - "${KAFKA_C_CTRL_PORT:-9093}:9093"
+      - "${KAFKA_C_HOST_PORT:-9094}:9094"
+    volumes:
+      - kafka3-data:/var/lib/kafka/data
+      - ./tls/out:/tls:ro
+    healthcheck: *kafka-healthcheck
+
+  zookeeper-3:
+    <<: *zk-common
+    profiles: ["c"]
+    container_name: petafs-mhha-zk3
+    environment:
+      <<: *zk-env
+      ZOO_MY_ID: "3"
+      ZOO_SERVERS: >-
+        server.1=${NODE_A_HOST:-node-a}:${ZK_A_PEER_PORT:-2888}:${ZK_A_ELECT_PORT:-3888};2181
+        server.2=${NODE_B_HOST:-node-b}:${ZK_B_PEER_PORT:-2888}:${ZK_B_ELECT_PORT:-3888};2181
+        server.3=0.0.0.0:2888:3888;2181
+    ports:
+      - "${ZK_C_CLIENT_PORT:-2181}:2181"
+      - "${ZK_C_PEER_PORT:-2888}:2888"
+      - "${ZK_C_ELECT_PORT:-3888}:3888"
+    volumes:
+      - zk3-data:/data
+      - zk3-datalog:/datalog
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep -q imok"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  redis-sentinel-3:
+    <<: *redis-common
+    profiles: ["c"]
+    container_name: petafs-mhha-redis-sentinel-3
+    entrypoint:
+      - sh
+      - -c
+      - |
+        CONF=/data/sentinel.conf
+        if [ ! -f "$$CONF" ]; then
+          cat > "$$CONF" <<EOF
+        port 0
+        tls-port 26379
+        tls-cert-file /tls/redis-node.crt
+        tls-key-file /tls/redis-node.key
+        tls-ca-cert-file /tls/ca.crt
+        tls-replication yes
+        tls-auth-clients no
+        requirepass ${REDIS_PASSWORD:-petafs-dev-secret}
+        sentinel announce-ip ${NODE_C_HOST:-node-c}
+        sentinel announce-port ${SENTINEL_C_PORT:-26379}
+        sentinel resolve-hostnames yes
+        sentinel announce-hostnames yes
+        sentinel monitor mymaster ${NODE_A_HOST:-node-a} ${REDIS_A_PORT:-6379} 2
+        sentinel auth-pass mymaster ${REDIS_PASSWORD:-petafs-dev-secret}
+        sentinel down-after-milliseconds mymaster 5000
+        sentinel failover-timeout mymaster 10000
+        dir /data
+        EOF
+        fi
+        exec redis-sentinel "$$CONF"
+    ports: ["${SENTINEL_C_PORT:-26379}:26379"]
+    volumes:
+      - redis-sentinel-3-data:/data
+      - ./tls/out:/tls:ro
+
+  jobmanager-standby:
+    # Identical configuration to the active JobManager apart from its own
+    # address and ports. That is not laziness — in HA there is no "standby"
+    # role in the config at all. Both processes contend for the same ZooKeeper
+    # leader latch and whichever wins is the leader; the other watches. A
+    # config that differed would mean the survivor ran a different cluster.
+    profiles: ["c"]
+    image: petafs/flink:2.2.1
+    container_name: petafs-mhha-jobmanager-standby
+    restart: unless-stopped
+    command: jobmanager
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${JM_C_REST_PORT:-8081}:${JM_C_REST_PORT:-8081}"
+      - "${JM_C_RPC_PORT:-6123}:${JM_C_RPC_PORT:-6123}"
+      - "${JM_C_BLOB_PORT:-6124}:${JM_C_BLOB_PORT:-6124}"
+      - "${JM_C_METRICS_PORT:-9250}:9250"
+    environment:
+      <<: *jm-env
+      FLINK_PROPERTIES: |
+        high-availability.type: zookeeper
+        high-availability.zookeeper.quorum: ${NODE_A_HOST:-node-a}:${ZK_A_CLIENT_PORT:-2181},${NODE_B_HOST:-node-b}:${ZK_B_CLIENT_PORT:-2181},${NODE_C_HOST:-node-c}:${ZK_C_CLIENT_PORT:-2181}
+        high-availability.zookeeper.path.root: /flink
+        high-availability.cluster-id: /petafs-mh-ha
+        high-availability.storageDir: s3://flink-ha/petafs
+        high-availability.jobmanager.port: ${JM_C_RPC_PORT:-6123}
+        jobmanager.rpc.address: ${NODE_C_HOST:-node-c}
+        jobmanager.rpc.port: ${JM_C_RPC_PORT:-6123}
+        jobmanager.bind-host: 0.0.0.0
+        rest.address: ${NODE_C_HOST:-node-c}
+        rest.bind-address: 0.0.0.0
+        rest.port: ${JM_C_REST_PORT:-8081}
+        blob.server.port: ${JM_C_BLOB_PORT:-6124}
+        jobmanager.memory.process.size: 700m
+        parallelism.default: 1
+        state.backend.type: rocksdb
+        state.backend.incremental: true
+        execution.checkpointing.dir: s3://flink-checkpoints/petafs
+        execution.checkpointing.savepoint-dir: s3://flink-savepoints/petafs
+        execution.checkpointing.interval: 30s
+        execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+        execution.checkpointing.num-retained: 5
+        execution.checkpointing.unaligned.enabled: true
+        restart-strategy.type: exponential-delay
+        restart-strategy.exponential-delay.initial-backoff: 5s
+        restart-strategy.exponential-delay.max-backoff: 30s
+        metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prom.port: 9250
+        s3.endpoint: http://${NODE_A_HOST:-node-a}:${MINIO_PORT:-9000}
+        s3.path.style.access: true
+    volumes:
+      - ../src:/opt/project/src:ro
+      - ../contracts:/opt/project/contracts:ro
+      - ./tls/out:/tls:ro
+
+  taskmanager-c:
+    profiles: ["c"]
+    image: petafs/flink:2.2.1
+    container_name: petafs-mhha-taskmanager-c
+    restart: unless-stopped
+    command: taskmanager
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${TM_C_RPC_PORT:-6122}:6122"
+      - "${TM_C_DATA_PORT:-6121}:6121"
+      - "${TM_C_METRICS_PORT:-9251}:9250"
+    environment:
+      PYTHONPATH: /opt/project
+      AWS_ACCESS_KEY_ID: ${MINIO_USER:-petafs}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_PASSWORD:-petafs-dev-secret}
+      REDIS_SENTINELS: >-
+        ${NODE_A_HOST:-node-a}:${SENTINEL_A_PORT:-26379},${NODE_B_HOST:-node-b}:${SENTINEL_B_PORT:-26379},${NODE_C_HOST:-node-c}:${SENTINEL_C_PORT:-26379}
+      REDIS_SENTINEL_MASTER: mymaster
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-petafs-dev-secret}
+      REDIS_TLS_CA: /tls/ca.crt
+      KAFKA_SECURITY_PROTOCOL: SASL_SSL
+      KAFKA_SSL_TRUSTSTORE: /tls/kafka.truststore.jks
+      TLS_STOREPASS: ${TLS_STOREPASS:-petafs-dev-secret}
+      KAFKA_SASL_MECHANISM: PLAIN
+      KAFKA_USER: ${KAFKA_USER:-petafs}
+      KAFKA_PASSWORD: ${KAFKA_PASSWORD:-petafs-dev-secret}
+      # No jobmanager.rpc.address here, deliberately: in HA mode the
+      # TaskManager resolves the leader through ZooKeeper, so a hardcoded
+      # address would be both unused and misleading about how failover works.
+      FLINK_PROPERTIES: |
+        high-availability.type: zookeeper
+        high-availability.zookeeper.quorum: ${NODE_A_HOST:-node-a}:${ZK_A_CLIENT_PORT:-2181},${NODE_B_HOST:-node-b}:${ZK_B_CLIENT_PORT:-2181},${NODE_C_HOST:-node-c}:${ZK_C_CLIENT_PORT:-2181}
+        high-availability.zookeeper.path.root: /flink
+        high-availability.cluster-id: /petafs-mh-ha
+        high-availability.storageDir: s3://flink-ha/petafs
+        taskmanager.host: ${NODE_C_HOST:-node-c}
+        taskmanager.bind-host: 0.0.0.0
+        taskmanager.rpc.port: ${TM_C_RPC_PORT:-6122}
+        taskmanager.rpc.bind-port: 6122
+        taskmanager.data.port: ${TM_C_DATA_PORT:-6121}
+        taskmanager.data.bind-port: 6121
+        taskmanager.memory.process.size: 1400m
+        taskmanager.numberOfTaskSlots: 1
+        state.backend.type: rocksdb
+        state.backend.incremental: true
+        execution.checkpointing.dir: s3://flink-checkpoints/petafs
+        execution.checkpointing.savepoint-dir: s3://flink-savepoints/petafs
+        metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prom.port: 9250
+        s3.endpoint: http://${NODE_A_HOST:-node-a}:${MINIO_PORT:-9000}
+        s3.path.style.access: true
+    volumes:
+      - ../src:/opt/project/src:ro
+      - ../contracts:/opt/project/contracts:ro
+      - ./tls/out:/tls:ro
+
+volumes:
+  kafka1-data:
+  kafka2-data:
+  kafka3-data:
+  zk1-data:
+  zk1-datalog:
+  zk2-data:
+  zk2-datalog:
+  zk3-data:
+  zk3-datalog:
+  redis-primary-data:
+  redis-replica-data:
+  redis-sentinel-1-data:
+  redis-sentinel-2-data:
+  redis-sentinel-3-data:
+  minio-data:

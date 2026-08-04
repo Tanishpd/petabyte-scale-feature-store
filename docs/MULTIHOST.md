@@ -7,7 +7,9 @@ and not a *host* failure.
 
 This closes it. `docker-compose.multihost.yml` spreads the same services across
 three independent nodes, and `make mh-drill` kills an entire node to prove what
-survives.
+survives. `docker-compose.multihost-ha.yml` (§5) goes further: a ZooKeeper
+ensemble and a second JobManager, so that losing the node running the pipeline
+does not stop the pipeline.
 
 ```bash
 make mh-tls        # CA + certs, with the routable node names in the SANs
@@ -30,7 +32,9 @@ make mh-down       # stop (volumes kept)   /  make mh-clean drops them
 | **C** | kafka3, sentinel 3, TaskManager | No Redis data node. Two data nodes plus three sentinels is the standard shape: the third vote has to live somewhere that is not either data node, or losing a data node also loses the quorum that was meant to react to it |
 
 Losing **B or C** is fully survivable and is what drill 2 proves. Losing **A**
-costs the running job — see §5.
+keeps all the data but stops the running job, because this file has a single
+JobManager. §5 removes that with a ZooKeeper ensemble and a standby; §6 is what
+is left after it.
 
 ## 2. What actually changes without Compose DNS
 
@@ -157,31 +161,94 @@ entities queried: 25  with features: 25
   user 2: count=2825 avg=69.22  emb_dim=384 behavior='airline, bookstore, coffee_shop, electronics'
 ```
 
-## 5. What still fails
+## 5. JobManager HA — `docker-compose.multihost-ha.yml`
 
-**Node A is a single point of failure for the *job*, not for the data.** It
-carries the JobManager and MinIO. Kill it and Redis fails over, Kafka keeps
-serving, the data is all intact — but the pipeline stops and does not restart
-itself. Drill 3 asserts the resubmission explicitly, so this is a documented
-procedure rather than a surprise.
+In the topology above, node A carries the single JobManager: kill it and the
+data all survives but the *pipeline* stops until someone resubmits. The HA file
+closes that. It is a superset — same routable addressing, same mTLS quorum,
+same Sentinel setup — plus a **ZooKeeper ensemble** and a **second
+JobManager**, with the layout rearranged so nothing critical shares a node with
+its own failover target:
 
-Two things would close it, and both are deliberately *not* faked here:
+```
+node A   kafka1, redis primary, sentinel 1, zk 1, MinIO
+node B   kafka2, redis replica,  sentinel 2, zk 2, JobManager, TaskManager
+node C   kafka3,                 sentinel 3, zk 3, JobManager, TaskManager
+```
 
-- **JobManager HA** needs a ZooKeeper ensemble plus a standby JobManager.
-  Flink 2.2.1 supports it — the shaded ZooKeeper 3 and Curator 5 are bundled
-  inside `flink-dist-2.2.1.jar`, so no extra jar is needed, unlike 1.x. It is
-  not enabled because the ensemble plus a standby needs roughly 1.5 GiB more
-  than this 7.75 GiB Docker VM has, and shipping a configuration that has never
-  been run is worse than a named gap.
-- **The object store must not be one node.** MinIO here is single-node. In a
-  real deployment this is S3/GCS and the problem disappears; that is a
-  credentials change, not a code one, and is already how `s3.endpoint` is wired.
+```bash
+make mh-ha-up && make mh-ha-topics && make mh-ha-produce && make mh-ha-submit
+make mh-ha-drill      # kills the node holding the LEADING JobManager
+```
+
+Flink 2.2.1 needs **no extra jar** for this: shaded ZooKeeper 3 and Curator 5
+are already inside `flink-dist-2.2.1.jar`. In 1.x they were a separate jar you
+copied into `lib/`, which is what most tutorials still tell you to do.
+
+### Measured — `make mh-ha-drill`, 14/14
+
+| Assertion | Result |
+|---|---|
+| ZooKeeper ensemble spans three nodes | 1 leader, 2 followers |
+| Both JobManagers live, exactly one leader | per ZooKeeper, not per REST |
+| Job graph reached the HA store | `submittedExecutionPlan` + blob in `s3://flink-ha` |
+| **Leadership moves after the leader's node dies** | automatic, no operator |
+| **Pipeline recovers with no resubmission** | same job id throughout |
+| State recovered, not restarted | `s3://flink-checkpoints/petafs/<job>/chk-32` |
+| Features flowing after failover | max TTL 1770 s of 1800 |
+| Leadership does not bounce back on restore | restored JM rejoins as contender |
+
+Run in both directions — once killing node B while node C led, once killing
+node C while node B led. The victim is whichever node ZooKeeper says is
+leading, never a fixed one.
+
+### Ask ZooKeeper who leads. Not the REST API.
+
+The obvious leader check — "the JobManager whose REST answers 200" — is wrong.
+In steady state **both** JobManagers answer 200 and return identical job lists
+and TaskManager counts, because a non-leading JobManager proxies to the leader.
+A 503 appears only in the brief window before its REST leader-contender starts,
+which is exactly long enough for a check written during startup to look
+correct and then silently stop discriminating forever after. The leader address
+lives in ZooKeeper at
+`/flink/<cluster-id>/leader/rest_server/connection_info`, and that is the only
+authority.
+
+### `high-availability.jobmanager.port`, or nothing registers
+
+In HA mode `jobmanager.rpc.port` is **ignored**. The port actually used comes
+from `high-availability.jobmanager.port`, which defaults to `0` — a random one.
+The JobManager then publishes an ephemeral port into ZooKeeper, the TaskManager
+reads it and dials a port Docker never published, and you get
+
+```
+Could not resolve ResourceManager address pekko.tcp://flink@host:42335/... retrying
+```
+
+forever. On a single host it works by accident, because there is no port
+mapping in the way. Set it explicitly, to a port you publish.
+
+## 6. What still fails
+
+**The object store is one node, and that is the honest remaining gap.** MinIO
+runs on node A and `s3.endpoint` names it. Lose node A and the data is fine —
+Redis fails over, Kafka keeps serving, both JobManagers are alive — but there is
+nowhere to checkpoint to.
+
+Distributed MinIO across the three nodes would fix the *durability* half and
+not the other half: Flink takes a single `s3.endpoint`, so the endpoint itself
+still has to be highly available, which means a load balancer or DNS failover
+in front of it. That is precisely what a managed object store is — S3 and GCS
+give you a regional endpoint with the availability already solved. Swapping
+MinIO for either is a credentials-and-URL change, not a code one; it is already
+how `s3.endpoint` is wired. Standing up an LB tier on a laptop to simulate
+something whose real answer is "use the managed service" would be theatre.
 
 Also still open, unchanged by this work: secrets are Compose environment
 variables with dev defaults, and the Feast private-API dependency
 ([ADR-003](DECISIONS.md)).
 
-## 6. Going to three real machines
+## 7. Going to three real machines
 
 1. Put the certs where they are needed and regenerate with the real names:
    `NODE_SANS=host-a.internal,host-b.internal,host-c.internal make mh-tls`.
@@ -202,7 +269,7 @@ its config file and Sentinel rewrites it on promotion, so an IP-based
 trap is in [RUNBOOK §4](RUNBOOK.md). Everything here announces a hostname for
 that reason.
 
-## 7. Traps found building this
+## 8. Traps found building this
 
 **The Kafka CLI answers an unauthenticated call with silence.** These drills
 delete and recreate whole nodes, so a credentials file written into a
@@ -236,3 +303,27 @@ gets OOM-killed part-way through — silently, so it looks like a hang. Run it
 from the host venv against the published Redis port instead; the certs carry
 `DNS:localhost` for exactly this. That is a property of a 7.75 GiB Docker VM
 running a whole three-node cluster, not of the topology.
+
+**A Kafka broker's resident size is dominated by mmap'd log segments, not by
+`KAFKA_HEAP_OPTS`.** With the heap pinned at 320m and the topic left at the
+default 2 GiB retention, the three brokers grew from ~390 MiB each to ~1.4 GiB
+each under a sustained producer. The box went to 7.5 of 7.75 GiB, and Flink
+started failing in ways that name nothing to do with memory:
+
+```
+Could not create actor system
+TimeoutException: Futures timed out after [10000 milliseconds]
+NoClassDefFoundError: org/apache/pekko/actor/dungeon/FaultHandling$...
+```
+
+I concluded from this that an 8 GiB laptop could not run two TaskManagers
+alongside HA, and that was **wrong** — it was the topic, not the topology. With
+retention capped the same TaskManager registers in 30 s and everything fits in
+5.4 GiB. If Flink starts throwing class-loading errors, look at the brokers
+before you believe an arithmetic argument about what fits.
+
+**`docker compose down -v` can leave the volumes behind** — if any container was
+mid-restart when it ran, it removes the containers, reports success, and skips
+the volumes. The stale Kafka logs then survive into the next run and the topic
+config you just set appears to have been ignored (`--if-not-exists` quietly
+keeps the old topic). `make mh-ha-clean` now sweeps by name and verifies.

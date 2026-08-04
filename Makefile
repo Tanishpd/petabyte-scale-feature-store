@@ -33,7 +33,9 @@ endif
         produce submit apply seed registry read bench test smoke clean nuke \
         verify-seed verify-windows bench-embed similar \
         prod-up prod-down prod-clean prod-ps prod-submit prod-drill prod-tls \
-        mh-up mh-down mh-clean mh-ps mh-health mh-tls mh-topics mh-produce mh-submit mh-drill
+        mh-up mh-down mh-clean mh-ps mh-health mh-tls mh-topics mh-produce mh-submit mh-drill \
+        mh-ha-up mh-ha-down mh-ha-clean mh-ha-ps mh-ha-health mh-ha-topics mh-ha-produce \
+        mh-ha-submit mh-ha-drill
 
 help:  ## Show this help
 	@echo "Petabyte-Scale Feature Store — available targets:"
@@ -285,3 +287,73 @@ mh-submit:  ## Submit the pipeline against the multi-host topology
 
 mh-drill:  ## Kill an entire node and assert what survived
 	bash scripts/multihost_drill.sh
+
+# ------------------------------------------- multi-host + JobManager HA ---
+# Adds a ZooKeeper ensemble and a standby JobManager. Separate project names
+# from the mh-* targets: the two topologies must never run at once on this
+# machine — together they need ~9 GiB and Docker has 7.75 GiB.
+
+MHHA_COMPOSE := docker compose -f docker/docker-compose.multihost-ha.yml --env-file docker/multihost/sim-ha.env
+MHHA_A       := $(MHHA_COMPOSE) -p petafs-ha-a --profile a
+MHHA_B       := $(MHHA_COMPOSE) -p petafs-ha-b --profile b
+MHHA_C       := $(MHHA_COMPOSE) -p petafs-ha-c --profile c
+MHHA_KAFKA   := host.docker.internal:19092,host.docker.internal:19192,host.docker.internal:19292
+
+mh-ha-up:  ## Start the three-node HA topology (ZooKeeper + standby JobManager)
+	@docker info >/dev/null 2>&1 || { echo "ERROR: Docker daemon not running."; exit 1; }
+	@test -f docker/tls/out/redis-node.crt || { echo "No certs — run 'make mh-tls' first."; exit 1; }
+	@docker ps --format '{{.Names}}' | grep -q '^petafs-mh-' \
+	  && { echo "ERROR: the non-HA multi-host stack is up. 'make mh-down' first — both do not fit in 7.75 GiB."; exit 1; } || true
+	@echo ">>> brokers and ZooKeeper first: both need a quorum before anything gates on them."
+	$(MHHA_A) up -d kafka1 zookeeper-1 minio
+	$(MHHA_B) up -d kafka2 zookeeper-2
+	$(MHHA_C) up -d kafka3 zookeeper-3
+	$(MHHA_A) up -d
+	$(MHHA_B) up -d
+	$(MHHA_C) up -d
+	@$(MAKE) --no-print-directory mh-ha-health
+
+mh-ha-down:  ## Stop the HA topology (volumes kept)
+	-$(MHHA_A) down
+	-$(MHHA_B) down
+	-$(MHHA_C) down
+
+mh-ha-clean:  ## Stop the HA topology and drop its volumes
+	-$(MHHA_A) down -v
+	-$(MHHA_B) down -v
+	-$(MHHA_C) down -v
+	@# `down -v` leaves the volumes behind if any container was mid-restart when
+	@# it ran, and it reports success either way. The stale Kafka logs then
+	@# survive into the next run, which looks like "the topic config I just set
+	@# was ignored". Sweep explicitly and verify.
+	-@docker volume ls -q --filter name=petafs-ha- | xargs -r docker volume rm -f >/dev/null 2>&1
+	@n=$$(docker volume ls -q --filter name=petafs-ha- | wc -l | tr -d ' '); \
+	  if [ "$$n" -eq 0 ]; then echo "all HA volumes removed"; \
+	  else echo "WARNING: $$n HA volume(s) still present:"; docker volume ls -q --filter name=petafs-ha-; fi
+
+mh-ha-ps:  ## Status of all three HA nodes
+	@for n in a b c; do echo "--- node $$n ---"; \
+	  docker compose -f docker/docker-compose.multihost-ha.yml --env-file docker/multihost/sim-ha.env \
+	    -p petafs-ha-$$n --profile $$n ps --format 'table {{.Service}}\t{{.Status}}' 2>/dev/null; echo; done
+
+mh-ha-health:  ## ZooKeeper quorum, JobManager leadership, cluster formation
+	@bash scripts/multihost_ha_health.sh
+
+mh-ha-topics:  ## Create the transactions topic at RF=3 on the HA topology
+	@bash scripts/multihost_ha_health.sh --create-topic $(TOPIC) $(PARTITIONS)
+
+mh-ha-produce:  ## Produce into the HA topology from this Mac (HOST listeners)
+	KAFKA_SECURITY_PROTOCOL=SASL_SSL KAFKA_SASL_MECHANISM=PLAIN \
+	KAFKA_USER=petafs KAFKA_PASSWORD=petafs-dev-secret \
+	KAFKA_SSL_CAFILE=docker/tls/out/ca.crt \
+	$(PY) src/producer/generate_stream.py --bootstrap localhost:19094,localhost:19194,localhost:19294 \
+	  --topic $(TOPIC) --eps $(or $(EPS),400) $(if $(DURATION),--duration $(DURATION),) \
+	  --acks all --users $(or $(USERS),400)
+
+mh-ha-submit:  ## Submit the pipeline against the HA topology
+	$(MHHA_B) exec -T jobmanager flink run -d -py /opt/project/src/flink/streaming_job.py \
+	  --no-wait --sink redis --bootstrap $(MHHA_KAFKA) --topic $(TOPIC) \
+	  $(if $(FROM_START),--startup-mode earliest-offset,)
+
+mh-ha-drill:  ## Kill the LEADING JobManager's whole node; assert automatic recovery
+	bash scripts/multihost_ha_drill.sh
