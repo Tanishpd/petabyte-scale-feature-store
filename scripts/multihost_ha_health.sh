@@ -35,7 +35,7 @@ kbin() {
 # `mntr` over the 4-letter-word port. Mode is "leader" or "follower" — an
 # ensemble that has NOT formed reports neither, which is the failure worth
 # catching: each node looks individually healthy while being alone.
-zk_mode() { docker exec "$1" sh -c 'echo mntr | nc -w 2 localhost 2181' 2>/dev/null \
+zk_mode() { docker exec "$1" sh -c 'echo mntr | nc -w 2 localhost $ZOO_PORT' 2>/dev/null \
               | awk -F'\t' '/zk_server_state/ {print $2}' | tr -d '\r'; }
 
 if [ "${1:-}" = "--create-topic" ]; then
@@ -105,8 +105,7 @@ done
 LEADER_PORT=""
 for z in petafs-mhha-zk1 petafs-mhha-zk2 petafs-mhha-zk3; do
   docker ps --format '{{.Names}}' | grep -q "^${z}$" || continue
-  LEADER_PORT=$(docker exec "$z" zkCli.sh -server localhost:2181 \
-      get /flink/petafs-mh-ha/leader/rest_server/connection_info 2>/dev/null \
+  LEADER_PORT=$(docker exec "$z" sh -c 'zkCli.sh -server localhost:$ZOO_PORT get /flink/petafs-mh-ha/leader/rest_server/connection_info' 2>/dev/null \
     | grep -aoE 'http://[^ "]+:[0-9]+' | head -1 | sed 's/.*://')
   [ -n "$LEADER_PORT" ] && break
 done

@@ -304,10 +304,11 @@ mh-ha-up:  ## Start the three-node HA topology (ZooKeeper + standby JobManager)
 	@test -f docker/tls/out/redis-node.crt || { echo "No certs — run 'make mh-tls' first."; exit 1; }
 	@docker ps --format '{{.Names}}' | grep -q '^petafs-mh-' \
 	  && { echo "ERROR: the non-HA multi-host stack is up. 'make mh-down' first — both do not fit in 7.75 GiB."; exit 1; } || true
-	@echo ">>> brokers and ZooKeeper first: both need a quorum before anything gates on them."
-	$(MHHA_A) up -d kafka1 zookeeper-1 minio
-	$(MHHA_B) up -d kafka2 zookeeper-2
-	$(MHHA_C) up -d kafka3 zookeeper-3
+	@echo ">>> brokers, ZooKeeper and the object store first: all three form"
+	@echo ">>> quorums, and nothing that gates on them can start until they have."
+	$(MHHA_A) up -d kafka1 zookeeper-1 minio-a
+	$(MHHA_B) up -d kafka2 zookeeper-2 minio-b
+	$(MHHA_C) up -d kafka3 zookeeper-3 minio-c
 	$(MHHA_A) up -d
 	$(MHHA_B) up -d
 	$(MHHA_C) up -d
@@ -326,6 +327,9 @@ mh-ha-clean:  ## Stop the HA topology and drop its volumes
 	@# it ran, and it reports success either way. The stale Kafka logs then
 	@# survive into the next run, which looks like "the topic config I just set
 	@# was ignored". Sweep explicitly and verify.
+	@# Containers first: a killed-but-not-removed container still holds its
+	@# volume, so removing volumes alone fails with "volume is in use".
+	-@docker ps -aq --filter name=petafs-mhha- | xargs -r docker rm -f >/dev/null 2>&1
 	-@docker volume ls -q --filter name=petafs-ha- | xargs -r docker volume rm -f >/dev/null 2>&1
 	@n=$$(docker volume ls -q --filter name=petafs-ha- | wc -l | tr -d ' '); \
 	  if [ "$$n" -eq 0 ]; then echo "all HA volumes removed"; \

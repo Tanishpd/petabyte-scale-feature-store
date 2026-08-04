@@ -21,15 +21,23 @@
 #
 # LAYOUT — nothing critical shares a node with its own failover target
 # --------------------------------------------------------------------
-#   node A   kafka1, redis primary, sentinel 1, zk 1, MinIO
-#   node B   kafka2, redis replica,  sentinel 2, zk 2, JobManager (starts active)
-#   node C   kafka3,                 sentinel 3, zk 3, JobManager (standby),
-#                                                      TaskManager
+#   node A   kafka1, redis primary, sentinel 1, zk 1, MinIO member
+#   node B   kafka2, redis replica,  sentinel 2, zk 2, JobManager, TaskManager,
+#                                                      MinIO member
+#   node C   kafka3,                 sentinel 3, zk 3, JobManager, TaskManager,
+#                                                      MinIO member
 #
-# Killing node B kills the leading JobManager. The standby on C takes
-# leadership, recovers the job from the HA store on A, and redeploys onto the
-# TaskManager on C — with no human involved. That is the assertion the whole
-# file exists to support, and `make mh-ha-drill` makes it.
+# Killing the node with the leading JobManager: the standby takes leadership,
+# recovers the job from the HA store, and redeploys onto a surviving
+# TaskManager — with no human involved. That is the assertion the whole file
+# exists to support, and `make mh-ha-drill` makes it.
+#
+# The object store is DISTRIBUTED across all three nodes rather than sitting on
+# one, and each Flink process uses the member on its OWN node. No load balancer
+# is needed and none is wanted: a client can never be orphaned by its endpoint
+# dying, because the endpoint dies only when the node running that client dies.
+# A separate LB tier would only cover "MinIO died but its node did not", which
+# is a process failure that `restart: unless-stopped` already handles.
 #
 # ⚠️ SIZING. This machine has 8 GiB of RAM total and Docker holds 7.75 GiB of
 # it, and the whole topology — 3 brokers, 3 ZooKeepers, 2 JobManagers, 2
@@ -114,6 +122,10 @@ x-zk-common: &zk-common
     ZOO_INIT_LIMIT: "10"
     ZOO_SYNC_LIMIT: "5"
     ZOO_STANDALONE_ENABLED: "false"
+    # ZooKeeper tells clients which port to use, and Curator replaces its
+    # configured connection string with what the ensemble advertises. If the
+    # advertised client port is the container-internal one, every client ends
+    # up dialling a port Docker never published — see the ZOO_PORT note below.
     ZOO_4LW_COMMANDS_WHITELIST: "srvr,stat,mntr,ruok,conf"
     # 96 MiB heap. ZooKeeper's job here is a few kilobytes of leader-election
     # metadata; the default heap is sized for a real coordination workload and
@@ -123,11 +135,10 @@ x-zk-common: &zk-common
 services:
 
   # ======================================================================
-  # NODE A — kafka1, Redis primary, sentinel 1, zk 1, MinIO
+  # NODE A — kafka1, Redis primary, sentinel 1, zk 1, MinIO member
   #
-  # The checkpoint/HA store lives here and the active JobManager does NOT.
-  # That separation is the entire point of the layout: the standby has to be
-  # able to reach the thing it recovers from after the leader's node is gone.
+  # No Flink here. Node A carries a third of the object store and a third of
+  # each quorum, so losing it costs redundancy and never availability.
   # ======================================================================
 
   kafka1:
@@ -157,22 +168,23 @@ services:
     environment:
       <<: *zk-env
       ZOO_MY_ID: "1"
+      ZOO_PORT: ${ZK_A_CLIENT_PORT:-2181}
       # Its OWN entry binds 0.0.0.0; the peers are dialled at their routable
       # addresses. Peer ports must be the PUBLISHED ones, since that is what
       # the other machines actually connect to.
       ZOO_SERVERS: >-
-        server.1=0.0.0.0:2888:3888;2181
-        server.2=${NODE_B_HOST:-node-b}:${ZK_B_PEER_PORT:-2888}:${ZK_B_ELECT_PORT:-3888};2181
-        server.3=${NODE_C_HOST:-node-c}:${ZK_C_PEER_PORT:-2888}:${ZK_C_ELECT_PORT:-3888};2181
+        server.1=0.0.0.0:2888:3888;${ZK_A_CLIENT_PORT:-2181}
+        server.2=${NODE_B_HOST:-node-b}:${ZK_B_PEER_PORT:-2888}:${ZK_B_ELECT_PORT:-3888};${ZK_B_CLIENT_PORT:-2181}
+        server.3=${NODE_C_HOST:-node-c}:${ZK_C_PEER_PORT:-2888}:${ZK_C_ELECT_PORT:-3888};${ZK_C_CLIENT_PORT:-2181}
     ports:
-      - "${ZK_A_CLIENT_PORT:-2181}:2181"
+      - "${ZK_A_CLIENT_PORT:-2181}:${ZK_A_CLIENT_PORT:-2181}"
       - "${ZK_A_PEER_PORT:-2888}:2888"
       - "${ZK_A_ELECT_PORT:-3888}:3888"
     volumes:
       - zk1-data:/data
       - zk1-datalog:/datalog
     healthcheck:
-      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep -q imok"]
+      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost $$ZOO_PORT | grep -q imok"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -255,40 +267,92 @@ services:
       redis-primary:
         condition: service_healthy
 
-  minio:
+  # --- distributed object storage, one member per node ---------------------
+  #
+  # A single MinIO was the last single point of failure: lose its node and the
+  # data all survived but there was nowhere to checkpoint TO. These three form
+  # one erasure-coded pool, so an object written through any member is readable
+  # and writable through the others after a node dies.
+  #
+  # FOUR non-obvious requirements, each of which failed loudly before it worked:
+  #
+  # 1. `hostname:` must be set. MinIO decides which endpoint is "itself" by
+  #    resolving each one and checking the IP is on a local interface. Docker
+  #    puts <container-ip> <hostname> in /etc/hosts, which satisfies that.
+  #    Mapping the name to 127.0.0.1 instead is explicitly rejected:
+  #    "minio-a resolves to localhost in a containerized deployment".
+  # 2. The listen port must EQUAL the published port (`--address :19000`,
+  #    `19000:19000`). MinIO compares ports as well as addresses when deciding
+  #    what is local, so the usual 9000-inside/19000-outside remap breaks it.
+  # 3. Drives must be real mounts. A directory on the container root filesystem
+  #    is refused with "drive is part of root drive, will not be used".
+  # 4. ONE DRIVE PER NODE, which is the subtle one. MinIO assigns drives to
+  #    erasure sets in flat endpoint order, so 3 drives per node produced three
+  #    sets of three with every set living entirely on ONE node — losing that
+  #    node destroyed a whole set and the cluster went 503. With one drive each,
+  #    the single set spans all three nodes and survives losing one. Real
+  #    deployments express this as `http://minio-{a...c}:9000/d{1...N}` and
+  #    MinIO interleaves across hosts itself; the host ellipsis needs identical
+  #    ports on every node, which a single-machine simulation cannot have.
+  minio-a:
     profiles: ["a"]
     image: minio/minio:RELEASE.2025-04-22T22-12-26Z
-    container_name: petafs-mhha-minio
+    container_name: petafs-mhha-minio-a
+    hostname: minio-a
     restart: unless-stopped
-    command: server /data --console-address ":9001"
-    environment:
+    command: >-
+      server --address :${MINIO_A_PORT:-9000} --console-address :${MINIO_A_CONSOLE_PORT:-9001}
+      http://minio-a:${MINIO_A_PORT:-9000}/d1
+      http://minio-b:${MINIO_B_PORT:-9000}/d1
+      http://minio-c:${MINIO_C_PORT:-9000}/d1
+    environment: &minio-env
       MINIO_ROOT_USER: ${MINIO_USER:-petafs}
       MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD:-petafs-dev-secret}
+      # 3 drives, 1 parity: tolerates exactly one node. That is the most a
+      # three-node pool can offer, and it is the shape being tested.
+      MINIO_STORAGE_CLASS_STANDARD: "EC:1"
+    extra_hosts:
+      - "minio-b:host-gateway"
+      - "minio-c:host-gateway"
     ports:
-      - "${MINIO_PORT:-9000}:9000"
-      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+      - "${MINIO_A_PORT:-9000}:${MINIO_A_PORT:-9000}"
+      - "${MINIO_A_CONSOLE_PORT:-9001}:${MINIO_A_CONSOLE_PORT:-9001}"
     volumes:
-      - minio-data:/data
+      - minio-a-d1:/d1
     healthcheck:
-      test: ["CMD-SHELL", "mc ready local || curl -fs http://localhost:9000/minio/health/live"]
+      test: ["CMD-SHELL", "curl -fs http://localhost:${MINIO_A_PORT:-9000}/minio/health/live || exit 1"]
       interval: 10s
       timeout: 5s
-      retries: 12
-      start_period: 10s
+      retries: 24
+      start_period: 20s
 
   minio-init:
     profiles: ["a"]
     image: minio/mc:RELEASE.2025-04-16T18-13-26Z
     container_name: petafs-mhha-minio-init
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
-      minio:
+      minio-a:
         condition: service_healthy
-    entrypoint: >
-      sh -c "mc alias set petafs http://minio:9000 ${MINIO_USER:-petafs} ${MINIO_PASSWORD:-petafs-dev-secret}
-      && mc mb --ignore-existing petafs/flink-checkpoints
-      && mc mb --ignore-existing petafs/flink-savepoints
-      && mc mb --ignore-existing petafs/flink-ha
-      && echo 'buckets ready'"
+    # Retries rather than assuming. A distributed pool is not writable until a
+    # quorum of its members is up, and node A's member reports itself healthy
+    # well before nodes B and C have joined — so a single `mc mb` here races
+    # the pool and fails with the buckets never created.
+    entrypoint:
+      - sh
+      - -c
+      - |
+        mc alias set petafs http://minio-a:${MINIO_A_PORT:-9000} ${MINIO_USER:-petafs} ${MINIO_PASSWORD:-petafs-dev-secret} >/dev/null 2>&1
+        for i in $$(seq 1 60); do
+          if mc mb --ignore-existing petafs/flink-checkpoints >/dev/null 2>&1 \
+             && mc mb --ignore-existing petafs/flink-savepoints >/dev/null 2>&1 \
+             && mc mb --ignore-existing petafs/flink-ha >/dev/null 2>&1; then
+            echo "buckets ready"; exit 0
+          fi
+          echo "waiting for the pool to accept writes ($$i)"; sleep 5
+        done
+        echo "pool never became writable"; exit 1
 
   # ======================================================================
   # NODE B — kafka2, Redis replica, sentinel 2, zk 2, JobManager (active)
@@ -321,19 +385,20 @@ services:
     environment:
       <<: *zk-env
       ZOO_MY_ID: "2"
+      ZOO_PORT: ${ZK_B_CLIENT_PORT:-2181}
       ZOO_SERVERS: >-
-        server.1=${NODE_A_HOST:-node-a}:${ZK_A_PEER_PORT:-2888}:${ZK_A_ELECT_PORT:-3888};2181
-        server.2=0.0.0.0:2888:3888;2181
-        server.3=${NODE_C_HOST:-node-c}:${ZK_C_PEER_PORT:-2888}:${ZK_C_ELECT_PORT:-3888};2181
+        server.1=${NODE_A_HOST:-node-a}:${ZK_A_PEER_PORT:-2888}:${ZK_A_ELECT_PORT:-3888};${ZK_A_CLIENT_PORT:-2181}
+        server.2=0.0.0.0:2888:3888;${ZK_B_CLIENT_PORT:-2181}
+        server.3=${NODE_C_HOST:-node-c}:${ZK_C_PEER_PORT:-2888}:${ZK_C_ELECT_PORT:-3888};${ZK_C_CLIENT_PORT:-2181}
     ports:
-      - "${ZK_B_CLIENT_PORT:-2181}:2181"
+      - "${ZK_B_CLIENT_PORT:-2181}:${ZK_B_CLIENT_PORT:-2181}"
       - "${ZK_B_PEER_PORT:-2888}:2888"
       - "${ZK_B_ELECT_PORT:-3888}:3888"
     volumes:
       - zk2-data:/data
       - zk2-datalog:/datalog
     healthcheck:
-      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep -q imok"]
+      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost $$ZOO_PORT | grep -q imok"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -414,6 +479,33 @@ services:
       - redis-sentinel-2-data:/data
       - ./tls/out:/tls:ro
 
+  minio-b:
+    profiles: ["b"]
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    container_name: petafs-mhha-minio-b
+    hostname: minio-b
+    restart: unless-stopped
+    command: >-
+      server --address :${MINIO_B_PORT:-9000} --console-address :${MINIO_B_CONSOLE_PORT:-9001}
+      http://minio-a:${MINIO_A_PORT:-9000}/d1
+      http://minio-b:${MINIO_B_PORT:-9000}/d1
+      http://minio-c:${MINIO_C_PORT:-9000}/d1
+    environment: *minio-env
+    extra_hosts:
+      - "minio-a:host-gateway"
+      - "minio-c:host-gateway"
+    ports:
+      - "${MINIO_B_PORT:-9000}:${MINIO_B_PORT:-9000}"
+      - "${MINIO_B_CONSOLE_PORT:-9001}:${MINIO_B_CONSOLE_PORT:-9001}"
+    volumes:
+      - minio-b-d1:/d1
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:${MINIO_B_PORT:-9000}/minio/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 24
+      start_period: 20s
+
   jobmanager:
     profiles: ["b"]
     image: petafs/flink:2.2.1
@@ -466,8 +558,18 @@ services:
       # never published, and you get "Could not resolve ResourceManager
       # address ...:42335" forever. On one host it works by accident because
       # there is no port mapping in the way.
+      #
+      # zookeeper.sasl.disable: true is NOT cosmetic here. Flink writes a JAAS
+      # file for the Kafka client, ZooKeeper's client finds it, looks for a
+      # section named 'Client', does not find one, and logs a LoginException
+      # saying it "will continue ... without SASL authentication" — while
+      # Curator logs `ERROR ConnectionState - Authentication failed` and cycles
+      # the connection several times a second. It survives that while the box
+      # is idle; under load the session churn stops the JobManager from ever
+      # holding the leader latch, and failover silently never happens.
       FLINK_PROPERTIES: |
         high-availability.type: zookeeper
+        zookeeper.sasl.disable: true
         high-availability.zookeeper.quorum: ${NODE_A_HOST:-node-a}:${ZK_A_CLIENT_PORT:-2181},${NODE_B_HOST:-node-b}:${ZK_B_CLIENT_PORT:-2181},${NODE_C_HOST:-node-c}:${ZK_C_CLIENT_PORT:-2181}
         high-availability.zookeeper.path.root: /flink
         high-availability.cluster-id: /petafs-mh-ha
@@ -495,7 +597,7 @@ services:
         restart-strategy.exponential-delay.max-backoff: 30s
         metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
         metrics.reporter.prom.port: 9250
-        s3.endpoint: http://${NODE_A_HOST:-node-a}:${MINIO_PORT:-9000}
+        s3.endpoint: http://${NODE_B_HOST:-node-b}:${MINIO_B_PORT:-9000}
         s3.path.style.access: true
     volumes:
       - ../src:/opt/project/src:ro
@@ -551,6 +653,7 @@ services:
       KAFKA_PASSWORD: ${KAFKA_PASSWORD:-petafs-dev-secret}
       FLINK_PROPERTIES: |
         high-availability.type: zookeeper
+        zookeeper.sasl.disable: true
         high-availability.zookeeper.quorum: ${NODE_A_HOST:-node-a}:${ZK_A_CLIENT_PORT:-2181},${NODE_B_HOST:-node-b}:${ZK_B_CLIENT_PORT:-2181},${NODE_C_HOST:-node-c}:${ZK_C_CLIENT_PORT:-2181}
         high-availability.zookeeper.path.root: /flink
         high-availability.cluster-id: /petafs-mh-ha
@@ -569,7 +672,7 @@ services:
         execution.checkpointing.savepoint-dir: s3://flink-savepoints/petafs
         metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
         metrics.reporter.prom.port: 9250
-        s3.endpoint: http://${NODE_A_HOST:-node-a}:${MINIO_PORT:-9000}
+        s3.endpoint: http://${NODE_B_HOST:-node-b}:${MINIO_B_PORT:-9000}
         s3.path.style.access: true
     volumes:
       - ../src:/opt/project/src:ro
@@ -607,19 +710,20 @@ services:
     environment:
       <<: *zk-env
       ZOO_MY_ID: "3"
+      ZOO_PORT: ${ZK_C_CLIENT_PORT:-2181}
       ZOO_SERVERS: >-
-        server.1=${NODE_A_HOST:-node-a}:${ZK_A_PEER_PORT:-2888}:${ZK_A_ELECT_PORT:-3888};2181
-        server.2=${NODE_B_HOST:-node-b}:${ZK_B_PEER_PORT:-2888}:${ZK_B_ELECT_PORT:-3888};2181
-        server.3=0.0.0.0:2888:3888;2181
+        server.1=${NODE_A_HOST:-node-a}:${ZK_A_PEER_PORT:-2888}:${ZK_A_ELECT_PORT:-3888};${ZK_A_CLIENT_PORT:-2181}
+        server.2=${NODE_B_HOST:-node-b}:${ZK_B_PEER_PORT:-2888}:${ZK_B_ELECT_PORT:-3888};${ZK_B_CLIENT_PORT:-2181}
+        server.3=0.0.0.0:2888:3888;${ZK_C_CLIENT_PORT:-2181}
     ports:
-      - "${ZK_C_CLIENT_PORT:-2181}:2181"
+      - "${ZK_C_CLIENT_PORT:-2181}:${ZK_C_CLIENT_PORT:-2181}"
       - "${ZK_C_PEER_PORT:-2888}:2888"
       - "${ZK_C_ELECT_PORT:-3888}:3888"
     volumes:
       - zk3-data:/data
       - zk3-datalog:/datalog
     healthcheck:
-      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep -q imok"]
+      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost $$ZOO_PORT | grep -q imok"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -661,6 +765,33 @@ services:
       - redis-sentinel-3-data:/data
       - ./tls/out:/tls:ro
 
+  minio-c:
+    profiles: ["c"]
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    container_name: petafs-mhha-minio-c
+    hostname: minio-c
+    restart: unless-stopped
+    command: >-
+      server --address :${MINIO_C_PORT:-9000} --console-address :${MINIO_C_CONSOLE_PORT:-9001}
+      http://minio-a:${MINIO_A_PORT:-9000}/d1
+      http://minio-b:${MINIO_B_PORT:-9000}/d1
+      http://minio-c:${MINIO_C_PORT:-9000}/d1
+    environment: *minio-env
+    extra_hosts:
+      - "minio-a:host-gateway"
+      - "minio-b:host-gateway"
+    ports:
+      - "${MINIO_C_PORT:-9000}:${MINIO_C_PORT:-9000}"
+      - "${MINIO_C_CONSOLE_PORT:-9001}:${MINIO_C_CONSOLE_PORT:-9001}"
+    volumes:
+      - minio-c-d1:/d1
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:${MINIO_C_PORT:-9000}/minio/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 24
+      start_period: 20s
+
   jobmanager-standby:
     # Identical configuration to the active JobManager apart from its own
     # address and ports. That is not laziness — in HA there is no "standby"
@@ -683,6 +814,7 @@ services:
       <<: *jm-env
       FLINK_PROPERTIES: |
         high-availability.type: zookeeper
+        zookeeper.sasl.disable: true
         high-availability.zookeeper.quorum: ${NODE_A_HOST:-node-a}:${ZK_A_CLIENT_PORT:-2181},${NODE_B_HOST:-node-b}:${ZK_B_CLIENT_PORT:-2181},${NODE_C_HOST:-node-c}:${ZK_C_CLIENT_PORT:-2181}
         high-availability.zookeeper.path.root: /flink
         high-availability.cluster-id: /petafs-mh-ha
@@ -710,7 +842,7 @@ services:
         restart-strategy.exponential-delay.max-backoff: 30s
         metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
         metrics.reporter.prom.port: 9250
-        s3.endpoint: http://${NODE_A_HOST:-node-a}:${MINIO_PORT:-9000}
+        s3.endpoint: http://${NODE_C_HOST:-node-c}:${MINIO_C_PORT:-9000}
         s3.path.style.access: true
     volumes:
       - ../src:/opt/project/src:ro
@@ -749,6 +881,7 @@ services:
       # address would be both unused and misleading about how failover works.
       FLINK_PROPERTIES: |
         high-availability.type: zookeeper
+        zookeeper.sasl.disable: true
         high-availability.zookeeper.quorum: ${NODE_A_HOST:-node-a}:${ZK_A_CLIENT_PORT:-2181},${NODE_B_HOST:-node-b}:${ZK_B_CLIENT_PORT:-2181},${NODE_C_HOST:-node-c}:${ZK_C_CLIENT_PORT:-2181}
         high-availability.zookeeper.path.root: /flink
         high-availability.cluster-id: /petafs-mh-ha
@@ -767,7 +900,7 @@ services:
         execution.checkpointing.savepoint-dir: s3://flink-savepoints/petafs
         metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
         metrics.reporter.prom.port: 9250
-        s3.endpoint: http://${NODE_A_HOST:-node-a}:${MINIO_PORT:-9000}
+        s3.endpoint: http://${NODE_C_HOST:-node-c}:${MINIO_C_PORT:-9000}
         s3.path.style.access: true
     volumes:
       - ../src:/opt/project/src:ro
@@ -775,6 +908,9 @@ services:
       - ./tls/out:/tls:ro
 
 volumes:
+  minio-a-d1:
+  minio-b-d1:
+  minio-c-d1:
   kafka1-data:
   kafka2-data:
   kafka3-data:
@@ -789,4 +925,3 @@ volumes:
   redis-sentinel-1-data:
   redis-sentinel-2-data:
   redis-sentinel-3-data:
-  minio-data:

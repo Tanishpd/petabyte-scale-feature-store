@@ -52,8 +52,7 @@ http_code() { curl -s -o /dev/null -m 5 -w '%{http_code}' "$1" 2>/dev/null; }
 zk_leader_port() {
   for z in petafs-mhha-zk1 petafs-mhha-zk2 petafs-mhha-zk3; do
     docker ps --format '{{.Names}}' | grep -q "^${z}$" || continue
-    P=$(docker exec "$z" zkCli.sh -server localhost:2181 \
-          get /flink/petafs-mh-ha/leader/rest_server/connection_info 2>/dev/null \
+    P=$(docker exec "$z" sh -c 'zkCli.sh -server localhost:$ZOO_PORT get /flink/petafs-mh-ha/leader/rest_server/connection_info' 2>/dev/null \
         | grep -aoE 'http://[^ "]+:[0-9]+' | head -1 | sed 's/.*://')
     [ -n "$P" ] && { echo "$P"; return; }
   done
@@ -73,8 +72,39 @@ import json,sys
 try: print(json.load(sys.stdin).get('taskmanagers',0))
 except Exception: print(0)"
 }
-zk_mode() { docker exec "$1" sh -c 'echo mntr | nc -w 2 localhost 2181' 2>/dev/null \
+zk_mode() { docker exec "$1" sh -c 'echo mntr | nc -w 2 localhost $ZOO_PORT' 2>/dev/null \
               | awk -F'\t' '/zk_server_state/ {print $2}' | tr -d '\r'; }
+
+# Talk to the object store from node A's network. Node A always survives this
+# drill (the victim is the LEADING JobManager's node, which is B or C), so this
+# stays a valid vantage point after the kill.
+mc_a() {
+  docker run --rm --entrypoint sh --network petafs-ha-a_default \
+    minio/mc:RELEASE.2025-04-16T18-13-26Z -c \
+    "mc alias set p http://minio-a:${MINIO_A_PORT:-19000} ${MINIO_USER:-petafs} ${MINIO_PASSWORD:-petafs-dev-secret} >/dev/null 2>&1; $1" \
+    2>/dev/null | grep -v "older version\|Update:"
+}
+# `mc admin info --json` nests everything under "info" — the backend block is at
+# d["info"]["backend"], not d["backend"]. Reading the wrong level yields 0 and
+# looks exactly like "the whole pool is offline".
+minio_online() { mc_a "mc admin info p --json" | python3 -c "
+import json,sys
+try:
+    d = json.load(sys.stdin)
+    print((d.get('info') or d).get('backend',{}).get('onlineDisks',0))
+except Exception: print(0)" 2>/dev/null; }
+minio_sets() { mc_a "mc admin info p --json" | python3 -c "
+import json,sys
+try:
+    b = (json.load(sys.stdin).get('info') or {}).get('backend',{})
+    print('%s set(s) of %s drives' % (b.get('totalSets'), b.get('totalDrivesPerSet')))
+except Exception: print('unknown')" 2>/dev/null; }
+checkpoints_completed() {  # <port> <jid>
+  curl -s -m 5 "http://localhost:$1/jobs/$2/checkpoints" 2>/dev/null | python3 -c "
+import json,sys
+try: print((json.load(sys.stdin).get('counts') or {}).get('completed',0))
+except Exception: print(0)"
+}
 
 redis_master_container() {
   for c in petafs-mhha-redis-primary petafs-mhha-redis-replica; do
@@ -136,14 +166,23 @@ note "ZooKeeper names node $LN (:$LP) the leader; node $OTHER_NODE (:$OTHER_PORT
 # the "Created ... storage directory" line is only emitted the FIRST time the
 # directory is created, so on any later run a log grep reports a perfectly
 # populated store as missing.
-HA_LS=$(docker run --rm --entrypoint sh --network petafs-ha-a_default \
-          minio/mc:RELEASE.2025-04-16T18-13-26Z -c \
-          "mc alias set p http://minio:9000 ${MINIO_USER:-petafs} ${MINIO_PASSWORD:-petafs-dev-secret} >/dev/null 2>&1 && mc ls --recursive p/flink-ha" 2>/dev/null)
+HA_LS=$(mc_a "mc ls --recursive p/flink-ha")
 if printf '%s' "$HA_LS" | grep -q submittedExecutionPlan; then
   ok "job graph is in the HA store — the standby has something to recover"
   note "$(printf '%s' "$HA_LS" | grep -oE '[a-zA-Z]+[0-9a-f]{8,}' | head -3 | tr '\n' ' ')"
 else
   bad "no submittedExecutionPlan in s3://flink-ha — failover would recover nothing"
+fi
+
+D=$(minio_online)
+if [ "${D:-0}" -eq 3 ]; then
+  ok "object store is distributed across all three nodes (3 drives online)"
+  # One set spanning all three nodes is the property that matters. Three sets
+  # of one, or one set per node, would report the same drive count and lose
+  # data the moment a node died.
+  note "erasure layout: $(minio_sets)"
+else
+  bad "object store reports ${D:-0} drives online, expected 3"
 fi
 
 N=$(tm_count "$LP")
@@ -197,10 +236,30 @@ except Exception: print('')")
         s3://*) ok "recovered STATE from the HA store, not restarted from scratch"; note "$R" ;;
         *)      note "no restore path reported (${R:-none}) — job may have been rescheduled without state" ;;
       esac
+      # The object store must still take WRITES with a node gone, not merely
+      # serve reads. A pool that has gone read-only looks fine to a `mc ls` and
+      # then silently fails the next checkpoint.
+      if mc_a "echo after-the-kill | mc pipe p/flink-ha/drill-probe.txt >/dev/null 2>&1 && mc cat p/flink-ha/drill-probe.txt" \
+           | grep -q after-the-kill; then
+        ok "object store still accepts writes with a node down"
+      else
+        bad "object store would not accept a write after the node loss"
+      fi
+      D2=$(minio_online)
+      [ "${D2:-0}" -eq 2 ] && ok "pool degraded to 2 of 3 drives and stayed serving" \
+                           || note "pool reports ${D2:-0} drives online"
+
+      CP0=$(checkpoints_completed "$OTHER_PORT" "$JOB2")
       sleep 75
       T1=$(max_ttl)
       [ "${T1:-0}" -gt 1600 ] && ok "features flowing again after failover (max TTL ${T1}s of 1800)" \
                               || bad "no recent feature writes after failover (max TTL ${T1:-none})"
+      # The end-to-end proof that the object store survived: Flink is still
+      # completing checkpoints INTO it after losing a node.
+      CP1=$(checkpoints_completed "$OTHER_PORT" "$JOB2")
+      [ "${CP1:-0}" -gt "${CP0:-0}" ] \
+        && ok "checkpoints still completing into the degraded pool ($CP0 -> $CP1)" \
+        || bad "no new checkpoints after the node loss ($CP0 -> $CP1)"
     else
       bad "job did not return to RUNNING within 240 s of the failover"
     fi

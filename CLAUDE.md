@@ -236,3 +236,22 @@ Invariant 4. Override with `REDIS_HOST_PORT=6379`.
   retention change looks ignored. Sweep by name and verify.
 - **Compose `profiles` MERGE across `-f` files, they do not replace.** An overlay cannot move a service
   to a different node — it ends up in both profiles. That is why HA is a separate file, not an overlay.
+- **ZooKeeper tells clients which port to use and they believe it over their own config.** Curator
+  replaces its connection string with the ensemble's advertised addresses, which come from the
+  `;clientPort` in `server.N=host:2888:3888;2181`. Bind 2181 and publish 12181 → every client learns
+  `:2181`, a port Docker never mapped, and loops on `Connection refused`. Advertised must EQUAL
+  published (`ZOO_PORT`). ZK 3.5+ also **persists this into its data dir**, so changing it needs the ZK
+  volumes dropped, not just a container recreate.
+- **`zookeeper.sasl.disable: true` is required on every Flink service.** Flink writes a JAAS file for
+  Kafka; ZooKeeper's client finds it, has no `Client` section, and Curator then logs
+  `Authentication failed` and re-connects several times a second. Idle boxes survive it; under load the
+  churn stops a JobManager ever holding the leader latch and failover silently never happens.
+- **A Kafka broker's RSS grows for as long as it runs** — ~390 MiB → 2.2 GiB over hours here, with the
+  heap pinned at 320m. Flink then dies with `Could not create actor system`, naming nothing about
+  memory. A rolling `docker restart` of the brokers took the VM 7,377 → 3,717 MiB. Restart the brokers
+  before concluding the topology does not fit.
+- **MinIO assigns erasure sets in flat endpoint order.** 3 drives × 3 nodes = three sets each living
+  entirely on ONE node, so losing a node destroys a set (cluster → 503). Use ONE drive per node so the
+  single set spans them. Real hosts use `http://minio-{a...c}:9000/d{1...N}` and MinIO interleaves
+  itself, but the host ellipsis needs identical ports everywhere. MinIO also needs `hostname:` set (it
+  refuses a name resolving to 127.0.0.1), listen port == published port, and real volume mounts.

@@ -147,17 +147,18 @@ Both are in [docs/MULTIHOST.md](docs/MULTIHOST.md).
 | Everything in the clear | **TLS everywhere**: Kafka SASL_SSL, Redis + Sentinel TLS-only (`port 0`), replication encrypted | An unencrypted client *with valid credentials* is refused on both; the whole path producer→Kafka→Flink→Redis is encrypted |
 | Nothing proved any of it | `make prod-drill` — 17 assertions | **17/17 passing** against the live topology |
 | **Everything on one host** | **Three nodes, separate failure domains** — routable addressing throughout, mTLS on the KRaft quorum | Killed the whole node running the job: rescheduled onto another node, restored from `s3://.../chk-4`, zero data loss, features still writing. Killed the Redis primary's node: promoted across hosts. **24/24** ([MULTIHOST](docs/MULTIHOST.md)) |
-| **The JobManager was a single point of failure** | **ZooKeeper ensemble + standby JobManager** — leadership is a ZK latch, job graph lives in object storage | Killed the whole node holding the *leading* JobManager: leadership moved automatically, the pipeline recovered **with no resubmission and the same job id**, restored from `s3://.../chk-32`, features resumed. **14/14**, run in both failover directions |
+| **The JobManager and the object store were single points of failure** | **ZooKeeper ensemble + standby JobManager + object store distributed across all three nodes**, each Flink process using its node-local S3 endpoint | Killed the whole node holding the *leading* JobManager: leadership moved automatically, the pipeline recovered **with no resubmission and the same job id**, restored from `s3://.../chk-2`, the pool **kept accepting writes** at 2 of 3 drives, and checkpoints kept completing into it. **18/18** |
 
 **Still open, honestly:**
 
-- **The object store is one node.** MinIO runs on a single node and Flink takes
-  a single `s3.endpoint`. Distributed MinIO would fix durability but not
-  endpoint availability — that needs a load balancer or DNS failover, which is
-  exactly what a managed object store already provides. Swapping in S3/GCS is a
-  credentials-and-URL change and is already how `s3.endpoint` is wired; building
-  an LB tier on a laptop to simulate it would be theatre. Named, not
-  half-closed.
+- **Only one node may be lost.** Three of anything tolerates one failure. The
+  object store in particular runs at parity 1 — the most a three-node pool can
+  offer — so while a node is down there is no redundancy left. Four nodes at
+  EC:2 is the first configuration that is comfortable rather than merely correct.
+- **A real deployment should still use S3/GCS rather than self-run MinIO** — not
+  for anything demonstrated here, but because running an object store is
+  operational work an API call avoids. `s3.endpoint` keeps that a
+  credentials-and-URL change.
 - **Secrets are compose env vars with dev defaults**, not a secret store.
 - **Feast internals dependency** ([ADR-003](docs/DECISIONS.md)). CI is the
   tripwire; a supported path would be `write_to_online_store`, at the cost of a hop.
@@ -166,9 +167,11 @@ Both are in [docs/MULTIHOST.md](docs/MULTIHOST.md).
   ([SCALING §8](docs/SCALING.md)).
 
 So: **durability, availability, authentication, transport encryption, deployment
-topology and control-plane failover are all real and tested** — 55 assertions
-across the three topologies, every one of them made by breaking something. What
-remains is the object store, and its fix is named above rather than faked.
+topology, control-plane failover and object storage are all real and tested** —
+59 assertions across the three topologies, every one of them made by breaking
+something. **No single node's loss stops the pipeline**: Kafka, Redis,
+ZooKeeper, the JobManager and the object store each survive one, and the drill
+proves it by killing whichever node ZooKeeper currently says is in charge.
 
 The multi-host claims are verified by running the three node profiles as three
 Compose projects on **separate Docker networks**, so there is no shared DNS and

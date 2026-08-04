@@ -171,9 +171,11 @@ JobManager**, with the layout rearranged so nothing critical shares a node with
 its own failover target:
 
 ```
-node A   kafka1, redis primary, sentinel 1, zk 1, MinIO
-node B   kafka2, redis replica,  sentinel 2, zk 2, JobManager, TaskManager
-node C   kafka3,                 sentinel 3, zk 3, JobManager, TaskManager
+node A   kafka1, redis primary, sentinel 1, zk 1, MinIO member
+node B   kafka2, redis replica,  sentinel 2, zk 2, MinIO member,
+                                                   JobManager, TaskManager
+node C   kafka3,                 sentinel 3, zk 3, MinIO member,
+                                                   JobManager, TaskManager
 ```
 
 ```bash
@@ -185,22 +187,53 @@ Flink 2.2.1 needs **no extra jar** for this: shaded ZooKeeper 3 and Curator 5
 are already inside `flink-dist-2.2.1.jar`. In 1.x they were a separate jar you
 copied into `lib/`, which is what most tutorials still tell you to do.
 
-### Measured — `make mh-ha-drill`, 14/14
+The object store is **distributed across all three nodes** too, so nothing in
+this topology is a single point of failure any more. Each Flink process uses
+the MinIO member on its OWN node — no load balancer, and none wanted: a client
+cannot be orphaned by its endpoint dying, because that endpoint dies only when
+the node running the client dies. An LB tier would only cover "MinIO died but
+its node did not", which is a process failure `restart: unless-stopped` handles.
+
+### Measured — `make mh-ha-drill`, 18/18
 
 | Assertion | Result |
 |---|---|
 | ZooKeeper ensemble spans three nodes | 1 leader, 2 followers |
 | Both JobManagers live, exactly one leader | per ZooKeeper, not per REST |
 | Job graph reached the HA store | `submittedExecutionPlan` + blob in `s3://flink-ha` |
+| Object store spans all three nodes | 3 drives online, **1 erasure set of 3** |
 | **Leadership moves after the leader's node dies** | automatic, no operator |
 | **Pipeline recovers with no resubmission** | same job id throughout |
-| State recovered, not restarted | `s3://flink-checkpoints/petafs/<job>/chk-32` |
-| Features flowing after failover | max TTL 1770 s of 1800 |
+| State recovered, not restarted | `s3://flink-checkpoints/petafs/<job>/chk-2` |
+| **Object store still accepts writes with a node down** | write + read back verified |
+| Pool degrades rather than stopping | 2 of 3 drives, still serving |
+| **Checkpoints keep completing into the degraded pool** | 0 → 2 after the kill |
+| Features flowing after failover | max TTL 1781 s of 1800 |
 | Leadership does not bounce back on restore | restored JM rejoins as contender |
 
-Run in both directions — once killing node B while node C led, once killing
-node C while node B led. The victim is whichever node ZooKeeper says is
-leading, never a fixed one.
+The victim is whichever node ZooKeeper says is leading, never a fixed one; the
+suite has been run killing node B and killing node C.
+
+### One drive per node, and why that is not arbitrary
+
+MinIO assigns drives to erasure sets in **flat endpoint order**. With three
+drives per node it built three sets of three, each set living entirely on one
+node — so losing a node destroyed a whole set and the cluster went straight to
+`503`. With one drive per node the single set spans all three and survives.
+
+Real deployments never hit this because they write
+`http://minio-{a...c}:9000/d{1...N}` and MinIO interleaves across hosts itself.
+The host ellipsis requires the *same port on every node*, which a single-machine
+simulation cannot have — so here the endpoints are listed explicitly and the
+drive count per node does the spreading instead.
+
+Three further requirements, each of which failed loudly before it worked:
+`hostname:` must be set (MinIO decides what is "local" by resolving each
+endpoint and checking the IP is on a local interface — mapping the name to
+127.0.0.1 is explicitly rejected with *"resolves to localhost in a
+containerized deployment"*); the listen port must **equal** the published port,
+because MinIO compares ports too; and drives must be real mounts, not
+directories on the container root filesystem.
 
 ### Ask ZooKeeper who leads. Not the REST API.
 
@@ -230,23 +263,26 @@ mapping in the way. Set it explicitly, to a port you publish.
 
 ## 6. What still fails
 
-**The object store is one node, and that is the honest remaining gap.** MinIO
-runs on node A and `s3.endpoint` names it. Lose node A and the data is fine —
-Redis fails over, Kafka keeps serving, both JobManagers are alive — but there is
-nowhere to checkpoint to.
+No single node's loss stops this topology any more — Kafka, Redis, ZooKeeper,
+the JobManager and the object store all survive one. What is left is not a
+node-failure question:
 
-Distributed MinIO across the three nodes would fix the *durability* half and
-not the other half: Flink takes a single `s3.endpoint`, so the endpoint itself
-still has to be highly available, which means a load balancer or DNS failover
-in front of it. That is precisely what a managed object store is — S3 and GCS
-give you a regional endpoint with the availability already solved. Swapping
-MinIO for either is a credentials-and-URL change, not a code one; it is already
-how `s3.endpoint` is wired. Standing up an LB tier on a laptop to simulate
-something whose real answer is "use the managed service" would be theatre.
-
-Also still open, unchanged by this work: secrets are Compose environment
-variables with dev defaults, and the Feast private-API dependency
-([ADR-003](DECISIONS.md)).
+- **Secrets are Compose environment variables with dev defaults**, not a secret
+  store.
+- **The Feast private-API dependency** ([ADR-003](DECISIONS.md)); CI is the
+  tripwire.
+- **Only one node may be lost.** Three of anything tolerates one failure. The
+  object store in particular runs at parity 1, which is the most a three-node
+  pool can offer — losing a node leaves it with no redundancy until the node
+  returns, so a second failure during that window is data loss. Four nodes and
+  EC:2 is the first configuration that is comfortable rather than merely
+  correct.
+- **A real deployment should still use S3 or GCS rather than self-run MinIO.**
+  Not because of anything demonstrated here, but because the operational burden
+  of an object store — rebalancing, healing, capacity — is not one worth
+  carrying to save an API call. `s3.endpoint` already makes that a
+  credentials-and-URL change.
+- **Network partitions are not simulated at all** (§3).
 
 ## 7. Going to three real machines
 
@@ -327,3 +363,36 @@ mid-restart when it ran, it removes the containers, reports success, and skips
 the volumes. The stale Kafka logs then survive into the next run and the topic
 config you just set appears to have been ignored (`--if-not-exists` quietly
 keeps the old topic). `make mh-ha-clean` now sweeps by name and verifies.
+
+**ZooKeeper tells clients which port to use, and the client believes it over
+its own configuration.** Curator replaces its configured connection string with
+the ensemble's advertised addresses, which come from the `;clientPort` suffix
+in `server.N=host:2888:3888;2181`. Bind 2181 inside the container and publish
+12181, and every client dutifully learns `:2181` — a port Docker never mapped —
+and loops on `Connection refused` forever, while its own config plainly says
+12181. The advertised client port must EQUAL the published one, so each
+ZooKeeper binds its published port via `ZOO_PORT`.
+
+Worse, ZooKeeper 3.5+ **persists that ensemble config into its data directory**
+and prefers it over the static one on restart. Changing the ports therefore
+needs the ZooKeeper volumes dropped, not just the containers recreated —
+otherwise the fix appears to do nothing.
+
+**Flink's Kafka JAAS file breaks its own ZooKeeper client.** Flink writes a
+JAAS config for the Kafka SASL client; ZooKeeper's client finds it, looks for a
+section named `Client`, does not find one, and logs a `LoginException` saying it
+will continue *without* SASL — while Curator logs `ERROR ConnectionState -
+Authentication failed` and re-establishes the connection several times a
+second. On an idle box it survives that. Under load the session churn stops a
+JobManager from ever holding the leader latch, so failover silently never
+happens and nothing in the logs says "leadership". `zookeeper.sasl.disable:
+true` removes it — measured 3/second → 0.
+
+**A Kafka broker's resident size grows for as long as it runs.** Under a
+sustained producer these three went from ~390 MiB each to 2.2, 1.8 and 0.9 GiB
+over a few hours — about 5 GiB of the 7.75 GiB budget — with the heap pinned at
+320m the whole time. Flink then failed to start TaskManagers with `Could not
+create actor system`, naming nothing to do with memory. A **rolling restart of
+the brokers** took the VM from 7,377 MiB used to 3,717 and the TaskManagers
+registered immediately. On a memory-tight box, restart the brokers before
+concluding the topology does not fit.

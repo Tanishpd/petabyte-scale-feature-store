@@ -407,3 +407,41 @@ stays a **named** gap rather than a half-closed one.
 Compose cannot express that as an overlay — `profiles` MERGES rather than replaces, so an overlay
 declaring `profiles: [b]` on a service the base file put in `a` lands it in both. Verified with
 `docker compose config`, not assumed. Same reasoning that produced a separate file in ADR-012.
+
+---
+
+## ADR-014 — Distributed object storage, and node-local S3 endpoints instead of a load balancer
+
+**Decision.** The HA topology runs a MinIO member on every node, forming one erasure-coded pool, and
+each Flink process points `s3.endpoint` at the member on **its own node**. There is no load-balancer
+tier. Verified by `make mh-ha-drill`: **18/18**, including that the pool still accepts writes and Flink
+still completes checkpoints after a whole node is killed.
+
+**Supersedes ADR-013's rejection.** ADR-013 declined distributed MinIO on the reasoning that it would
+close durability but not endpoint availability, since Flink takes a single `s3.endpoint` that would then
+need an LB or DNS failover — "and building that on a laptop to simulate something whose real answer is
+'use the managed service' would be theatre". The reasoning had a hole: it assumed the client and the
+endpoint fail independently. They do not. If every Flink process uses the member co-located with it,
+then the only event that removes an endpoint — losing its node — also removes the clients that were
+using it. There is nothing left to orphan, so there is nothing for a load balancer to do. An LB tier
+would only cover "MinIO died but its node did not", which is a process failure that
+`restart: unless-stopped` already handles.
+
+**Erasure sets must span nodes, and that is not automatic.** MinIO assigns drives to sets in flat
+endpoint order. Three drives per node produced three sets of three, each set entirely on one node, so
+killing a node destroyed a whole set and the cluster went to `503` — durable-looking configuration,
+zero node tolerance. One drive per node forces the single set to span all three. Real deployments avoid
+the trap by writing `http://minio-{a...c}:9000/d{1...N}`, where MinIO interleaves across hosts itself;
+the host ellipsis needs identical ports on every node, which a one-machine simulation cannot provide.
+
+**Three more requirements, each found by hitting it:** `hostname:` must be set, because MinIO decides
+which endpoint is itself by resolving each one and checking the IP is on a local interface — pointing the
+name at 127.0.0.1 is explicitly refused ("resolves to localhost in a containerized deployment"); the
+listen port must equal the published port, because MinIO compares ports as well as addresses; and drives
+must be real mounts, not directories on the container root filesystem.
+
+**What this does not buy.** Parity 1 is the most a three-node pool offers: losing a node leaves no
+redundancy until it returns, so a second failure in that window loses data. Four nodes at EC:2 is the
+first comfortable configuration. A real deployment should still prefer S3/GCS — not for any property
+demonstrated here, but because running an object store is operational work that an API call avoids.
+`s3.endpoint` keeps that a credentials-and-URL change.
