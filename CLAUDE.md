@@ -112,7 +112,7 @@ make test          # pytest, includes the codec round-trip
 make mh-tls && make mh-up   # 3-node topology as 3 isolated compose projects
 make mh-drill      # kill a WHOLE node; 24 assertions. See docs/MULTIHOST.md
 make secrets       # generate docker/secrets/* — REQUIRED before mh-ha-up
-make mh-ha-up && make mh-ha-drill   # + ZK/standby JM; 21 assertions (MULTIHOST §5)
+make mh-ha-up && make mh-ha-drill   # + ZK/standby JM; 34 assertions (MULTIHOST §5)
 # ⚠️ mh and mh-ha must not run at once, and neither alongside the dev stack.
 redis-cli -p 6380 --scan --pattern '*' | head         # raw Feast keys (binary) — note 6380
 open http://localhost:8081                            # Flink UI: watch backpressure + watermarks
@@ -262,3 +262,44 @@ Invariant 4. Override with `REDIS_HOST_PORT=6379`.
   single set spans them. Real hosts use `http://minio-{a...c}:9000/d{1...N}` and MinIO interleaves
   itself, but the host ellipsis needs identical ports everywhere. MinIO also needs `hostname:` set (it
   refuses a name resolving to 127.0.0.1), listen port == published port, and real volume mounts.
+
+### Authorization (ADR-016)
+
+- **The Kafka CLI answers a DENIED call with silence too**, not just an unauthenticated one. A consumer
+  refused `Read` does not exit — it retries the fetch forever and logs nothing at the default level. So
+  a two-valued probe (`grep AuthorizationException || echo allowed`) reports a boundary *breach* when
+  the truth is "no answer", and takes unbounded wall-clock with it. Denial probes must be three-valued:
+  denied / allowed / **indeterminate**. `scripts/multihost_ha_drill.sh:probe()`.
+- **`timeout N cmd | other` bounds `cmd` only.** The shell parses the pipeline first, so a probe piping
+  into `kafka-console-producer` times out the `printf` and lets the JVM run forever. Write
+  `timeout -s KILL N sh -c '<whole pipeline>'` — coreutils `timeout` signals the child's whole process
+  group, so the JVM dies with the shell. Cost two 11-minute hangs before it was spotted.
+- **A drill that writes to the live topic must write SCHEMA-VALID JSON.** A marker string (`drill`, `x`)
+  parses as garbage, and the Flink source dies on `Unrecognized token`, re-reads the same offset from
+  its checkpoint, and restart-loops permanently — which on this box drove the load average past 160 and
+  made every later assertion fail for an unrelated reason. Use an event with an ancient
+  `event_timestamp` so it parses, counts as a write, and is dropped as late by the window.
+- **One malformed record kills the pipeline unless `--on-bad-record skip`.** `make mh-ha-submit` passes
+  it; the dev stack deliberately does not (a schema mismatch should be loud there). `skip` counts what
+  it drops — "tolerate but count" is the only safe version.
+- **No features after ONE bounded burst is not a sink failure.** The HOP window needs the watermark to
+  advance *past* the window end, and a burst that stops leaves the last windows unfired. Produce a
+  second burst before concluding the sink is broken — 250 s of polling an empty Redis was this, not a
+  bad ACL.
+- **Redis: `masterauth` alone authenticates as `default`.** With `user default off`, a replica
+  configured the old way fails to sync with `NOAUTH` and Sentinel never sees it come back. It needs
+  `masteruser` too — and Sentinel needs `sentinel auth-user` alongside `auth-pass`, which is a
+  *different* credential from the `requirepass` clients use to talk to the Sentinel itself.
+- **`redis-cli --user` becomes mandatory once `default` is off.** A bare `-a "$PW"` authenticates a
+  disabled user, so every probe reports the store as unreachable rather than as locked down — the
+  failure looks like "Redis is down", not "your script is wrong".
+- **The Kafka healthcheck spawns a JVM every 10 s per broker.** Three brokers = a JVM launch every
+  ~3.3 s forever, and under load the authenticated `kafka-broker-api-versions.sh` exceeds its own 10 s
+  timeout, so healthy brokers report `health: starting` indefinitely. Took 195 s to go healthy on a
+  settled box.
+- **Docker Desktop can be "manually paused"** and it presents exactly like a wedged daemon: every
+  `docker` call hangs, `docker.sock` exists, the backend processes are running. The error text only
+  appears on `docker version`. `docker desktop restart` clears it; there is no `resume` subcommand.
+- **This box cannot run the HA topology, the embedding pipeline, and JVM-spawning probes at once.**
+  18 containers + sentence-transformers + a drill peaked at load 302 on 6 VM CPUs and took the daemon
+  down with it. Produce a bounded burst, let it drain, *then* drill.

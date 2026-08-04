@@ -29,9 +29,12 @@ C="$MH -p petafs-ha-c --profile c"
 SECRETS=docker/secrets
 _secret() { [ -f "$SECRETS/$1" ] || { echo "missing $SECRETS/$1 — run 'make secrets'" >&2; exit 1; }; tr -d '\r\n' < "$SECRETS/$1"; }
 PW=$(_secret redis_password)
-KAFKA_PW=$(_secret kafka_password)
+KAFKA_PW=$(_secret kafka_admin_password)
 STOREPASS=$(_secret tls_storepass)
-RCLI="redis-cli --tls --cacert /tls/ca.crt"
+# --user is REQUIRED now that `default` is off — a bare `-a $PW` authenticates
+# as a disabled user, and every Redis probe in this drill would report the
+# store as unreachable rather than as locked down.
+RCLI="redis-cli --tls --cacert /tls/ca.crt --user petafs-admin"
 JM_B_PORT="${JM_B_REST_PORT:-8081}"
 JM_C_PORT="${JM_C_REST_PORT:-8082}"
 TOPIC="${TOPIC:-transactions}"
@@ -128,6 +131,77 @@ max_ttl() {
     2>/dev/null | tr -d '\r'
 }
 
+# Write a client config for an arbitrary principal, so the drill can ask "what
+# happens if THIS identity tries that" rather than only exercising the happy path.
+as_principal() {  # <principal> <secret-file>
+  docker exec petafs-mhha-kafka1 sh -c "cat > /tmp/$1.properties <<EOF
+security.protocol=SASL_SSL
+sasl.mechanism=PLAIN
+sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username=\"$1\" password=\"$(_secret "$2")\";
+ssl.truststore.location=/tls/kafka.truststore.jks
+ssl.truststore.password=$STOREPASS
+EOF" >/dev/null 2>&1
+}
+# Any *AuthorizationException is a denial; which one depends on the request the
+# client made first (a consumer trips GROUP before TOPIC, an idempotent producer
+# trips CLUSTER). Matching one specific exception would make the assertion
+# brittle for no gain.
+#
+# THREE-VALUED, and that is the load-bearing part. The Kafka CLI answers a call
+# it cannot complete with SILENCE, not an error — the same trap documented for
+# unauthenticated calls in docs/MULTIHOST.md §7, which also applies to a broker
+# that is merely too sick to reply. A denied consumer does not exit: it retries
+# the fetch forever and logs nothing at the default level. Two-valued logic
+# reads that silence as "no exception seen → allowed", i.e. it reports a
+# BOUNDARY BREACH when the truth is "no answer", and burns unbounded wall-clock
+# on the way: an early version of this drill sat on one such probe for 11
+# minutes before reporting a failure that had not happened.
+#
+# `timeout` runs INSIDE the container on purpose. Killing the `docker exec` from
+# the host leaves the JVM running, so the next probe queues behind a client that
+# is still hammering the broker we are trying to measure.
+#
+# It also has to wrap the WHOLE command, hence `timeout ... sh -c`. Written the
+# other way round — `sh -c "timeout N cmd | other"` — the shell parses the
+# pipeline first and `timeout` binds to the leftmost command only, so a probe
+# that pipes into kafka-console-producer bounds the `printf` and lets the JVM
+# run forever. That is not a hypothetical: it hung this drill for two minutes
+# per probe until the ordering was fixed. coreutils `timeout` puts its child in
+# its own process group and signals the group, so the JVM dies with the shell.
+#
+# 40s, not 25: every one of these probes pays a cold JVM start, and on a box
+# already running the pipeline that alone can exceed 20s. Too short a timeout
+# manufactures "indeterminate" verdicts that look like broker trouble.
+PROBE_TIMEOUT=${PROBE_TIMEOUT:-40}
+probe() {  # <shell-cmd> -> denied | allowed | indeterminate
+  local out rc
+  out=$(docker exec petafs-mhha-kafka1 timeout -s KILL "$PROBE_TIMEOUT" sh -c "$1" 2>&1); rc=$?
+  if printf '%s' "$out" | grep -qiE "AuthorizationException|not authorized"; then
+    echo denied
+  elif [ "$rc" -eq 137 ] || [ "$rc" -eq 124 ]; then
+    echo indeterminate
+  else
+    echo allowed
+  fi
+}
+# An indeterminate verdict fails the drill, but with its own wording: "the ACL
+# did not hold" and "the cluster never answered" need different fixes, and
+# collapsing them sends you to read ACLs when the real problem is a broker.
+must_deny() {   # <description> <shell-cmd>
+  case "$(probe "$2")" in
+    denied)        ok  "$1" ;;
+    allowed)       bad "$1 — IT SUCCEEDED" ;;
+    indeterminate) bad "$1 — no verdict in ${PROBE_TIMEOUT}s; broker degraded, not an ACL result" ;;
+  esac
+}
+must_allow() {  # <description> <shell-cmd>
+  case "$(probe "$2")" in
+    allowed)       ok  "$1" ;;
+    denied)        bad "$1 — it was REFUSED; the ACLs are too tight" ;;
+    indeterminate) bad "$1 — no verdict in ${PROBE_TIMEOUT}s; broker degraded, not an ACL result" ;;
+  esac
+}
+
 # ===========================================================================
 step "Drill 0 — the three nodes are isolated"
 # ===========================================================================
@@ -148,7 +222,7 @@ step "Drill 1 — credentials are not visible through the orchestrator"
 # at /run/secrets is visible only to the processes in that container.
 IDS=$(docker ps -q --filter name=petafs-mhha- 2>/dev/null)
 LEAKED=""
-for s in redis_password kafka_password tls_storepass minio_root_password; do
+for s in redis_password kafka_admin_password kafka_flink_password tls_storepass minio_root_password; do
   V=$(_secret "$s")
   [ -n "$IDS" ] && docker inspect $IDS 2>/dev/null | grep -qF -- "$V" && LEAKED="$LEAKED $s"
 done
@@ -170,7 +244,140 @@ else
 fi
 
 # ===========================================================================
-step "Drill 2 — the HA machinery is formed across the three nodes"
+step "Drill 2 — authentication is not authorization"
+# ===========================================================================
+# SASL proves who a client is. Without an authorizer it then permits everything
+# that identity might ask for, including deleting the topic the whole pipeline
+# depends on. These assert the boundary in both directions: the happy path must
+# still work, and everything outside it must not.
+as_principal petafs-admin kafka_admin_password
+as_principal petafs-producer kafka_producer_password
+as_principal petafs-flink kafka_flink_password
+
+# What the write probes put on the wire. It has to be a SCHEMA-VALID event, not
+# a marker string: this is the live `transactions` topic, and the Flink source
+# deserializes JSON. A probe that wrote `drill` poisoned the stream — the job
+# died on `Unrecognized token 'drill'`, entered a restart loop, and every later
+# assertion in this drill then failed for a reason that had nothing to do with
+# what it was testing. The positive control must prove the WRITE is permitted
+# without changing what the pipeline computes.
+#
+# event_timestamp is deliberately ancient, so the record parses, counts as a
+# write, and is then dropped as late by the window — it can never perturb a
+# feature value the later drills assert on.
+PROBE_EVENT='{"event_id":"drill-probe-000000001","user_id":1,"merchant_id":1,"merchant_name":"drill-probe","merchant_category":"drill-probe","amount":1.0,"currency":"USD","country":"US","device":"drill-probe","is_card_present":true,"event_timestamp":"2000-01-01T00:00:00.000"}'
+
+# Positive controls first. A rule set that denies everything would pass every
+# negative assertion below while leaving the pipeline dead, so each principal's
+# real job is asserted before its limits are.
+must_allow "producer principal CAN write $TOPIC" \
+  "printf '%s\n' '$PROBE_EVENT' | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server localhost:9092 --topic $TOPIC --producer.config /tmp/petafs-producer.properties"
+# Reads a partition directly rather than joining a group: this isolates the
+# TOPIC Read permission instead of tripping over the group ACL first, so the
+# allowed and denied cases below differ in exactly one thing.
+#
+# WHICH partition has to be discovered, not assumed. console-producer leaves the
+# choice to the partitioner, so the record just written can land on any of the
+# three — and a `--partition 0` that happens to be empty blocks forever, which
+# this drill would then (correctly, but uselessly) report as "the broker never
+# answered". Ask for a partition whose end offset is non-zero instead.
+READ_PART=$(docker exec petafs-mhha-kafka1 timeout -s KILL "$PROBE_TIMEOUT" \
+  /opt/kafka/bin/kafka-get-offsets.sh --bootstrap-server localhost:9092 --topic "$TOPIC" \
+  --command-config /tmp/petafs-admin.properties 2>/dev/null | awk -F: '$3 > 0 { print $2; exit }')
+READ_PART=${READ_PART:-0}
+must_allow "flink principal CAN read $TOPIC (partition $READ_PART)" \
+  "/opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic $TOPIC --partition $READ_PART --offset earliest --max-messages 1 --consumer.config /tmp/petafs-flink.properties"
+
+# ...and now the limits. Same command as the positive control above, different
+# identity.
+must_deny "producer principal CANNOT read $TOPIC (partition $READ_PART)" \
+  "/opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic $TOPIC --partition $READ_PART --offset earliest --max-messages 1 --consumer.config /tmp/petafs-producer.properties"
+must_deny "producer principal CANNOT delete $TOPIC" \
+  "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --delete --topic $TOPIC --command-config /tmp/petafs-producer.properties"
+# Same valid payload as the positive control: if this ACL ever regressed, the
+# drill would report the breach WITHOUT also poisoning the topic on its way out.
+must_deny "flink principal CANNOT write $TOPIC (read-only consumer)" \
+  "printf '%s\n' '$PROBE_EVENT' | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server localhost:9092 --topic $TOPIC --producer.config /tmp/petafs-flink.properties"
+# The delete must have been REFUSED, not merely errored — an exception in the
+# client proves nothing about what the broker did.
+kbin_exists=$(docker exec petafs-mhha-kafka1 timeout -s KILL "$PROBE_TIMEOUT" \
+  /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list \
+  --command-config /tmp/petafs-admin.properties 2>/dev/null | grep -c "^$TOPIC$")
+[ "${kbin_exists:-0}" -eq 1 ] && ok "$TOPIC survived the unauthorized delete attempt" \
+                             || bad "$TOPIC is gone — a delete succeeded"
+
+# --- and the same question, asked of Redis ---------------------------------
+#
+# Kafka was only half the gap. The online store held ONE password with full
+# command access, so every component that could write a feature could also read
+# the whole keyspace or FLUSHALL it. These assert the split from the outside:
+# by what each credential can actually do, not by reading the ACL file back
+# (which would only prove the file says what we wrote in it).
+#
+# No timeout wrapper needed here — redis-cli answers or fails immediately. The
+# silent-retry problem that forced the three-valued probe() above is a Kafka
+# client behaviour, not a Redis one.
+rprobe() {  # <user> <secret-file> <args...> -> the server's reply, or NOAUTH/NOPERM
+  local u="$1" s="$2"; shift 2
+  docker exec "$RMASTER" redis-cli --tls --cacert /tls/ca.crt \
+    --user "$u" -a "$(_secret "$s")" --no-auth-warning "$@" 2>&1 | tr -d '\r'
+}
+RMASTER=$(redis_master_container)
+if [ -z "$RMASTER" ]; then
+  bad "no Redis master reachable — cannot assert the online store's ACLs"
+else
+  note "asserting Redis ACLs against the current master (${RMASTER#petafs-mhha-})"
+
+  # `default` is the account a client gets without asking for one. If it is
+  # still enabled, every rule below is decoration.
+  D=$(docker exec "$RMASTER" redis-cli --tls --cacert /tls/ca.crt \
+        -a "$(_secret redis_password)" --no-auth-warning PING 2>&1 | tr -d '\r')
+  case "$D" in
+    *WRONGPASS*|*NOAUTH*|*disabled*|*"no password"*)
+      ok "the default Redis user is disabled (answered: $(printf '%s' "$D" | head -c 40))" ;;
+    PONG) bad "the default Redis user still works — one password is still full access" ;;
+    *)    bad "unexpected reply from the default user: $D" ;;
+  esac
+
+  # Positive control: the sink's own credential must still do the sink's job,
+  # or a "secure" store is just a broken one.
+  W=$(rprobe petafs-flink redis_flink_password HSET petafs:drill:probe f v)
+  case "$W" in
+    0|1) ok "petafs-flink CAN write a feature hash (HSET -> $W)" ;;
+    *)   bad "petafs-flink cannot HSET: $W" ;;
+  esac
+  E=$(rprobe petafs-flink redis_flink_password EXPIRE petafs:drill:probe 60)
+  [ "$E" = "1" ] && ok "petafs-flink CAN set a TTL (EXPIRE -> 1)" \
+                 || bad "petafs-flink cannot EXPIRE: $E"
+
+  # ...and nothing else. FLUSHALL is the one that matters: it is the difference
+  # between a leaked TaskManager credential costing you a restart and costing
+  # you the entire online store.
+  F=$(rprobe petafs-flink redis_flink_password FLUSHALL)
+  case "$F" in
+    *NOPERM*) ok "petafs-flink CANNOT FLUSHALL the online store" ;;
+    *)        bad "petafs-flink was allowed to FLUSHALL: $F" ;;
+  esac
+  S=$(rprobe petafs-flink redis_flink_password SCAN 0)
+  case "$S" in
+    *NOPERM*) ok "petafs-flink CANNOT SCAN the keyspace it writes to" ;;
+    *)        bad "petafs-flink was allowed to SCAN: $(printf '%s' "$S" | head -c 60)" ;;
+  esac
+  # The serving path reads. It must not be able to rewrite what it reads.
+  R=$(rprobe petafs-reader redis_reader_password HGET petafs:drill:probe f)
+  [ "$R" = "v" ] && ok "petafs-reader CAN read a feature (HGET -> $R)" \
+                 || bad "petafs-reader cannot HGET: $R"
+  RW=$(rprobe petafs-reader redis_reader_password HSET petafs:drill:probe f tampered)
+  case "$RW" in
+    *NOPERM*) ok "petafs-reader CANNOT write to the online store" ;;
+    *)        bad "petafs-reader was allowed to HSET: $RW" ;;
+  esac
+  docker exec "$RMASTER" redis-cli --tls --cacert /tls/ca.crt --user petafs-admin \
+    -a "$(_secret redis_password)" --no-auth-warning DEL petafs:drill:probe >/dev/null 2>&1
+fi
+
+# ===========================================================================
+step "Drill 3 — the HA machinery is formed across the three nodes"
 # ===========================================================================
 MODES=$(for n in 1 2 3; do zk_mode "petafs-mhha-zk$n"; done | sort | tr '\n' ' ')
 LEADERS=$(echo "$MODES" | tr ' ' '\n' | grep -c '^leader$')
@@ -230,7 +437,7 @@ JOB=$(running_job "$LP")
               || note "no running job — 'make mh-ha-submit' first; recovery cannot be asserted"
 
 # ===========================================================================
-step "Drill 3 — kill the node running the LEADING JobManager"
+step "Drill 4 — kill the node running the LEADING JobManager"
 # ===========================================================================
 if [ -z "$JOB" ]; then
   note "skipped: no running job to recover"

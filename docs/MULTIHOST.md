@@ -194,11 +194,21 @@ cannot be orphaned by its endpoint dying, because that endpoint dies only when
 the node running the client dies. An LB tier would only cover "MinIO died but
 its node did not", which is a process failure `restart: unless-stopped` handles.
 
-### Measured — `make mh-ha-drill`, 21/21
+### Measured — `make mh-ha-drill`, 34/34
 
 | Assertion | Result |
 |---|---|
 | No credential in `docker inspect` or `docker compose config` | absent, while mounted where needed |
+| Producer principal **can** write `transactions` | positive control — asserted first |
+| Flink principal **can** read `transactions` | positive control, same command, different identity |
+| Producer principal cannot **read** `transactions` | denied |
+| Producer principal cannot **delete** `transactions` | denied; topic still there afterwards |
+| Flink principal cannot **write** `transactions` | denied — it is a read-only consumer |
+| Redis `default` user | **disabled** (`WRONGPASS`) |
+| `petafs-flink` can `HSET` + `EXPIRE` | positive control — the sink's actual job |
+| `petafs-flink` cannot `FLUSHALL` | `NOPERM` |
+| `petafs-flink` cannot `SCAN` the keyspace it writes to | `NOPERM` |
+| `petafs-reader` can `HGET`, cannot `HSET` | read-only confirmed both ways |
 | ZooKeeper ensemble spans three nodes | 1 leader, 2 followers |
 | Both JobManagers live, exactly one leader | per ZooKeeper, not per REST |
 | Job graph reached the HA store | `submittedExecutionPlan` + blob in `s3://flink-ha` |
@@ -290,14 +300,51 @@ into. Note also that `docker-compose.prod.yml` and `docker-compose.multihost.yml
 have *not* been converted — see [ADR-015](DECISIONS.md) for why that is a
 deliberate stopping point rather than an oversight.
 
+### Authentication is not authorization
+
+Making a credential unreadable and unforgeable says nothing about what it may
+*do*. Until [ADR-016](DECISIONS.md) the whole topology shared two secrets, and
+each was effectively root: anything that could produce to `transactions` could
+delete it, and anything that could write a feature could `FLUSHALL` the online
+store. Now every component has its own identity and a rule set naming exactly
+what it needs.
+
+Kafka runs `StandardAuthorizer` with `allow.everyone.if.no.acl.found=false`;
+`make mh-ha-acls` adds the four rules. Redis runs with `user default off` and
+five users written by `docker/redis/write-acl.sh` — **both** data nodes write
+the identical file, because roles swap on failover and a per-role rule set is
+wrong the moment it matters.
+
+Two things that fail silently if you get them wrong:
+
+- A replica needs `masteruser`, not just `masterauth`. `masterauth` alone
+  authenticates as `default`, which is off, so replication stops with `NOAUTH`.
+- Sentinel needs *two* credentials: `requirepass` is what a client presents to
+  talk to the Sentinel; `sentinel auth-user`/`auth-pass` is the much narrower
+  identity Sentinel presents to the instances it monitors.
+
+Drill 2 asserts thirteen boundaries by attempting each operation with the real
+credential — never by listing the rules back, which would only prove the file
+says what we wrote in it. It asserts the **positive** controls first: a rule set
+that denies everything passes every negative assertion while leaving the
+pipeline dead.
+
+One trap is worth repeating from §8: a denied Kafka consumer does not error, it
+retries forever in silence. A two-valued "did we see an exception?" probe reads
+that as *allowed* — reporting a breach that did not happen, after hanging for as
+long as you let it.
+
 ## 6. What still fails
 
 No single node's loss stops this topology any more — Kafka, Redis, ZooKeeper,
 the JobManager and the object store all survive one. What is left is not a
 node-failure question:
 
-- **Secrets are Compose environment variables with dev defaults**, not a secret
-  store.
+- **Credentials are files on disk, not a secret manager.** Nothing rotates,
+  expires or is audited ([ADR-015](DECISIONS.md)).
+- **Authorization rules are static and not scoped by host.** Every ACL is
+  `host=*`; a stolen credential works from anywhere that can reach the port
+  ([ADR-016](DECISIONS.md)).
 - **The Feast private-API dependency** ([ADR-003](DECISIONS.md)); CI is the
   tripwire.
 - **Only one node may be lost.** Three of anything tolerates one failure. The

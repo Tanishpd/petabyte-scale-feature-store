@@ -36,7 +36,7 @@ endif
         prod-up prod-down prod-clean prod-ps prod-submit prod-drill prod-tls \
         mh-up mh-down mh-clean mh-ps mh-health mh-tls mh-topics mh-produce mh-submit mh-drill \
         mh-ha-up mh-ha-down mh-ha-clean mh-ha-ps mh-ha-health mh-ha-topics mh-ha-produce \
-        mh-ha-submit mh-ha-drill
+        mh-ha-submit mh-ha-drill mh-ha-acls
 
 help:  ## Show this help
 	@echo "Petabyte-Scale Feature Store — available targets:"
@@ -358,21 +358,32 @@ mh-ha-health:  ## ZooKeeper quorum, JobManager leadership, cluster formation
 mh-ha-topics:  ## Create the transactions topic at RF=3 on the HA topology
 	@bash scripts/multihost_ha_health.sh --create-topic $(TOPIC) $(PARTITIONS)
 
+mh-ha-acls:  ## Apply least-privilege Kafka ACLs (deny-by-default is already on)
+	@bash scripts/multihost_ha_health.sh --apply-acls $(TOPIC) petafs-flink
+
 mh-ha-produce:  ## Produce into the HA topology from this Mac (HOST listeners)
-	@test -f docker/secrets/kafka_password || { echo "No secrets — run 'make secrets'."; exit 1; }
+	@test -f docker/secrets/kafka_producer_password || { echo "No secrets — run 'make secrets'."; exit 1; }
 	@# KAFKA_PASSWORD_FILE, not KAFKA_PASSWORD: the value never enters this
 	@# process's environment, so it cannot leak via `ps -e` or a crash dump.
 	@# contracts/secrets.py resolves it.
 	KAFKA_SECURITY_PROTOCOL=SASL_SSL KAFKA_SASL_MECHANISM=PLAIN \
-	KAFKA_USER=petafs KAFKA_PASSWORD_FILE=docker/secrets/kafka_password \
+	KAFKA_USER=petafs-producer KAFKA_PASSWORD_FILE=docker/secrets/kafka_producer_password \
 	KAFKA_SSL_CAFILE=docker/tls/out/ca.crt \
 	$(PY) src/producer/generate_stream.py --bootstrap localhost:19094,localhost:19194,localhost:19294 \
 	  --topic $(TOPIC) --eps $(or $(EPS),400) $(if $(DURATION),--duration $(DURATION),) \
 	  --acks all --users $(or $(USERS),400)
 
 mh-ha-submit:  ## Submit the pipeline against the HA topology
+	@# --on-bad-record skip, unlike the dev stack. streaming_job.py argues the
+	@# case in full: a schema mismatch must be LOUD in development, and in
+	@# production one malformed record must not stop the pipeline. This topology
+	@# is the production one, and the difference is not academic — a single
+	@# unparseable byte on the topic put the job in a permanent restart loop
+	@# (it re-reads the same offset from its checkpoint and dies again), which
+	@# on this box took the load average past 160. `skip` counts what it drops.
 	$(MHHA_B) exec -T jobmanager flink run -d -py /opt/project/src/flink/streaming_job.py \
 	  --no-wait --sink redis --bootstrap $(MHHA_KAFKA) --topic $(TOPIC) \
+	  --on-bad-record $(or $(ON_BAD_RECORD),skip) \
 	  $(if $(FROM_START),--startup-mode earliest-offset,)
 
 mh-ha-drill:  ## Kill the LEADING JobManager's whole node; assert automatic recovery

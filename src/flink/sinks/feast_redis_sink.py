@@ -42,6 +42,23 @@ REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
 #: never reaches `docker inspect`. See contracts/secrets.py.
 REDIS_PASSWORD = read_secret("REDIS_PASSWORD") or None
 
+#: Which Redis ACL user to authenticate as. Empty means the `default` user,
+#: which is what the dev stack (a single `requirepass`) still uses.
+#:
+#: The HA topology sets this to `petafs-flink`, whose grants are exactly the
+#: three commands below — HGET for the staleness guard, HSET, EXPIRE. Leaving
+#: it empty there does NOT fall back to something weaker: `default` is `off` on
+#: those nodes, so the connection is refused outright rather than silently
+#: connecting with more privilege than intended.
+REDIS_USER = os.environ.get("REDIS_USER", "").strip() or None
+
+#: Sentinel is a SEPARATE credential from the data connection. The sentinels
+#: keep their own `requirepass` and know nothing of the data nodes' ACL users,
+#: so reusing REDIS_PASSWORD here would authenticate the discovery connection
+#: with the sink's data password and fail before a master is ever resolved.
+#: Falls back to REDIS_PASSWORD for the dev stack, where they are the same.
+REDIS_SENTINEL_PASSWORD = read_secret("REDIS_SENTINEL_PASSWORD") or REDIS_PASSWORD
+
 #: Sentinel discovery for the production topology. Writing to a fixed host would
 #: undo the failover the topology exists to provide: after a promotion the old
 #: primary is gone (or demoted to a read-only replica) and every write fails
@@ -98,21 +115,29 @@ class FeastRedisWriter(MapFunction):
             # The sentinels themselves are TLS too, so sentinel_kwargs needs the
             # same settings — otherwise discovery fails while the data
             # connection would have worked.
+            # Discovery talks to the SENTINELS, so it carries the sentinel
+            # credential and no username: the sentinels authenticate their own
+            # `default` user via requirepass and have no ACL users at all.
+            # Passing REDIS_USER here would make discovery fail with an error
+            # about a user the sentinel has never heard of, long before the
+            # data connection this is all for gets a chance to work.
             sentinel_kwargs = dict(tls)
-            if REDIS_PASSWORD:
-                sentinel_kwargs["password"] = REDIS_PASSWORD
+            if REDIS_SENTINEL_PASSWORD:
+                sentinel_kwargs["password"] = REDIS_SENTINEL_PASSWORD
             sentinel = Sentinel(
                 nodes,
                 socket_timeout=5,
-                password=REDIS_PASSWORD,
+                password=REDIS_SENTINEL_PASSWORD,
                 sentinel_kwargs=sentinel_kwargs,
                 **tls,
             )
             # master_for() re-resolves on every failover, so a promotion costs a
-            # reconnect rather than a stream of READONLY errors.
+            # reconnect rather than a stream of READONLY errors. THIS one is the
+            # data connection, so it carries the ACL user.
             self._client = sentinel.master_for(
                 REDIS_SENTINEL_MASTER,
                 socket_timeout=5,
+                username=REDIS_USER,
                 password=REDIS_PASSWORD,
                 health_check_interval=30,
                 **tls,
@@ -120,6 +145,7 @@ class FeastRedisWriter(MapFunction):
         else:
             self._client = redis.Redis(
                 host=REDIS_HOST, port=REDIS_PORT,
+                username=REDIS_USER,
                 password=REDIS_PASSWORD,
                 socket_timeout=5, socket_connect_timeout=5,
                 health_check_interval=30,

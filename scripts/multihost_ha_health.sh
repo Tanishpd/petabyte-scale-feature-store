@@ -16,9 +16,12 @@ cd "$(dirname "$0")/.."
 SECRETS=docker/secrets
 _secret() { [ -f "$SECRETS/$1" ] || { echo "missing $SECRETS/$1 — run 'make secrets'" >&2; exit 1; }; tr -d '\r\n' < "$SECRETS/$1"; }
 PW=$(_secret redis_password)
-KAFKA_PW=$(_secret kafka_password)
+KAFKA_PW=$(_secret kafka_admin_password)
 STOREPASS=$(_secret tls_storepass)
-RCLI="redis-cli --tls --cacert /tls/ca.crt"
+# --user is now REQUIRED, not decoration: `default` is off on the data nodes,
+# so a bare `-a $PW` authenticates as a disabled user and every probe below
+# comes back as though Redis were down. See docker/redis/write-acl.sh.
+RCLI="redis-cli --tls --cacert /tls/ca.crt --user petafs-admin"
 K1=petafs-mhha-kafka1
 JM_B_PORT="${JM_B_REST_PORT:-8081}"
 JM_C_PORT="${JM_C_REST_PORT:-8082}"
@@ -27,7 +30,7 @@ kafka_conf() {
   docker exec "$K1" sh -c "cat > /tmp/mh.properties <<'EOF'
 security.protocol=SASL_SSL
 sasl.mechanism=PLAIN
-sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username=\"${KAFKA_USER:-petafs}\" password=\"$KAFKA_PW\";
+sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username=\"petafs-admin\" password=\"$KAFKA_PW\";
 ssl.truststore.location=/tls/kafka.truststore.jks
 ssl.truststore.password=$STOREPASS
 EOF" >/dev/null 2>&1
@@ -44,6 +47,31 @@ kbin() {
 # catching: each node looks individually healthy while being alone.
 zk_mode() { docker exec "$1" sh -c 'echo mntr | nc -w 2 localhost $ZOO_PORT' 2>/dev/null \
               | awk -F'\t' '/zk_server_state/ {print $2}' | tr -d '\r'; }
+
+if [ "${1:-}" = "--apply-acls" ]; then
+  TOPIC="${2:-transactions}"
+  GROUP="${3:-petafs-flink}"
+  # Least privilege, one rule per thing a principal actually does.
+  #
+  # petafs-broker and petafs-admin are super users (KAFKA_SUPER_USERS) and need
+  # no rules. Everything else is denied unless named here, because
+  # allow.everyone.if.no.acl.found is false.
+  #
+  # The producer may WRITE the topic and DESCRIBE it (the client fetches
+  # metadata before its first send). It may NOT read it, and may not touch any
+  # other topic or create one.
+  kbin kafka-acls.sh --add --allow-principal User:petafs-producer \
+      --operation Write --operation Describe --topic "$TOPIC" >/dev/null
+  # Flink may READ the topic and commit offsets under its own group only. A
+  # group ACL that used * would let any consumer hijack another's offsets.
+  kbin kafka-acls.sh --add --allow-principal User:petafs-flink \
+      --operation Read --operation Describe --topic "$TOPIC" >/dev/null
+  kbin kafka-acls.sh --add --allow-principal User:petafs-flink \
+      --operation Read --operation Describe --group "$GROUP" >/dev/null
+  echo "ACLs on '$TOPIC' and group '$GROUP':"
+  kbin kafka-acls.sh --list --topic "$TOPIC" 2>/dev/null | sed 's/^/  /' | head -12
+  echo
+fi
 
 if [ "${1:-}" = "--create-topic" ]; then
   # Deliberately tiny retention, and fewer partitions than the non-HA topology.

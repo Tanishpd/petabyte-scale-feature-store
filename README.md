@@ -149,6 +149,7 @@ Both are in [docs/MULTIHOST.md](docs/MULTIHOST.md).
 | Credentials in env vars with dev defaults | **Mounted files, no defaults** — `make secrets`, and the code resolves `${VAR}_FILE` first | Grepped every container's `docker inspect` and `docker compose config` for each secret: **absent**, while the file *is* present inside the container that needs it |
 | **Everything on one host** | **Three nodes, separate failure domains** — routable addressing throughout, mTLS on the KRaft quorum | Killed the whole node running the job: rescheduled onto another node, restored from `s3://.../chk-4`, zero data loss, features still writing. Killed the Redis primary's node: promoted across hosts. **24/24** ([MULTIHOST](docs/MULTIHOST.md)) |
 | **The JobManager and the object store were single points of failure** | **ZooKeeper ensemble + standby JobManager + object store distributed across all three nodes**, each Flink process using its node-local S3 endpoint | Killed the whole node holding the *leading* JobManager: leadership moved automatically, the pipeline recovered **with no resubmission and the same job id**, restored from `s3://.../chk-2`, the pool **kept accepting writes** at 2 of 3 drives, and checkpoints kept completing into it. **18/18** |
+| **Authenticated meant root.** Two shared secrets, each of them unlimited: anything that could produce to `transactions` could delete it, and anything that could write a feature could `FLUSHALL` the store | **Per-component identities with least-privilege rules.** Kafka `StandardAuthorizer`, deny-by-default, four principals; Redis `user default off` and five ACL users | Every boundary attempted with the real credential, not read back from config: producer **denied** read + delete, Flink **denied** write, `petafs-flink` **denied** `FLUSHALL` and `SCAN`, `petafs-reader` **denied** every write — while the pipeline kept running on those same credentials. **34/34** ([ADR-016](docs/DECISIONS.md)) |
 
 **Still open, honestly:**
 
@@ -171,6 +172,12 @@ Both are in [docs/MULTIHOST.md](docs/MULTIHOST.md).
   audits; the file sits on a host filesystem. It is the interface one plugs
   into — point the paths at a K8s projected secret or a Vault agent and no
   service config changes.
+- **Authorization rules are static and not scoped by host.** Every ACL is
+  `host=*`, so a stolen credential works from anywhere that can reach the port,
+  and the rules themselves are files edited by hand rather than anything
+  generated from a policy. Only the HA topology has them at all — the dev stack
+  keeps one `requirepass`, deliberately, because its job is to start
+  ([ADR-016](docs/DECISIONS.md)).
 - **Feast internals dependency** ([ADR-003](docs/DECISIONS.md)). CI is the
   tripwire; a supported path would be `write_to_online_store`, at the cost of a hop.
 - **One unexplained behaviour**: a long-lived `FeatureStore` drifts 2.7× over 200

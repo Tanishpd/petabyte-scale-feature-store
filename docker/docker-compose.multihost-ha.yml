@@ -62,12 +62,26 @@ name: petafs-mh-ha
 secrets:
   redis_password:
     file: ./secrets/redis_password
-  kafka_password:
-    file: ./secrets/kafka_password
+  kafka_broker_password:
+    file: ./secrets/kafka_broker_password
+  kafka_admin_password:
+    file: ./secrets/kafka_admin_password
+  kafka_producer_password:
+    file: ./secrets/kafka_producer_password
+  kafka_flink_password:
+    file: ./secrets/kafka_flink_password
   tls_storepass:
     file: ./secrets/tls_storepass
   minio_root_password:
     file: ./secrets/minio_root_password
+  redis_flink_password:
+    file: ./secrets/redis_flink_password
+  redis_reader_password:
+    file: ./secrets/redis_reader_password
+  redis_repl_password:
+    file: ./secrets/redis_repl_password
+  redis_sentinel_password:
+    file: ./secrets/redis_sentinel_password
 
 x-kafka-common: &kafka-common
   image: apache/kafka:4.3.1
@@ -79,17 +93,29 @@ x-kafka-common: &kafka-common
       # Read the credentials from the mounted files and export them where the
       # image's own runner expects them. Nothing here is visible to
       # `docker inspect`, because none of it came from `environment:`.
-      KP=$$(cat /run/secrets/kafka_password)
+      BROKER_PW=$$(cat /run/secrets/kafka_broker_password)
+      ADMIN_PW=$$(cat /run/secrets/kafka_admin_password)
+      PROD_PW=$$(cat /run/secrets/kafka_producer_password)
+      FLINK_PW=$$(cat /run/secrets/kafka_flink_password)
       SP=$$(cat /run/secrets/tls_storepass)
-      U="$${KAFKA_USER:-petafs}"
-      JAAS="org.apache.kafka.common.security.plain.PlainLoginModule required username=\"$$U\" password=\"$$KP\" user_$$U=\"$$KP\";"
+      # The broker authenticates to its peers as petafs-broker, and knows the
+      # password of every principal that may connect to it. SASL/PLAIN keeps
+      # its user table inline like this; SCRAM would keep it in the metadata
+      # log instead, which is the better production answer but has a
+      # bootstrap-ordering problem on a cluster that is still forming.
+      JAAS="org.apache.kafka.common.security.plain.PlainLoginModule required \
+        username=\"petafs-broker\" password=\"$$BROKER_PW\" \
+        user_petafs-broker=\"$$BROKER_PW\" \
+        user_petafs-admin=\"$$ADMIN_PW\" \
+        user_petafs-producer=\"$$PROD_PW\" \
+        user_petafs-flink=\"$$FLINK_PW\";"
       export KAFKA_LISTENER_NAME_BROKER_PLAIN_SASL_JAAS_CONFIG="$$JAAS"
       export KAFKA_LISTENER_NAME_HOST_PLAIN_SASL_JAAS_CONFIG="$$JAAS"
       export KAFKA_SSL_KEYSTORE_PASSWORD="$$SP"
       export KAFKA_SSL_KEY_PASSWORD="$$SP"
       export KAFKA_SSL_TRUSTSTORE_PASSWORD="$$SP"
       exec /etc/kafka/docker/run
-  secrets: [kafka_password, tls_storepass]
+  secrets: [kafka_broker_password, kafka_admin_password, kafka_producer_password, kafka_flink_password, tls_storepass]
   environment: &kafka-env
     KAFKA_PROCESS_ROLES: broker,controller
     KAFKA_CONTROLLER_QUORUM_VOTERS: >-
@@ -98,6 +124,20 @@ x-kafka-common: &kafka-common
     KAFKA_INTER_BROKER_LISTENER_NAME: BROKER
     KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
     KAFKA_LISTENER_NAME_CONTROLLER_SSL_CLIENT_AUTH: required
+    # AUTHENTICATION IS NOT AUTHORIZATION. Without an authorizer, SASL proves
+    # who a client is and then permits everything it might ask for: read any
+    # topic, write any topic, create or delete topics. StandardAuthorizer is
+    # the KRaft-native one (no ZooKeeper involved).
+    KAFKA_AUTHORIZER_CLASS_NAME: org.apache.kafka.metadata.authorizer.StandardAuthorizer
+    # Deny by default. `true` here would mean "allow anything nobody has
+    # written a rule about", which quietly reintroduces the gap the authorizer
+    # exists to close.
+    KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND: "false"
+    # Semicolon-separated. The brokers must be super users or inter-broker
+    # replication is itself denied and the cluster never forms; the CN= entries
+    # are the controllers, whose principal comes from their mTLS certificate
+    # rather than from SASL.
+    KAFKA_SUPER_USERS: User:petafs-broker;User:petafs-admin;User:CN=kafka1;User:CN=kafka2;User:CN=kafka3
     KAFKA_SSL_TRUSTSTORE_LOCATION: /tls/kafka.truststore.jks
     KAFKA_SSL_ENDPOINT_IDENTIFICATION_ALGORITHM: https
     KAFKA_SASL_ENABLED_MECHANISMS: PLAIN
@@ -123,7 +163,7 @@ x-kafka-healthcheck: &kafka-healthcheck
   test:
     - CMD-SHELL
     - |
-      printf 'security.protocol=SASL_SSL\nsasl.mechanism=PLAIN\nsasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="%s" password="%s";\nssl.truststore.location=/tls/kafka.truststore.jks\nssl.truststore.password=%s\n' "$${KAFKA_USER:-petafs}" "$$(cat /run/secrets/kafka_password)" "$$(cat /run/secrets/tls_storepass)" > /tmp/hc.properties
+      printf 'security.protocol=SASL_SSL\nsasl.mechanism=PLAIN\nsasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="%s" password="%s";\nssl.truststore.location=/tls/kafka.truststore.jks\nssl.truststore.password=%s\n' "petafs-admin" "$$(cat /run/secrets/kafka_admin_password)" "$$(cat /run/secrets/tls_storepass)" > /tmp/hc.properties
       /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 --command-config /tmp/hc.properties >/dev/null 2>&1
   interval: 10s
   timeout: 10s
@@ -133,9 +173,20 @@ x-kafka-healthcheck: &kafka-healthcheck
 x-redis-common: &redis-common
   image: redis/redis-stack-server:7.4.0-v8
   restart: unless-stopped
-  secrets: [redis_password]
+  secrets:
+    - redis_password
+    - redis_flink_password
+    - redis_reader_password
+    - redis_repl_password
+    - redis_sentinel_password
   extra_hosts:
     - "host.docker.internal:host-gateway"
+
+# Primary and replica share one ACL script (docker/redis/write-acl.sh) rather
+# than each embedding its own copy, because ROLES SWAP: after a failover the
+# promoted replica must already know every user, and the demoted master must be
+# able to authenticate outward as petafs-repl. Two copies of a rule set that
+# has to be identical is a divergence waiting for the one moment it matters.
 
 # ZooKeeper is what makes JobManager HA possible: it holds the leader latch and
 # the pointers to the job graph in the HA store. Three of them, one per node —
@@ -231,12 +282,9 @@ services:
       - sh
       - -c
       - |
-        PW=$$(cat /run/secrets/redis_password)
         CONF=/data/redis.conf
         if [ ! -f "$$CONF" ]; then
           cat > "$$CONF" <<EOF
-        requirepass $$PW
-        masterauth $$PW
         appendonly yes
         dir /data
         port 0
@@ -250,13 +298,15 @@ services:
         replica-announce-port ${REDIS_A_PORT:-6379}
         EOF
         fi
+        /usr/local/bin/write-acl.sh "$$CONF"
         exec redis-server "$$CONF"
     ports: ["${REDIS_A_PORT:-6379}:6379"]
     volumes:
       - redis-primary-data:/data
       - ./tls/out:/tls:ro
+      - ./redis/write-acl.sh:/usr/local/bin/write-acl.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli --tls --cacert /tls/ca.crt -a \"$$(cat /run/secrets/redis_password)\" ping | grep -q PONG"]
+      test: ["CMD-SHELL", "redis-cli --tls --cacert /tls/ca.crt --user petafs-admin -a \"$$(cat /run/secrets/redis_password)\" ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
       retries: 12
@@ -270,7 +320,13 @@ services:
       - sh
       - -c
       - |
+        # Two different credentials, and the distinction matters. PW is what a
+        # client must present to talk TO this Sentinel (`requirepass` below).
+        # SENTINEL_PW is what this Sentinel presents to the monitored Redis
+        # instances — a separate, far more limited identity, so compromising a
+        # Sentinel does not hand over the feature store.
         PW=$$(cat /run/secrets/redis_password)
+        SENTINEL_PW=$$(cat /run/secrets/redis_sentinel_password)
         CONF=/data/sentinel.conf
         if [ ! -f "$$CONF" ]; then
           cat > "$$CONF" <<EOF
@@ -287,7 +343,8 @@ services:
         sentinel resolve-hostnames yes
         sentinel announce-hostnames yes
         sentinel monitor mymaster ${NODE_A_HOST:-node-a} ${REDIS_A_PORT:-6379} 2
-        sentinel auth-pass mymaster $$PW
+        sentinel auth-user mymaster petafs-sentinel
+        sentinel auth-pass mymaster $$SENTINEL_PW
         sentinel down-after-milliseconds mymaster 5000
         sentinel failover-timeout mymaster 10000
         dir /data
@@ -450,12 +507,9 @@ services:
       - sh
       - -c
       - |
-        PW=$$(cat /run/secrets/redis_password)
         CONF=/data/redis.conf
         if [ ! -f "$$CONF" ]; then
           cat > "$$CONF" <<EOF
-        requirepass $$PW
-        masterauth $$PW
         appendonly yes
         dir /data
         port 0
@@ -470,13 +524,15 @@ services:
         replicaof ${NODE_A_HOST:-node-a} ${REDIS_A_PORT:-6379}
         EOF
         fi
+        /usr/local/bin/write-acl.sh "$$CONF"
         exec redis-server "$$CONF"
     ports: ["${REDIS_B_PORT:-6379}:6379"]
     volumes:
       - redis-replica-data:/data
       - ./tls/out:/tls:ro
+      - ./redis/write-acl.sh:/usr/local/bin/write-acl.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli --tls --cacert /tls/ca.crt -a \"$$(cat /run/secrets/redis_password)\" ping | grep -q PONG"]
+      test: ["CMD-SHELL", "redis-cli --tls --cacert /tls/ca.crt --user petafs-admin -a \"$$(cat /run/secrets/redis_password)\" ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
       retries: 12
@@ -490,7 +546,13 @@ services:
       - sh
       - -c
       - |
+        # Two different credentials, and the distinction matters. PW is what a
+        # client must present to talk TO this Sentinel (`requirepass` below).
+        # SENTINEL_PW is what this Sentinel presents to the monitored Redis
+        # instances — a separate, far more limited identity, so compromising a
+        # Sentinel does not hand over the feature store.
         PW=$$(cat /run/secrets/redis_password)
+        SENTINEL_PW=$$(cat /run/secrets/redis_sentinel_password)
         CONF=/data/sentinel.conf
         if [ ! -f "$$CONF" ]; then
           cat > "$$CONF" <<EOF
@@ -507,7 +569,8 @@ services:
         sentinel resolve-hostnames yes
         sentinel announce-hostnames yes
         sentinel monitor mymaster ${NODE_A_HOST:-node-a} ${REDIS_A_PORT:-6379} 2
-        sentinel auth-pass mymaster $$PW
+        sentinel auth-user mymaster petafs-sentinel
+        sentinel auth-pass mymaster $$SENTINEL_PW
         sentinel down-after-milliseconds mymaster 5000
         sentinel failover-timeout mymaster 10000
         dir /data
@@ -558,7 +621,7 @@ services:
       - -c
       - export AWS_SECRET_ACCESS_KEY="$$(cat /run/secrets/minio_root_password)"; exec /docker-entrypoint.sh "$$@"
       - --
-    secrets: [redis_password, kafka_password, tls_storepass, minio_root_password]
+    secrets: [redis_password, redis_flink_password, kafka_flink_password, tls_storepass, minio_root_password]
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
@@ -579,14 +642,21 @@ services:
       REDIS_SENTINELS: >-
         ${NODE_A_HOST:-node-a}:${SENTINEL_A_PORT:-26379},${NODE_B_HOST:-node-b}:${SENTINEL_B_PORT:-26379},${NODE_C_HOST:-node-c}:${SENTINEL_C_PORT:-26379}
       REDIS_SENTINEL_MASTER: mymaster
-      REDIS_PASSWORD_FILE: /run/secrets/redis_password
+      # The sink authenticates as petafs-flink: HGET + HSET + EXPIRE and nothing
+      # else. It cannot SCAN the keyspace, cannot DEL, and cannot FLUSHALL — so
+      # a leaked TaskManager credential cannot destroy the online store.
+      # SENTINEL_* is a SEPARATE identity: Sentinel discovery authenticates
+      # against the sentinels, which keep their own `requirepass`.
+      REDIS_USER: petafs-flink
+      REDIS_PASSWORD_FILE: /run/secrets/redis_flink_password
+      REDIS_SENTINEL_PASSWORD_FILE: /run/secrets/redis_password
       REDIS_TLS_CA: /tls/ca.crt
       KAFKA_SECURITY_PROTOCOL: SASL_SSL
       KAFKA_SSL_TRUSTSTORE: /tls/kafka.truststore.jks
       TLS_STOREPASS_FILE: /run/secrets/tls_storepass
       KAFKA_SASL_MECHANISM: PLAIN
-      KAFKA_USER: ${KAFKA_USER:-petafs}
-      KAFKA_PASSWORD_FILE: /run/secrets/kafka_password
+      KAFKA_USER: petafs-flink
+      KAFKA_PASSWORD_FILE: /run/secrets/kafka_flink_password
       # NOTE: no `#` comments inside FLINK_PROPERTIES. The Flink entrypoint
       # appends each line to the config and strips whitespace, so a comment
       # becomes a junk key ("#Bindwideandadvertise..."). Harmless when the text
@@ -681,7 +751,7 @@ services:
       - -c
       - export AWS_SECRET_ACCESS_KEY="$$(cat /run/secrets/minio_root_password)"; exec /docker-entrypoint.sh "$$@"
       - --
-    secrets: [redis_password, kafka_password, tls_storepass, minio_root_password]
+    secrets: [redis_password, redis_flink_password, kafka_flink_password, tls_storepass, minio_root_password]
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
@@ -694,14 +764,21 @@ services:
       REDIS_SENTINELS: >-
         ${NODE_A_HOST:-node-a}:${SENTINEL_A_PORT:-26379},${NODE_B_HOST:-node-b}:${SENTINEL_B_PORT:-26379},${NODE_C_HOST:-node-c}:${SENTINEL_C_PORT:-26379}
       REDIS_SENTINEL_MASTER: mymaster
-      REDIS_PASSWORD_FILE: /run/secrets/redis_password
+      # The sink authenticates as petafs-flink: HGET + HSET + EXPIRE and nothing
+      # else. It cannot SCAN the keyspace, cannot DEL, and cannot FLUSHALL — so
+      # a leaked TaskManager credential cannot destroy the online store.
+      # SENTINEL_* is a SEPARATE identity: Sentinel discovery authenticates
+      # against the sentinels, which keep their own `requirepass`.
+      REDIS_USER: petafs-flink
+      REDIS_PASSWORD_FILE: /run/secrets/redis_flink_password
+      REDIS_SENTINEL_PASSWORD_FILE: /run/secrets/redis_password
       REDIS_TLS_CA: /tls/ca.crt
       KAFKA_SECURITY_PROTOCOL: SASL_SSL
       KAFKA_SSL_TRUSTSTORE: /tls/kafka.truststore.jks
       TLS_STOREPASS_FILE: /run/secrets/tls_storepass
       KAFKA_SASL_MECHANISM: PLAIN
-      KAFKA_USER: ${KAFKA_USER:-petafs}
-      KAFKA_PASSWORD_FILE: /run/secrets/kafka_password
+      KAFKA_USER: petafs-flink
+      KAFKA_PASSWORD_FILE: /run/secrets/kafka_flink_password
       FLINK_PROPERTIES: |
         high-availability.type: zookeeper
         zookeeper.sasl.disable: true
@@ -788,7 +865,13 @@ services:
       - sh
       - -c
       - |
+        # Two different credentials, and the distinction matters. PW is what a
+        # client must present to talk TO this Sentinel (`requirepass` below).
+        # SENTINEL_PW is what this Sentinel presents to the monitored Redis
+        # instances — a separate, far more limited identity, so compromising a
+        # Sentinel does not hand over the feature store.
         PW=$$(cat /run/secrets/redis_password)
+        SENTINEL_PW=$$(cat /run/secrets/redis_sentinel_password)
         CONF=/data/sentinel.conf
         if [ ! -f "$$CONF" ]; then
           cat > "$$CONF" <<EOF
@@ -805,7 +888,8 @@ services:
         sentinel resolve-hostnames yes
         sentinel announce-hostnames yes
         sentinel monitor mymaster ${NODE_A_HOST:-node-a} ${REDIS_A_PORT:-6379} 2
-        sentinel auth-pass mymaster $$PW
+        sentinel auth-user mymaster petafs-sentinel
+        sentinel auth-pass mymaster $$SENTINEL_PW
         sentinel down-after-milliseconds mymaster 5000
         sentinel failover-timeout mymaster 10000
         dir /data
@@ -861,7 +945,7 @@ services:
       - -c
       - export AWS_SECRET_ACCESS_KEY="$$(cat /run/secrets/minio_root_password)"; exec /docker-entrypoint.sh "$$@"
       - --
-    secrets: [redis_password, kafka_password, tls_storepass, minio_root_password]
+    secrets: [redis_password, redis_flink_password, kafka_flink_password, tls_storepass, minio_root_password]
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
@@ -919,7 +1003,7 @@ services:
       - -c
       - export AWS_SECRET_ACCESS_KEY="$$(cat /run/secrets/minio_root_password)"; exec /docker-entrypoint.sh "$$@"
       - --
-    secrets: [redis_password, kafka_password, tls_storepass, minio_root_password]
+    secrets: [redis_password, redis_flink_password, kafka_flink_password, tls_storepass, minio_root_password]
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
@@ -932,14 +1016,21 @@ services:
       REDIS_SENTINELS: >-
         ${NODE_A_HOST:-node-a}:${SENTINEL_A_PORT:-26379},${NODE_B_HOST:-node-b}:${SENTINEL_B_PORT:-26379},${NODE_C_HOST:-node-c}:${SENTINEL_C_PORT:-26379}
       REDIS_SENTINEL_MASTER: mymaster
-      REDIS_PASSWORD_FILE: /run/secrets/redis_password
+      # The sink authenticates as petafs-flink: HGET + HSET + EXPIRE and nothing
+      # else. It cannot SCAN the keyspace, cannot DEL, and cannot FLUSHALL — so
+      # a leaked TaskManager credential cannot destroy the online store.
+      # SENTINEL_* is a SEPARATE identity: Sentinel discovery authenticates
+      # against the sentinels, which keep their own `requirepass`.
+      REDIS_USER: petafs-flink
+      REDIS_PASSWORD_FILE: /run/secrets/redis_flink_password
+      REDIS_SENTINEL_PASSWORD_FILE: /run/secrets/redis_password
       REDIS_TLS_CA: /tls/ca.crt
       KAFKA_SECURITY_PROTOCOL: SASL_SSL
       KAFKA_SSL_TRUSTSTORE: /tls/kafka.truststore.jks
       TLS_STOREPASS_FILE: /run/secrets/tls_storepass
       KAFKA_SASL_MECHANISM: PLAIN
-      KAFKA_USER: ${KAFKA_USER:-petafs}
-      KAFKA_PASSWORD_FILE: /run/secrets/kafka_password
+      KAFKA_USER: petafs-flink
+      KAFKA_PASSWORD_FILE: /run/secrets/kafka_flink_password
       # No jobmanager.rpc.address here, deliberately: in HA mode the
       # TaskManager resolves the leader through ZooKeeper, so a hardcoded
       # address would be both unused and misleading about how failover works.

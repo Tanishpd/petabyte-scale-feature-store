@@ -41,7 +41,22 @@ gen() {
 }
 
 created=0
-for name in redis_password kafka_password tls_storepass minio_root_password; do
+# One password PER KAFKA PRINCIPAL, not one for "Kafka". A single shared
+# identity makes ACLs decorative: every client authenticates as the same user,
+# so any rule that lets the producer write also lets the reader delete topics.
+#
+# Redis gets the same treatment, for the same reason. `redis_password` is now
+# the BREAK-GLASS ADMIN credential (user petafs-admin), not "the Redis
+# password": with one shared identity, anything that could write a feature
+# could also FLUSHALL the store, and nothing in Redis would record which client
+# did it. The sink, the serving path, replication and Sentinel each get their
+# own user, so a leaked sink credential cannot read the whole keyspace and a
+# leaked reader credential cannot write to it.
+for name in redis_password tls_storepass minio_root_password \
+            kafka_broker_password kafka_admin_password \
+            kafka_producer_password kafka_flink_password \
+            redis_flink_password redis_reader_password \
+            redis_repl_password redis_sentinel_password; do
   f="$OUT/$name"
   # An EMPTY or short file is treated as absent. A crashed generator leaves one
   # behind, and "kept" on a truncated credential is far worse than regenerating:
@@ -54,9 +69,16 @@ for name in redis_password kafka_password tls_storepass minio_root_password; do
     chmod 600 "$f"
     printf '  created  %s\n' "$f"
     created=$((created + 1))
+    [ "$name" = tls_storepass ] && tls_new=1
   fi
 done
 
-if [ "$created" -gt 0 ]; then
-  printf '\n%s new secret(s). The certs embed tls_storepass, so run:\n  make mh-tls\n' "$created"
+# Only tls_storepass forces a cert rebuild — it is baked into the JKS
+# keystores. Printing that instruction whenever ANY secret is new (adding the
+# Redis ACL users, say) trains people to regenerate certs they did not need to,
+# and `make mh-tls` invalidates every keystore the running brokers hold open.
+if [ "${tls_new:-0}" = 1 ]; then
+  printf '\ntls_storepass is new and the certs embed it, so run:\n  make mh-tls\n'
+elif [ "$created" -gt 0 ]; then
+  printf '\n%s new secret(s). Certs unaffected (tls_storepass unchanged).\n' "$created"
 fi

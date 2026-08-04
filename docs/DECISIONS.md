@@ -452,7 +452,7 @@ demonstrated here, but because running an object store is operational work that 
 
 **Decision.** The HA topology takes every credential from a file mounted at `/run/secrets/<name>`.
 `make secrets` generates them into `docker/secrets/` (gitignored, mode 600); nothing has a dev default
-any more. Asserted by `make mh-ha-drill`: **21/21**, three of which are about the credentials themselves.
+any more. Asserted by `make mh-ha-drill`: **34/34**, three of which are about the credentials themselves.
 
 **Why files.** An environment variable holding a password is readable by anything that can ask the
 Docker daemon about the container — `docker inspect`, `docker compose config`, `/proc/1/environ` — and
@@ -486,3 +486,68 @@ filesystem and any process in the container can read it. It is the *interface* a
 plugs into: point the same paths at a Kubernetes projected secret or a Vault agent's tmpfs and no
 service configuration changes. `make secrets-rotate` exists but is deliberately blunt — Redis persists
 its password into its own config file on first boot, so rotating means dropping the Redis volumes too.
+
+---
+
+## ADR-016 — Authentication is not authorization: per-component identities on Kafka and Redis
+
+**Decision.** Every component gets its own credential and a rule set naming exactly what it may do.
+Kafka runs `StandardAuthorizer` with `allow.everyone.if.no.acl.found=false`; Redis runs with
+`user default off` and one ACL user per component. Asserted by `make mh-ha-drill`: **34/34**,
+thirteen of them about authorization specifically.
+
+**The gap this closes.** ADR-015 made credentials unreadable through the orchestrator, and the earlier
+TLS/SASL work made them unforgeable on the wire. Neither did anything about *scope*. Before this, the
+whole topology shared two secrets — one Kafka password, one Redis password — and each was effectively
+root:
+
+- Anything that could produce to `transactions` could also **delete** it.
+- Anything that could write a feature could `FLUSHALL` the online store, and Redis recorded nothing
+  about which client did it.
+
+That is a lock on a door with no rooms behind it. Authentication answers *who are you*; without
+authorization the answer does not constrain anything.
+
+**Kafka.** Four principals — `petafs-broker` (inter-broker), `petafs-admin` (operator, a super user),
+`petafs-producer`, `petafs-flink` — each with its own password file. The rules are one per thing a
+principal actually does: the producer may `Write` and `Describe` the topic; Flink may `Read` and
+`Describe` the topic *and its own consumer group*. A group ACL of `*` was rejected deliberately — it
+would let any consumer hijack another's committed offsets.
+
+The controller listener's mTLS principals (`CN=kafka1…3`) are super users. They have to be: KRaft's
+`Vote`/`BeginQuorumEpoch`/metadata-log RPCs are `CLUSTER_ACTION`, and a controller that cannot
+authorize them cannot elect a leader.
+
+**Redis.** Five users, in `docker/redis/write-acl.sh`, written by **both** data nodes because roles
+swap: after a failover the promoted replica must already know every user, and the demoted master must
+be able to authenticate *outward* as `petafs-repl`. A per-role rule set is correct until the first
+failover and wrong from then on — the one moment the topology exists to survive.
+
+| user | may do | notably may not |
+|------|--------|-----------------|
+| `default` | **off** | anything — this is the point |
+| `petafs-admin` | `+@all` | — (break-glass; what the runbook uses) |
+| `petafs-flink` | `HGET` `HSET` `EXPIRE` | `SCAN`, `DEL`, `FLUSHALL`, `CONFIG` |
+| `petafs-reader` | hash reads | any write |
+| `petafs-repl` | `PSYNC` `REPLCONF` `PING` | everything else |
+| `petafs-sentinel` | the set from the Sentinel docs | read or write any key |
+
+`petafs-flink`'s three commands are not a category grant; they are what the sink actually issues —
+`HGET` for the staleness guard, `HSET`, `EXPIRE`. `~*` on the key pattern is honest rather than lazy:
+Feast's Redis keys are **binary** mmh3 hashes, so no printable prefix exists for a glob to match. The
+restriction carrying weight here is the command list.
+
+**Sentinel needs two different credentials** and conflating them breaks failover silently. `requirepass`
+on the Sentinel is what a *client* presents to talk to it; `sentinel auth-user`/`auth-pass` is the far
+narrower identity Sentinel presents to the monitored instances. Likewise a replica needs `masteruser`,
+not just `masterauth` — `masterauth` alone authenticates as `default`, which is now off, so a replica
+configured the old way fails to sync with `NOAUTH` and Sentinel never sees it return.
+
+**Verified by probing, not by reading config.** Listing the ACLs back only proves the file says what we
+wrote in it. The drill asserts each boundary by attempting the operation with the real credential —
+and asserts the *positive* control first, because a rule set that denies everything passes every
+negative assertion while leaving the pipeline dead.
+
+**What it is not.** These are static rules in files on disk; nothing rotates or audits. There is no
+per-client-IP restriction (`host=*` throughout), and the dev stack is deliberately untouched — it keeps
+one `requirepass`, because the point of the dev stack is to be startable.
