@@ -52,11 +52,23 @@ created=0
 # did it. The sink, the serving path, replication and Sentinel each get their
 # own user, so a leaked sink credential cannot read the whole keyspace and a
 # leaked reader credential cannot write to it.
+#
+# `kafka_password` and `grafana_password` belong to the prod and multihost
+# topologies, which have no authorizer and therefore one shared Kafka identity
+# (`petafs`). They are NOT the HA topology's per-principal credentials — those
+# only mean something where StandardAuthorizer is enforcing rules against them.
+#
+# `tls_storepass` is shared by ALL topologies and has to be: one run of
+# `make prod-tls` builds one set of JKS keystores, and the password is baked
+# inside them. A stack that reads a different value cannot open its own
+# keystore — which is precisely how the prod topology broke once the HA
+# topology started reading this file (see ADR-015's note on partial migration).
 for name in redis_password tls_storepass minio_root_password \
             kafka_broker_password kafka_admin_password \
             kafka_producer_password kafka_flink_password \
             redis_flink_password redis_reader_password \
-            redis_repl_password redis_sentinel_password; do
+            redis_repl_password redis_sentinel_password \
+            kafka_password grafana_password; do
   f="$OUT/$name"
   # An EMPTY or short file is treated as absent. A crashed generator leaves one
   # behind, and "kept" on a truncated credential is far worse than regenerating:

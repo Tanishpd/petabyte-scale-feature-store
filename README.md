@@ -141,7 +141,7 @@ Both are in [docs/MULTIHOST.md](docs/MULTIHOST.md).
 | State lost on restart | Checkpoints to object storage (MinIO → S3) | Killed the TaskManager: restored from `s3://.../chk-N`, Kafka offsets recovered with it |
 | Single Redis | primary + replica + Sentinel; the sink discovers the master | Killed the master: promotion in ~9 s, 8,018 keys intact, writes resumed |
 | Nothing authenticated | SASL/PLAIN on Kafka; `requirepass` on Redis nodes *and* Sentinel | Authenticated clients work, unauthenticated are refused — on both |
-| Nothing watched it | Prometheus + 5 alerts on lag, checkpoints, restarts, backpressure, feature staleness | 2/2 scrape targets up, rules loaded |
+| Nothing watched it | Prometheus + 5 alerts on lag, checkpoints, restarts, backpressure, feature staleness | **Each rule unit-tested in both directions** — fires on its condition, silent below the threshold — with `promtool test rules` in CI, **plus** a live check that every metric the rules watch actually exists. Found a real bug doing it: `NoFeaturesWritten` could never fire when the writer *died*, because a vanished series is empty, not zero ([ADR-017](docs/DECISIONS.md)) |
 | Tests never ran | CI on every push, **fails on any skip** | A skipped round-trip test is the same as no test |
 | Sentinel could split-brain | 3 sentinels, quorum 2, config-file Redis so promotions persist | Killed the master, restarted the old one: it rejoins as a replica, exactly one master, all 3 sentinels agree |
 | Everything in the clear | **TLS everywhere**: Kafka SASL_SSL, Redis + Sentinel TLS-only (`port 0`), replication encrypted | An unencrypted client *with valid credentials* is refused on both; the whole path producer→Kafka→Flink→Redis is encrypted |
@@ -161,13 +161,14 @@ Both are in [docs/MULTIHOST.md](docs/MULTIHOST.md).
   for anything demonstrated here, but because running an object store is
   operational work an API call avoids. `s3.endpoint` keeps that a
   credentials-and-URL change.
-- **Two of the four stacks still use env-var credentials.** The HA topology
-  takes every credential from a mounted file with no dev default, asserted by
-  drill (`docker inspect` and `docker compose config` contain none of them).
-  `docker-compose.prod.yml` and `docker-compose.multihost.yml` have not been
-  converted — they are separately verified stacks, and changing their credential
-  plumbing without re-running both drill suites would ship unverified changes
-  ([ADR-015](docs/DECISIONS.md)).
+- **One of the four stacks still uses env-var credentials.**
+  `docker-compose.multihost.yml` has not been converted;
+  `docker-compose.prod.yml` now has been, re-verified by re-running its drill
+  suite ([ADR-015](docs/DECISIONS.md)).
+- **Alerts fire into a UI nobody watches.** The rules are now proven to
+  evaluate correctly against real metrics ([ADR-017](docs/DECISIONS.md)), but
+  there is no Alertmanager, no routing and no paging — so "the alert fires" and
+  "somebody finds out" are still different claims.
 - **File-based secrets are not a secret manager.** Nothing rotates, expires or
   audits; the file sits on a host filesystem. It is the interface one plugs
   into — point the paths at a K8s projected secret or a Vault agent and no

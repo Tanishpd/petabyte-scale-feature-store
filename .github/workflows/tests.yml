@@ -70,6 +70,16 @@ jobs:
           set -o pipefail
           pytest -q -rs tests/ | tee /tmp/pytest.out
 
+      - name: Prove the alert rules fire
+        # "rules loaded" is not evidence an alert works — a rule that can never
+        # fire loads exactly as successfully as one that does. promtool replays
+        # synthetic series through the real alerts.yml and checks both
+        # directions: fires on the condition, silent below the threshold.
+        # No stack needed, so it belongs in CI rather than in a drill.
+        run: |
+          docker run --rm -v "$PWD/docker/observability:/obs:ro" -w /obs \
+            --entrypoint promtool prom/prometheus:v3.2.1 test rules alerts_test.yml
+
       - name: Fail if any test was skipped
         # Every test in this suite has an infra guard that turns into a skip when
         # Redis or the registry is missing. Without this check a broken service

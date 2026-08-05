@@ -113,6 +113,8 @@ make mh-tls && make mh-up   # 3-node topology as 3 isolated compose projects
 make mh-drill      # kill a WHOLE node; 24 assertions. See docs/MULTIHOST.md
 make secrets       # generate docker/secrets/* — REQUIRED before mh-ha-up
 make mh-ha-up && make mh-ha-drill   # + ZK/standby JM; 34 assertions (MULTIHOST §5)
+make alerts-test   # promtool: every alert rule fires on its condition (no stack needed)
+make alerts-verify # every metric those rules watch exists in Prometheus (needs a stack)
 # ⚠️ mh and mh-ha must not run at once, and neither alongside the dev stack.
 redis-cli -p 6380 --scan --pattern '*' | head         # raw Feast keys (binary) — note 6380
 open http://localhost:8081                            # Flink UI: watch backpressure + watermarks
@@ -262,6 +264,25 @@ Invariant 4. Override with `REDIS_HOST_PORT=6379`.
   single set spans them. Real hosts use `http://minio-{a...c}:9000/d{1...N}` and MinIO interleaves
   itself, but the host ellipsis needs identical ports everywhere. MinIO also needs `hostname:` set (it
   refuses a name resolving to 127.0.0.1), listen port == published port, and real volume mounts.
+
+### Observability and drill hygiene (ADR-017)
+
+- **`sum(rate(x[10m])) == 0` does NOT fire when `x` disappears.** A dead TaskManager's metrics go
+  *stale*, not to zero; `sum()` over nothing is an empty vector and `empty == 0` is empty, not true. The
+  `NoFeaturesWritten` alert — the one covering the failure this design fears most — was therefore silent
+  in the most likely way for the pipeline to stop writing. Needs `or absent(x)`.
+- **"Rules loaded" is not "alerts work."** Same configured-vs-enforced trap as everywhere else here.
+  `make alerts-test` replays synthetic series through the real rules; `make alerts-verify` asserts the
+  metrics those rules name actually exist. Neither alone is evidence: promtool cannot catch a metric
+  that never exists, and the live check cannot catch a wrong threshold.
+- **A drill assertion whose PRECONDITION was not met must be a note, not a FAIL.** "no keys after
+  failover" blamed Redis for an empty database it was handed — the pipeline had not written a feature
+  yet. Capture the before-state and say so instead; scoring it either way is a lie.
+- **Converging state has to be polled to a deadline, never sampled once.** A rejoining Redis replica
+  reports `master_link_status:down` during its resync, so a single read right after a failover measures
+  the resync. Seen failing at `down` with "sync: Finished with success" in the log seconds later.
+- **The prod topology has no `prod-topics` target and `auto.create.topics.enable=false`.** Producing
+  before creating `transactions` gives `0 eps` and a handful of errors, not a clear message.
 
 ### Authorization (ADR-016)
 

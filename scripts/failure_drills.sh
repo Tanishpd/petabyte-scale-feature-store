@@ -11,7 +11,16 @@ set -uo pipefail
 
 cd "$(dirname "$0")/.."
 P="docker compose -f docker/docker-compose.prod.yml"
-PW="${REDIS_PASSWORD:-petafs-dev-secret}"
+
+# Credentials come from the same files the topology mounts (`make secrets`),
+# never from a dev default. A drill that quietly fell back to a hardcoded
+# password would pass against a stack whose real credentials it never touched —
+# and would keep passing after those credentials were rotated.
+SECRETS=docker/secrets
+_secret() { [ -f "$SECRETS/$1" ] || { echo "missing $SECRETS/$1 — run 'make secrets'" >&2; exit 1; }; tr -d '\r\n' < "$SECRETS/$1"; }
+PW=$(_secret redis_password)
+KAFKA_PW=$(_secret kafka_password)
+STOREPASS=$(_secret tls_storepass)
 # Redis and Sentinel are TLS-only in the production topology (`port 0` disables
 # the plaintext listener), so every redis-cli call needs --tls and the CA.
 RCLI="redis-cli --tls --cacert /tls/ca.crt"
@@ -20,6 +29,11 @@ pass=0; fail=0
 step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 ok()   { printf '  \033[32mPASS\033[0m %s\n' "$*"; pass=$((pass+1)); }
 bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$*"; fail=$((fail+1)); }
+# Neither pass nor fail. A drill whose PRECONDITION was never met has not
+# discovered anything about the system, and scoring it either way is a lie:
+# `bad` blames the component for the setup, `ok` claims evidence that does not
+# exist. Say so instead.
+note() { printf '  \033[90m%s\033[0m\n' "$*"; }
 
 # Every kafka CLI call needs credentials now that SASL is on. Without them the
 # call returns nothing, which reads as "no data" rather than "not authenticated"
@@ -28,9 +42,9 @@ kafka_client_config() {
   $P exec -T kafka1 sh -c "cat > /tmp/drill.properties <<'EOF'
 security.protocol=SASL_SSL
 sasl.mechanism=PLAIN
-sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username=\"${KAFKA_USER:-petafs}\" password=\"${KAFKA_PASSWORD:-petafs-dev-secret}\";
+sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username=\"${KAFKA_USER:-petafs}\" password=\"$KAFKA_PW\";
 ssl.truststore.location=/tls/kafka.truststore.jks
-ssl.truststore.password=${TLS_STOREPASS:-petafs-dev-secret}
+ssl.truststore.password=$STOREPASS
 EOF" >/dev/null 2>&1
 }
 kafka_records() {
@@ -106,8 +120,9 @@ else
        | grep -q "^role:master"; then VICTIM="petafs-prod-redis-$c"; fi
   done
   if [ -z "$VICTIM" ]; then bad "no node reports role:master — cannot pick a victim"; VICTIM=petafs-prod-redis-primary; fi
+  BEFORE=$(docker exec "$VICTIM" $RCLI -a "$PW" DBSIZE 2>/dev/null | tr -d '\r')
   docker kill "$VICTIM" >/dev/null 2>&1
-  echo "  killed $VICTIM"
+  echo "  killed $VICTIM (held ${BEFORE:-0} keys)"
 
   M1=""
   for _ in $(seq 1 20); do
@@ -119,8 +134,20 @@ else
 
   SURV=$(docker exec petafs-prod-redis-replica $RCLI -a "$PW" DBSIZE 2>/dev/null \
       || docker exec petafs-prod-redis-primary $RCLI -a "$PW" DBSIZE 2>/dev/null)
-  [ "${SURV:-0}" -gt 0 ] && ok "features survived the failover ($SURV keys)" \
-                         || bad "no keys after failover"
+  # $BEFORE is captured above, ahead of the kill. Without it this assertion
+  # compares against nothing: on a stack where the pipeline has not yet written
+  # a feature it reported "no keys after failover" and blamed Redis for handing
+  # back the empty database it was given. Windows have to have FIRED first —
+  # a single bounded burst of events is not enough, because the watermark never
+  # advances past the last window (see CLAUDE.md).
+  if [ "${BEFORE:-0}" -eq 0 ]; then
+    note "no features in Redis before the kill — nothing to survive, so this proves nothing."
+    note "  produce, wait for a window to fire, then re-run to assert data survival."
+  elif [ "${SURV:-0}" -gt 0 ]; then
+    ok "features survived the failover ($SURV keys, $BEFORE before)"
+  else
+    bad "$BEFORE keys before the failover, none after"
+  fi
 
   # The promotion must SURVIVE the old primary coming back. With a
   # command-line --replicaof the argument reasserts on restart and fights
@@ -181,7 +208,7 @@ else
 fi
 
 # Kafka: an authenticated client must work and an unauthenticated one must not.
-$P exec -T kafka1 sh -c 'printf "security.protocol=SASL_PLAINTEXT\nsasl.mechanism=PLAIN\nsasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username=\"'"${KAFKA_USER:-petafs}"'\" password=\"'"${KAFKA_PASSWORD:-petafs-dev-secret}"'\";\n" > /tmp/d.properties' >/dev/null 2>&1
+$P exec -T kafka1 sh -c 'printf "security.protocol=SASL_PLAINTEXT\nsasl.mechanism=PLAIN\nsasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username=\"'"${KAFKA_USER:-petafs}"'\" password=\"'"$KAFKA_PW"'\";\n" > /tmp/d.properties' >/dev/null 2>&1
 if $P exec -T kafka1 /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka1:9092 \
      --command-config /tmp/drill.properties --list >/dev/null 2>&1; then
   ok "kafka accepts an authenticated client"
@@ -204,7 +231,7 @@ step "Drill 5 — transport is encrypted, not just authenticated"
 $P exec -T kafka1 sh -c "cat > /tmp/nossl.properties <<'EOF'
 security.protocol=SASL_PLAINTEXT
 sasl.mechanism=PLAIN
-sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username=\"${KAFKA_USER:-petafs}\" password=\"${KAFKA_PASSWORD:-petafs-dev-secret}\";
+sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username=\"${KAFKA_USER:-petafs}\" password=\"$KAFKA_PW\";
 EOF" >/dev/null 2>&1
 if $P exec -T kafka1 sh -c 'timeout 25 /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka1:9092 --command-config /tmp/nossl.properties --list >/dev/null 2>&1'; then
   bad "kafka served an unencrypted client that had valid credentials"
@@ -235,14 +262,36 @@ fi
 # Check whichever node is CURRENTLY the replica. Drill 2 may have swapped the
 # roles, and a master has no master_link_status at all — hardcoding the
 # container name reported a healthy link as down.
+# POLLED, not read once. Drill 2 above promoted a replica and brought the old
+# master back, and a rejoining node reports master_link_status:down while it is
+# doing the full resync — reading the field immediately after a failover
+# measures the resync, not the health of the link. Seen failing at 'down' with
+# "MASTER <-> REPLICA sync: Finished with success" already in the log seconds
+# later. Converging state has to be polled to a deadline, never sampled once.
 LINK=""
-for c in primary replica; do
-  INFO=$(docker exec "petafs-prod-redis-$c" $RCLI -a "$PW" INFO replication 2>/dev/null)
-  echo "$INFO" | grep -q "^role:slave" || continue
-  LINK=$(echo "$INFO" | grep -o "master_link_status:[a-z]*" | cut -d: -f2)
+for _ in $(seq 1 60); do
+  for c in primary replica; do
+    INFO=$(docker exec "petafs-prod-redis-$c" $RCLI -a "$PW" INFO replication 2>/dev/null)
+    echo "$INFO" | grep -q "^role:slave" || continue
+    LINK=$(echo "$INFO" | grep -o "master_link_status:[a-z]*" | cut -d: -f2)
+  done
+  [ "$LINK" = "up" ] && break
+  sleep 3
 done
-[ "$LINK" = "up" ] && ok "replication link is up over TLS (replica -> master)" \
-                   || bad "TLS replication link is '${LINK:-absent}'"
+if [ "$LINK" = "up" ]; then
+  ok "replication link is up over TLS (replica -> master)"
+else
+  # Report what the MASTER thinks the sync is doing. "down" alone sends you
+  # looking at TLS and credentials; `state=wait_bgsave` says the opposite —
+  # the link is fine and the full resync has not finished. Drill 2 above forces
+  # exactly that by promoting a replica and bringing the old master back, and on
+  # a loaded box the RDB snapshot and transfer take longer than you would guess.
+  SUB=$(for c in primary replica; do
+          docker exec "petafs-prod-redis-$c" $RCLI -a "$PW" INFO replication 2>/dev/null \
+            | grep -o "state=[a-z_]*"
+        done | head -1)
+  bad "TLS replication link is '${LINK:-absent}' after 180s (master-side sync ${SUB:-unknown})"
+fi
 
 printf '\n\033[1m== %d passed, %d failed ==\033[0m\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

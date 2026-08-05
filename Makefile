@@ -153,6 +153,20 @@ bench:  ## p50/p95/p99 online read latency + Redis footprint
 test:  ## Run pytest (includes the Feast codec round-trip)
 	$(VENV)/bin/pytest -q tests/
 
+alerts-test:  ## Prove each alert rule FIRES on its condition (no stack needed)
+	@# "rules loaded" is not evidence an alert works — the same configured-vs-
+	@# enforced gap this repo probes for everywhere else. promtool replays
+	@# synthetic series through the real rules file and checks both directions:
+	@# fires on the condition, silent below the threshold.
+	docker run --rm -v "$(PWD)/docker/observability:/obs:ro" -w /obs \
+	  --entrypoint promtool prom/prometheus:v3.2.1 test rules alerts_test.yml
+
+alerts-verify:  ## Assert every metric the alerts watch EXISTS (needs a running stack)
+	@# The half promtool cannot cover: a rule over a misspelled metric passes
+	@# every unit test and then never fires, because an empty query result is
+	@# not an alert. Needs Prometheus up with the pipeline submitted.
+	bash scripts/alerts_verify.sh
+
 smoke:  ## End-to-end: produce -> flink -> redis -> feast read
 	@test -f scripts/smoke_test.sh \
 	  || { echo "Not built yet — Phase 6 in PLAN.md."; exit 1; }
@@ -208,6 +222,29 @@ prod-clean:  ## Stop it and drop the volumes
 
 prod-ps:  ## Production container status
 	$(PROD_COMPOSE) ps
+
+prod-topics:  ## Create `transactions` at RF=3 on the production topology
+	@# `auto.create.topics.enable=false` here, deliberately — a topic created by
+	@# accident gets the broker defaults, not RF=3, which quietly undoes the
+	@# whole point of three brokers. The cost is that producing before this runs
+	@# reports `0 eps` and a handful of client errors rather than "no such
+	@# topic", so it is worth a target rather than a line in a doc.
+	@#
+	@# retention.bytes/segment.bytes are a LAPTOP CONCESSION, not production
+	@# sizing — override them on a real box. A Kafka broker's resident size is
+	@# dominated by mmap'd log segments rather than by KAFKA_HEAP_OPTS, so an
+	@# uncapped topic grows the brokers until they crowd out everything else on
+	@# the machine; that is what starved Flink into "Could not create actor
+	@# system" on the HA topology, an error naming nothing about memory.
+	@#   make prod-topics RETENTION_BYTES=10737418240 SEGMENT_BYTES=1073741824
+	$(PROD_COMPOSE) exec -T kafka1 sh -c 'printf "security.protocol=SASL_SSL\nsasl.mechanism=PLAIN\nsasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username=\"$${KAFKA_USER:-petafs}\" password=\"%s\";\nssl.truststore.location=/tls/kafka.truststore.jks\nssl.truststore.password=%s\n" "$$(cat /run/secrets/kafka_password)" "$$(cat /run/secrets/tls_storepass)" > /tmp/t.properties; \
+	  /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --if-not-exists \
+	    --topic $(TOPIC) --partitions $(or $(PARTITIONS),6) --replication-factor 3 \
+	    --config retention.bytes=$(or $(RETENTION_BYTES),268435456) \
+	    --config segment.bytes=$(or $(SEGMENT_BYTES),67108864) \
+	    --command-config /tmp/t.properties && \
+	  /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --describe \
+	    --topic $(TOPIC) --command-config /tmp/t.properties | head -1'
 
 prod-submit:  ## Submit the pipeline against the production topology
 	$(PROD_COMPOSE) exec -T jobmanager flink run -d -py /opt/project/src/flink/streaming_job.py \

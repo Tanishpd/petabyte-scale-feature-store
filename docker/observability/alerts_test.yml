@@ -1,0 +1,231 @@
+# Unit tests for alerts.yml. `make alerts-test`, and CI runs it too.
+#
+# WHY THIS EXISTS
+# ---------------
+# The README used to claim the alerting gap was closed on the evidence "2/2
+# scrape targets up, rules loaded". That is the same *configured vs enforced*
+# distinction this repo probes for everywhere else — mTLS is proven by a TLS
+# alert, the Kafka ACLs by an actual denial — and alerting was the one place it
+# had not been applied. A rule that never fires is loaded exactly as
+# successfully as one that does.
+#
+# Each alert gets two cases: it FIRES on its condition, and it stays SILENT
+# just below the threshold. The second half is what makes the first mean
+# something — an expression stuck permanently true would pass a fires-only test
+# while telling you nothing about the system.
+#
+# What this does NOT prove is that Flink emits these metric names at all; a
+# perfect rule over a metric that never exists would pass every test here. That
+# half is asserted live against Prometheus by `make alerts-verify`, which
+# queries each metric and fails on an empty result. The two together are the
+# evidence; either alone is not.
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # --- 1. KafkaConsumerLagGrowing: sum(lag) > 120000 for 5m ----------------
+  - interval: 1m
+    name: lag above 2 minutes fires after the 5m hold
+    input_series:
+      # Two operator subtasks; the rule sums across them, so neither alone
+      # crosses the threshold and together they do. That ordering is the point
+      # of using `sum()` rather than a bare comparison.
+      - series: 'flink_taskmanager_job_task_operator_currentEmitEventTimeLag{job="flink",subtask="0"}'
+        values: '70000+0x20'
+      - series: 'flink_taskmanager_job_task_operator_currentEmitEventTimeLag{job="flink",subtask="1"}'
+        values: '70000+0x20'
+    alert_rule_test:
+      # Not yet: the condition is true but has not been true for 5m.
+      - eval_time: 3m
+        alertname: KafkaConsumerLagGrowing
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: KafkaConsumerLagGrowing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Pipeline is falling behind (event-time lag > 2 min)"
+              description: >
+                Sustained lag means throughput is below ingest. Check the embedding
+                operator first — it saturates before Kafka does.
+
+  - interval: 1m
+    name: lag below the threshold stays silent
+    input_series:
+      - series: 'flink_taskmanager_job_task_operator_currentEmitEventTimeLag{job="flink",subtask="0"}'
+        values: '50000+0x20'
+      - series: 'flink_taskmanager_job_task_operator_currentEmitEventTimeLag{job="flink",subtask="1"}'
+        values: '50000+0x20'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: KafkaConsumerLagGrowing
+        exp_alerts: []
+
+  # --- 2. CheckpointsFailing: increase(failed[15m]) > 2 for 5m -------------
+  - interval: 1m
+    name: repeated checkpoint failures fire
+    input_series:
+      - series: 'flink_jobmanager_job_numberOfFailedCheckpoints{job="flink",job_name="petafs"}'
+        values: '0+1x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: CheckpointsFailing
+        exp_alerts:
+          # `increase()` is not wrapped in an aggregation, so the series labels
+          # pass through — which is what lets the alert name the job that is
+          # failing. The sum()/avg() rules above deliberately lose them.
+          - exp_labels:
+              severity: critical
+              job: flink
+              job_name: petafs
+            exp_annotations:
+              summary: "Flink checkpoints are failing"
+              description: >
+                More than two failures in 15 minutes. State is not durable; a
+                restart will lose in-flight windows. Check object-storage
+                credentials and checkpoint duration vs interval.
+
+  - interval: 1m
+    name: checkpoints succeeding stays silent
+    input_series:
+      # A flat counter is the healthy case: checkpoints are completing, so the
+      # FAILED counter never advances.
+      - series: 'flink_jobmanager_job_numberOfFailedCheckpoints{job="flink",job_name="petafs"}'
+        values: '0+0x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: CheckpointsFailing
+        exp_alerts: []
+
+  # --- 3. JobRestarting: increase(numRestarts[10m]) > 3 for 2m -------------
+  - interval: 1m
+    name: a restart loop fires
+    input_series:
+      - series: 'flink_jobmanager_job_numRestarts{job="flink",job_name="petafs"}'
+        values: '0+1x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: JobRestarting
+        exp_alerts:
+          # `increase()` is not wrapped in an aggregation, so the series labels
+          # pass through — which is what lets the alert name the job that is
+          # failing. The sum()/avg() rules above deliberately lose them.
+          - exp_labels:
+              severity: critical
+              job: flink
+              job_name: petafs
+            exp_annotations:
+              summary: "Flink job is in a restart loop"
+              description: >
+                Check the SDK-harness traceback in the TaskManager log — a Python
+                UDF or sink exception is the usual cause.
+
+  - interval: 1m
+    name: a single restart does not fire
+    input_series:
+      # One restart in the window. Three is the threshold precisely so that an
+      # ordinary recovery — which this repo's drills cause deliberately — is not
+      # an incident.
+      - series: 'flink_jobmanager_job_numRestarts{job="flink",job_name="petafs"}'
+        values: '0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: JobRestarting
+        exp_alerts: []
+
+  # --- 4. SustainedBackpressure: avg(bp) > 500 for 10m --------------------
+  - interval: 1m
+    name: an operator backpressured most of the time fires
+    input_series:
+      - series: 'flink_taskmanager_job_task_backPressuredTimeMsPerSecond{job="flink",task="embed"}'
+        values: '900+0x30'
+      - series: 'flink_taskmanager_job_task_backPressuredTimeMsPerSecond{job="flink",task="source"}'
+        values: '700+0x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: SustainedBackpressure
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "An operator is backpressured more than half the time"
+
+  - interval: 1m
+    name: one hot operator does not fire when the average is fine
+    input_series:
+      # The rule averages, so a single saturated operator among several healthy
+      # ones is deliberately NOT an alert — that is normal for a pipeline with
+      # one expensive stage (the embedding UDF, SCALING §3).
+      - series: 'flink_taskmanager_job_task_backPressuredTimeMsPerSecond{job="flink",task="embed"}'
+        values: '900+0x30'
+      - series: 'flink_taskmanager_job_task_backPressuredTimeMsPerSecond{job="flink",task="source"}'
+        values: '0+0x30'
+      - series: 'flink_taskmanager_job_task_backPressuredTimeMsPerSecond{job="flink",task="sink"}'
+        values: '0+0x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: SustainedBackpressure
+        exp_alerts: []
+
+  # --- 5. NoFeaturesWritten: sum(rate(numRecordsOut[10m])) == 0 for 15m ----
+  - interval: 1m
+    name: a stalled pipeline fires
+    input_series:
+      # THE failure this whole repo is most afraid of: the job is up, Feast
+      # still answers PRESENT, and the values are getting older every second.
+      # A flat counter is exactly what that looks like in metrics.
+      - series: 'flink_taskmanager_job_task_operator_numRecordsOut{job="flink",operator="feast-redis-writer"}'
+        values: '5000+0x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: NoFeaturesWritten
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "No feature rows written for 15 minutes"
+              description: >
+                The pipeline is up but producing nothing. Models are reading
+                increasingly stale features and Feast reports them as PRESENT.
+
+  - interval: 1m
+    name: a writing pipeline stays silent
+    input_series:
+      - series: 'flink_taskmanager_job_task_operator_numRecordsOut{job="flink",operator="feast-redis-writer"}'
+        values: '0+10x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: NoFeaturesWritten
+        exp_alerts: []
+
+  # --- 5b. The case the live check surfaced -------------------------------
+  #
+  # When the TaskManager DIES, its metrics do not go to zero — they cease to
+  # exist. Prometheus marks the series stale and `sum(rate(...))` over nothing
+  # returns an EMPTY vector, and `empty == 0` is still empty, not true. So the
+  # alert that exists to catch "the pipeline is up but writing nothing" was
+  # silent in the most likely way for a pipeline to stop writing.
+  #
+  # Found by `make alerts-verify` reporting the series missing while a drill had
+  # the TaskManager down — not by reading the expression, which looks correct.
+  - interval: 1m
+    name: a vanished writer fires (series absent, not zero)
+    input_series:
+      # Deliberately NO numRecordsOut series at all. Another Flink metric is
+      # present so the test is "this metric is gone", not "Prometheus is empty".
+      - series: 'flink_jobmanager_job_numRestarts{job="flink",job_name="petafs"}'
+        values: '0+0x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: NoFeaturesWritten
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "No feature rows written for 15 minutes"
+              description: >
+                The pipeline is up but producing nothing. Models are reading
+                increasingly stale features and Feast reports them as PRESENT.

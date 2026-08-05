@@ -481,6 +481,15 @@ and converting their credential plumbing without re-running both suites would me
 changes to working topologies. The mechanism is shared, so the conversion is mechanical when it happens;
 what is not shared is the evidence.
 
+**Update (ADR-016 follow-on): `docker-compose.prod.yml` has since been converted too**, leaving only
+`docker-compose.multihost.yml` on environment variables. The stopping point turned out to be
+load-bearing in a way this ADR did not anticipate: `tls_storepass` is baked into the JKS keystores that
+**every** topology shares, so once the HA stack started reading it from a file while prod still read
+`${TLS_STOREPASS:-petafs-dev-secret}`, the prod brokers could not open their own keystore
+(`keystore password was incorrect`) and the stack would not boot. A partially migrated credential is
+worse than either end state whenever the two halves share an artefact. Converted and re-verified by
+re-running the drill suite.
+
 **What it is not.** Nothing here rotates, expires, audits or seals anything. The file sits on a host
 filesystem and any process in the container can read it. It is the *interface* a real secret manager
 plugs into: point the same paths at a Kubernetes projected secret or a Vault agent's tmpfs and no
@@ -551,3 +560,53 @@ negative assertion while leaving the pipeline dead.
 **What it is not.** These are static rules in files on disk; nothing rotates or audits. There is no
 per-client-IP restriction (`host=*` throughout), and the dev stack is deliberately untouched — it keeps
 one `requirepass`, because the point of the dev stack is to be startable.
+
+---
+
+## ADR-017 — Alert rules are unit-tested, and the metrics they watch are verified live
+
+**Decision.** `alerts.yml` has a `promtool test rules` suite (`make alerts-test`, and CI runs it), plus
+a live check that every metric the rules reference actually exists in Prometheus (`make alerts-verify`).
+Both are required; neither alone is evidence.
+
+**The gap this closes.** The README claimed the observability gap was closed on the evidence *"2/2 scrape
+targets up, rules loaded"*. That is the **configured vs. enforced** distinction this repo probes for
+everywhere else — mTLS is proven by triggering a TLS alert, the Kafka ACLs by attempting an operation and
+being refused — and alerting was the one place it had not been applied. A rule that can never fire loads
+exactly as successfully as one that does.
+
+**Why both halves.** They fail in opposite directions and neither covers the other:
+
+| | catches | blind to |
+|---|---|---|
+| `make alerts-test` (promtool) | wrong threshold, wrong `for:`, wrong comparison, expression that never becomes true | a metric name that does not exist — it feeds synthetic series named by hand |
+| `make alerts-verify` (live) | typo'd or renamed metric, rules that failed to load | whether the rule would fire on the condition it is meant to catch |
+
+A rule over `flink_jobmanager_job_numRestart` (no trailing `s`) passes every unit test and then never
+fires in production: the query returns empty, and empty is not an alert. Nothing reports an error. Same
+silent-success shape as a Feast feature-name typo (Invariant 1) — both sides look fine, the answer is
+just absent. The live check extracts metric names **from the rules file** rather than restating them,
+so a rule that starts watching something new is covered without anyone remembering to update a list.
+
+Every alert is tested in **both directions** — fires on its condition, silent below the threshold. The
+silent half is what gives the first half meaning: an expression stuck permanently true would pass a
+fires-only suite while telling you nothing.
+
+**It immediately found a real bug — in the most important alert.** `NoFeaturesWritten` is the one
+covering the failure this whole design fears: the pipeline is up, Feast still answers `PRESENT`, and the
+features get staler every second. It read:
+
+```promql
+sum(rate(flink_taskmanager_job_task_operator_numRecordsOut[10m])) == 0
+```
+
+When the TaskManager **dies**, its metrics do not fall to zero — they stop existing. Prometheus marks
+the series stale, `sum(rate(...))` over nothing is an *empty vector*, and `empty == 0` is empty, not
+true. So the alert was silent in the most likely way for a pipeline to stop writing. Surfaced by
+`alerts-verify` reporting the series missing while a drill had the TaskManager down; confirmed with a
+test case asserting the old expression did **not** fire on an absent series. Fixed with
+`or absent(...)`, and both directions are now in the suite.
+
+**What it is not.** These prove the rules evaluate correctly and watch real metrics. Nothing here proves
+an alert reaches a human — there is no Alertmanager, no routing, and no paging integration. Firing into
+a Prometheus UI nobody is looking at is still an open gap, and it is the next one on this axis.

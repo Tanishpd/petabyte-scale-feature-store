@@ -52,9 +52,18 @@ groups:
       # 5. Features going stale is the failure that serves wrong answers
       #    silently. FeatureView.ttl does NOT cover this — expiry is the sink's
       #    EXPIRE, and a stalled pipeline simply stops refreshing.
+      #
+      #    The `or absent(...)` is load-bearing and was missing. When the
+      #    TaskManager dies its metrics do not fall to zero — they STOP
+      #    EXISTING, Prometheus marks the series stale, and `sum(rate(...))`
+      #    over nothing is an empty vector. `empty == 0` is empty, not true, so
+      #    the alert covering "the pipeline writes nothing" stayed silent in the
+      #    most likely way for a pipeline to stop writing. Proven both ways in
+      #    alerts_test.yml.
       - alert: NoFeaturesWritten
         expr: >
           sum(rate(flink_taskmanager_job_task_operator_numRecordsOut[10m])) == 0
+          or absent(flink_taskmanager_job_task_operator_numRecordsOut)
         for: 15m
         labels: {severity: critical}
         annotations:
