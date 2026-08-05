@@ -42,7 +42,7 @@ make read          # a "model" pulls features for a user — the payoff
 make similar       # find behaviourally similar users (RediSearch KNN)
 make bench         # p50/p95/p99 read latency + Redis footprint
 make verify-windows  # prove the aggregates match an independent pandas recomputation
-make test          # 53 tests, including the Feast codec round-trip
+make test          # 61 tests, including the Feast codec round-trip
 make down          # stop everything
 ```
 
