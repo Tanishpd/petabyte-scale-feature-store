@@ -233,3 +233,37 @@ Replace every ⓔ above with a measurement:
 - `get_online_features()` p50/p95/p99, 1 entity vs. 100 entities per call
 - Redis memory per entity, measured with `MEMORY USAGE` on a real key — validates the 1.8 KB estimate
 - End-to-end freshness: event timestamp → readable, sampled continuously
+
+---
+
+## 9. What `--on-bad-record dlq` costs — measured
+
+`dlq` routes unparseable records to a dead-letter topic instead of dropping them
+silently ([src/flink/dlq.py](../src/flink/dlq.py)). It does that by parsing JSON
+in **Python, per event**, because PyFlink cannot hand the SQL connector a custom
+Java `DeserializationSchema` — a side output is the only place a deserialization
+failure is observable.
+
+That is exactly the thing §3 says not to do, so it was measured rather than
+argued. Identical 48,000-event backfill (150 users over a 1,200 s event-time
+span), drained from `earliest-offset` with a fresh consumer group, dev stack,
+two runs each. Time is from job submission to the first feature key in Redis:
+
+| mode | run 1 | run 2 | keys written |
+|---|---|---|---|
+| `skip` (SQL source, Java parsing) | 29 s | 20 s | 300 |
+| `dlq` (DataStream source, Python parsing) | 28 s | 20 s | 300 |
+
+**No measurable difference, and identical output.** Which is the expected
+result rather than a surprising one: §3's whole argument is that the embedding
+stage dominates, and per-event JSON parsing disappears behind it. The same key
+count in every run also shows the two source paths agree on what is a valid
+record — they are separate implementations, so that is worth checking.
+
+**The honest caveat.** This drain runs at roughly 1,600–2,400 events/s, which is
+well under the measured ~8,500 eps ceiling. It shows the parse cost is invisible
+at ordinary rates; it does **not** show what happens at saturation, where the
+Python worker could plausibly become the constraint instead of the embedding
+UDF. Anyone planning to run `dlq` near the ceiling should repeat the §5
+saturation test with it enabled. Until then the flag stays opt-in for that
+reason as much as for the principle.
