@@ -69,28 +69,41 @@ SHADED_PLAIN_LOGIN_MODULE = (
 )
 
 
-def _kafka_security_options() -> str:
-    """DDL options for an authenticated broker, or nothing for PLAINTEXT."""
+def kafka_client_properties() -> dict[str, str]:
+    """Plain Kafka client properties for an authenticated broker, or {}.
+
+    ONE definition, consumed two ways. The SQL connector wants them as DDL
+    options and the DataStream connector (used by the DLQ source in
+    src/flink/dlq.py) wants a properties map; deriving the DDL form from this
+    dict means the two source paths cannot end up authenticating differently,
+    which would present as one of them hanging on metadata fetch rather than
+    as an error.
+    """
     if not KAFKA_SECURITY_PROTOCOL:
-        return ""
-    jaas = (
-        f"{SHADED_PLAIN_LOGIN_MODULE} required "
-        f'username="{KAFKA_USER}" password="{KAFKA_PASSWORD}";'
-    )
-    opts = (
-        f"      'properties.security.protocol' = '{KAFKA_SECURITY_PROTOCOL}',\n"
-        f"      'properties.sasl.mechanism' = '{KAFKA_SASL_MECHANISM}',\n"
-        f"      'properties.sasl.jaas.config' = '{jaas}',\n"
-    )
+        return {}
+    props = {
+        "security.protocol": KAFKA_SECURITY_PROTOCOL,
+        "sasl.mechanism": KAFKA_SASL_MECHANISM,
+        "sasl.jaas.config": (
+            f"{SHADED_PLAIN_LOGIN_MODULE} required "
+            f'username="{KAFKA_USER}" password="{KAFKA_PASSWORD}";'
+        ),
+    }
     if KAFKA_SSL_TRUSTSTORE:
         # Without endpoint identification the connection is encrypted but will
         # accept any certificate, which gives up most of the guarantee.
-        opts += (
-            f"      'properties.ssl.truststore.location' = '{KAFKA_SSL_TRUSTSTORE}',\n"
-            f"      'properties.ssl.truststore.password' = '{KAFKA_SSL_TRUSTSTORE_PASSWORD}',\n"
-            "      'properties.ssl.endpoint.identification.algorithm' = 'https',\n"
-        )
-    return opts
+        props["ssl.truststore.location"] = KAFKA_SSL_TRUSTSTORE
+        props["ssl.truststore.password"] = KAFKA_SSL_TRUSTSTORE_PASSWORD
+        props["ssl.endpoint.identification.algorithm"] = "https"
+    return props
+
+
+def _kafka_security_options() -> str:
+    """DDL options for an authenticated broker, or nothing for PLAINTEXT."""
+    return "".join(
+        f"      'properties.{k}' = '{v}',\n"
+        for k, v in kafka_client_properties().items()
+    )
 
 
 def build_source_ddl(
@@ -135,14 +148,16 @@ def build_source_ddl(
     line. Flink's JSON format discards on `json.ignore-parse-errors` without
     incrementing a metric.
 
-    So drops here are genuinely invisible, and no alert can currently detect
-    them (conservation between Kafka records-consumed and source records-out is
-    ~4x apart on a healthy pipeline, so any realistic drop rate is below the
-    noise). Closing this properly means routing bad records to a dead-letter
-    topic rather than dropping them — a change to this job, not to a rule file.
-    Until then `skip` trades a stalled pipeline for data loss you cannot see,
-    which is the right trade only because the alternative was measured to be a
-    permanent restart loop.
+    So drops under `skip` are genuinely invisible, and no alert can detect them
+    (conservation between Kafka records-consumed and source records-out is ~4x
+    apart on a healthy pipeline, so any realistic drop rate is below the noise).
+
+    **`--on-bad-record dlq` is the answer to that**, and it is what you want in
+    production: the record is neither dropped nor fatal, it is written to a
+    dead-letter topic with the reason and the raw payload, so it can be
+    inspected and replayed. See src/flink/dlq.py for what it costs — it parses
+    JSON in Python per event, which is a real trade against Invariant 5, and is
+    therefore opt-in rather than the default.
     """
     bounded_opt = (
         "  'scan.bounded.mode' = 'latest-offset',\n" if bounded else ""
@@ -290,10 +305,17 @@ def main() -> int:
     ap.add_argument("--startup-mode", default="latest-offset",
                     choices=["earliest-offset", "latest-offset", "group-offsets"])
     ap.add_argument("--parallelism", type=int, default=None)
-    ap.add_argument("--on-bad-record", default="fail", choices=["fail", "skip"],
+    ap.add_argument("--on-bad-record", default="fail",
+                    choices=["fail", "skip", "dlq"],
                     help="fail (default, dev): a malformed record stops the job, "
-                         "so schema drift is loud. skip (prod): tolerate it and "
-                         "count the drops instead of dying on one bad message.")
+                         "so schema drift is loud. skip: tolerate it — but the "
+                         "drop is INVISIBLE (measured: no metric, no log). "
+                         "dlq: tolerate it and write the payload plus the reason "
+                         "to --dlq-topic, at the cost of parsing in Python "
+                         "per event. See src/flink/dlq.py.")
+    ap.add_argument("--dlq-topic", default=None,
+                    help="dead-letter topic for --on-bad-record dlq "
+                         "(default: <topic>.dlq)")
     ap.add_argument("--sink", default="redis", choices=["redis", "print"],
                     help="redis writes Feast-encoded hashes (the real path); "
                          "print dumps rows to the TaskManager stdout")
@@ -307,14 +329,34 @@ def main() -> int:
     stream_env, t_env = build_stream_env(args.parallelism)
     tolerate_bad = args.on_bad_record == "skip"
     if tolerate_bad:
-        print("WARNING: --on-bad-record skip — malformed records are DROPPED. "
-              "Watch numRecordsIn on the source vs the producer's send count; "
-              "a growing gap means schema drift, not a quiet pipeline.")
-    t_env.execute_sql(
-        build_source_ddl(args.bootstrap, args.topic, args.group_id,
-                         args.startup_mode, bounded=False,
-                         ignore_parse_errors=tolerate_bad)
-    )
+        print("WARNING: --on-bad-record skip — malformed records are DROPPED and "
+              "the drop is INVISIBLE: Flink's JSON format discards them without "
+              "incrementing a metric or logging (measured). Use --on-bad-record "
+              "dlq to keep the payload.")
+
+    if args.on_bad_record == "dlq":
+        # A DataStream source instead of the SQL DDL, because a side output is
+        # the only place a deserialization failure is observable from PyFlink.
+        # It registers the same table name, columns and watermark, so
+        # everything below is identical.
+        from src.flink.dlq import register_validated_source
+
+        dlq_topic = args.dlq_topic or f"{args.topic}.dlq"
+        print(f"--on-bad-record dlq — unparseable records go to '{dlq_topic}'. "
+              f"NOTE: this parses JSON in Python per event; see docs/SCALING.md "
+              f"for the measured throughput cost.")
+        register_validated_source(
+            stream_env, t_env,
+            bootstrap=args.bootstrap, topic=args.topic, group_id=args.group_id,
+            startup_mode=args.startup_mode, dlq_topic=dlq_topic,
+            properties=kafka_client_properties(), source_table=SOURCE_TABLE,
+        )
+    else:
+        t_env.execute_sql(
+            build_source_ddl(args.bootstrap, args.topic, args.group_id,
+                             args.startup_mode, bounded=False,
+                             ignore_parse_errors=tolerate_bad)
+        )
 
     register_embedding_udfs(t_env)
     t_env.create_temporary_view("windowed", t_env.sql_query(windowed_aggregate_sql()))
