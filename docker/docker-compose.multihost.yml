@@ -61,6 +61,14 @@ secrets:
     file: ./secrets/tls_storepass
   minio_root_password:
     file: ./secrets/minio_root_password
+  redis_flink_password:
+    file: ./secrets/redis_flink_password
+  redis_reader_password:
+    file: ./secrets/redis_reader_password
+  redis_repl_password:
+    file: ./secrets/redis_repl_password
+  redis_sentinel_password:
+    file: ./secrets/redis_sentinel_password
 
 # ---------------------------------------------------------------------------
 # Addressing. Defaults are the natural ports, i.e. what a genuine three-machine
@@ -200,7 +208,7 @@ services:
     healthcheck: *kafka-healthcheck
 
   redis-primary:
-    secrets: [redis_password]
+    secrets: [redis_password, redis_flink_password, redis_reader_password, redis_repl_password, redis_sentinel_password]
     <<: *redis-common
     profiles: ["a"]
     container_name: petafs-mh-redis-primary
@@ -214,8 +222,6 @@ services:
         CONF=/data/redis.conf
         if [ ! -f "$$CONF" ]; then
           cat > "$$CONF" <<EOF
-        requirepass $$PW
-        masterauth $$PW
         appendonly yes
         dir /data
         port 0
@@ -235,20 +241,28 @@ services:
         replica-announce-port ${REDIS_A_PORT:-6379}
         EOF
         fi
+        # Same ACL definition as the HA topology, from one file rather than a
+        # second copy: `user default off` plus one user per component, written
+        # on every boot. Until this ran here, prod and multihost were the
+        # "authenticated means root" state ADR-016 exists to close.
+        /usr/local/bin/write-acl.sh "$$CONF"
         exec redis-server "$$CONF"
     ports: ["${REDIS_A_PORT:-6379}:6379"]
     volumes:
       - redis-primary-data:/data
       - ./tls/out:/tls:ro
+      - ./redis/write-acl.sh:/usr/local/bin/write-acl.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli --tls --cacert /tls/ca.crt -a \"$$(cat /run/secrets/redis_password)\" ping | grep -q PONG"]
+      # --user is REQUIRED once `default` is off; a bare -a authenticates a
+      # disabled user and the node reports unhealthy forever.
+      test: ["CMD-SHELL", "redis-cli --tls --cacert /tls/ca.crt --user petafs-admin -a \"$$(cat /run/secrets/redis_password)\" ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
       retries: 12
       start_period: 10s
 
   redis-sentinel-1:
-    secrets: [redis_password]
+    secrets: [redis_password, redis_sentinel_password]
     <<: *redis-common
     profiles: ["a"]
     container_name: petafs-mh-redis-sentinel-1
@@ -257,6 +271,10 @@ services:
       - -c
       - |
         PW=$$(cat /run/secrets/redis_password)
+        # Two credentials: PW is what a CLIENT presents to this Sentinel;
+        # SENTINEL_PW is the much narrower identity Sentinel presents to the
+        # instances it monitors.
+        SENTINEL_PW=$$(cat /run/secrets/redis_sentinel_password)
         CONF=/data/sentinel.conf
         if [ ! -f "$$CONF" ]; then
           cat > "$$CONF" <<EOF
@@ -278,7 +296,8 @@ services:
         sentinel resolve-hostnames yes
         sentinel announce-hostnames yes
         sentinel monitor mymaster ${NODE_A_HOST:-node-a} ${REDIS_A_PORT:-6379} 2
-        sentinel auth-pass mymaster $$PW
+        sentinel auth-user mymaster petafs-sentinel
+        sentinel auth-pass mymaster $$SENTINEL_PW
         sentinel down-after-milliseconds mymaster 5000
         sentinel failover-timeout mymaster 10000
         dir /data
@@ -330,7 +349,7 @@ services:
       && echo 'buckets ready'"
 
   jobmanager:
-    secrets: [redis_password, kafka_password, tls_storepass, minio_root_password]
+    secrets: [redis_password, redis_flink_password, kafka_password, tls_storepass, minio_root_password]
     profiles: ["a"]
     image: petafs/flink:2.2.1
     container_name: petafs-mh-jobmanager
@@ -364,7 +383,9 @@ services:
       REDIS_SENTINELS: >-
         ${NODE_A_HOST:-node-a}:${SENTINEL_A_PORT:-26379},${NODE_B_HOST:-node-b}:${SENTINEL_B_PORT:-26379},${NODE_C_HOST:-node-c}:${SENTINEL_C_PORT:-26379}
       REDIS_SENTINEL_MASTER: mymaster
-      REDIS_PASSWORD_FILE: /run/secrets/redis_password
+      REDIS_USER: petafs-flink
+      REDIS_PASSWORD_FILE: /run/secrets/redis_flink_password
+      REDIS_SENTINEL_PASSWORD_FILE: /run/secrets/redis_password
       REDIS_TLS_CA: /tls/ca.crt
       KAFKA_SECURITY_PROTOCOL: SASL_SSL
       KAFKA_SSL_TRUSTSTORE: /tls/kafka.truststore.jks
@@ -509,7 +530,7 @@ services:
     healthcheck: *kafka-healthcheck
 
   redis-replica:
-    secrets: [redis_password]
+    secrets: [redis_password, redis_flink_password, redis_reader_password, redis_repl_password, redis_sentinel_password]
     <<: *redis-common
     profiles: ["b"]
     container_name: petafs-mh-redis-replica
@@ -521,8 +542,6 @@ services:
         CONF=/data/redis.conf
         if [ ! -f "$$CONF" ]; then
           cat > "$$CONF" <<EOF
-        requirepass $$PW
-        masterauth $$PW
         appendonly yes
         dir /data
         port 0
@@ -539,20 +558,28 @@ services:
         replicaof ${NODE_A_HOST:-node-a} ${REDIS_A_PORT:-6379}
         EOF
         fi
+        # Same ACL definition as the HA topology, from one file rather than a
+        # second copy: `user default off` plus one user per component, written
+        # on every boot. Until this ran here, prod and multihost were the
+        # "authenticated means root" state ADR-016 exists to close.
+        /usr/local/bin/write-acl.sh "$$CONF"
         exec redis-server "$$CONF"
     ports: ["${REDIS_B_PORT:-6379}:6379"]
     volumes:
       - redis-replica-data:/data
       - ./tls/out:/tls:ro
+      - ./redis/write-acl.sh:/usr/local/bin/write-acl.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli --tls --cacert /tls/ca.crt -a \"$$(cat /run/secrets/redis_password)\" ping | grep -q PONG"]
+      # --user is REQUIRED once `default` is off; a bare -a authenticates a
+      # disabled user and the node reports unhealthy forever.
+      test: ["CMD-SHELL", "redis-cli --tls --cacert /tls/ca.crt --user petafs-admin -a \"$$(cat /run/secrets/redis_password)\" ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
       retries: 12
       start_period: 10s
 
   redis-sentinel-2:
-    secrets: [redis_password]
+    secrets: [redis_password, redis_sentinel_password]
     <<: *redis-common
     profiles: ["b"]
     container_name: petafs-mh-redis-sentinel-2
@@ -561,6 +588,10 @@ services:
       - -c
       - |
         PW=$$(cat /run/secrets/redis_password)
+        # Two credentials: PW is what a CLIENT presents to this Sentinel;
+        # SENTINEL_PW is the much narrower identity Sentinel presents to the
+        # instances it monitors.
+        SENTINEL_PW=$$(cat /run/secrets/redis_sentinel_password)
         CONF=/data/sentinel.conf
         if [ ! -f "$$CONF" ]; then
           cat > "$$CONF" <<EOF
@@ -577,7 +608,8 @@ services:
         sentinel resolve-hostnames yes
         sentinel announce-hostnames yes
         sentinel monitor mymaster ${NODE_A_HOST:-node-a} ${REDIS_A_PORT:-6379} 2
-        sentinel auth-pass mymaster $$PW
+        sentinel auth-user mymaster petafs-sentinel
+        sentinel auth-pass mymaster $$SENTINEL_PW
         sentinel down-after-milliseconds mymaster 5000
         sentinel failover-timeout mymaster 10000
         dir /data
@@ -590,7 +622,7 @@ services:
       - ./tls/out:/tls:ro
 
   taskmanager-b:
-    secrets: [redis_password, kafka_password, tls_storepass, minio_root_password]
+    secrets: [redis_password, redis_flink_password, kafka_password, tls_storepass, minio_root_password]
     profiles: ["b"]
     image: petafs/flink:2.2.1
     container_name: petafs-mh-taskmanager-b
@@ -620,7 +652,9 @@ services:
       REDIS_SENTINELS: >-
         ${NODE_A_HOST:-node-a}:${SENTINEL_A_PORT:-26379},${NODE_B_HOST:-node-b}:${SENTINEL_B_PORT:-26379},${NODE_C_HOST:-node-c}:${SENTINEL_C_PORT:-26379}
       REDIS_SENTINEL_MASTER: mymaster
-      REDIS_PASSWORD_FILE: /run/secrets/redis_password
+      REDIS_USER: petafs-flink
+      REDIS_PASSWORD_FILE: /run/secrets/redis_flink_password
+      REDIS_SENTINEL_PASSWORD_FILE: /run/secrets/redis_password
       REDIS_TLS_CA: /tls/ca.crt
       KAFKA_SECURITY_PROTOCOL: SASL_SSL
       KAFKA_SSL_TRUSTSTORE: /tls/kafka.truststore.jks
@@ -682,7 +716,7 @@ services:
     healthcheck: *kafka-healthcheck
 
   redis-sentinel-3:
-    secrets: [redis_password]
+    secrets: [redis_password, redis_sentinel_password]
     <<: *redis-common
     profiles: ["c"]
     container_name: petafs-mh-redis-sentinel-3
@@ -691,6 +725,10 @@ services:
       - -c
       - |
         PW=$$(cat /run/secrets/redis_password)
+        # Two credentials: PW is what a CLIENT presents to this Sentinel;
+        # SENTINEL_PW is the much narrower identity Sentinel presents to the
+        # instances it monitors.
+        SENTINEL_PW=$$(cat /run/secrets/redis_sentinel_password)
         CONF=/data/sentinel.conf
         if [ ! -f "$$CONF" ]; then
           cat > "$$CONF" <<EOF
@@ -707,7 +745,8 @@ services:
         sentinel resolve-hostnames yes
         sentinel announce-hostnames yes
         sentinel monitor mymaster ${NODE_A_HOST:-node-a} ${REDIS_A_PORT:-6379} 2
-        sentinel auth-pass mymaster $$PW
+        sentinel auth-user mymaster petafs-sentinel
+        sentinel auth-pass mymaster $$SENTINEL_PW
         sentinel down-after-milliseconds mymaster 5000
         sentinel failover-timeout mymaster 10000
         dir /data
@@ -720,7 +759,7 @@ services:
       - ./tls/out:/tls:ro
 
   taskmanager-c:
-    secrets: [redis_password, kafka_password, tls_storepass, minio_root_password]
+    secrets: [redis_password, redis_flink_password, kafka_password, tls_storepass, minio_root_password]
     profiles: ["c"]
     image: petafs/flink:2.2.1
     container_name: petafs-mh-taskmanager-c
@@ -746,7 +785,9 @@ services:
       REDIS_SENTINELS: >-
         ${NODE_A_HOST:-node-a}:${SENTINEL_A_PORT:-26379},${NODE_B_HOST:-node-b}:${SENTINEL_B_PORT:-26379},${NODE_C_HOST:-node-c}:${SENTINEL_C_PORT:-26379}
       REDIS_SENTINEL_MASTER: mymaster
-      REDIS_PASSWORD_FILE: /run/secrets/redis_password
+      REDIS_USER: petafs-flink
+      REDIS_PASSWORD_FILE: /run/secrets/redis_flink_password
+      REDIS_SENTINEL_PASSWORD_FILE: /run/secrets/redis_password
       REDIS_TLS_CA: /tls/ca.crt
       KAFKA_SECURITY_PROTOCOL: SASL_SSL
       KAFKA_SSL_TRUSTSTORE: /tls/kafka.truststore.jks

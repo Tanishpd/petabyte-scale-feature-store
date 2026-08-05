@@ -1,0 +1,258 @@
+{
+  "title": "petafs \u2014 pipeline health",
+  "uid": "petafs-pipeline",
+  "tags": [
+    "petafs"
+  ],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "description": "One panel per alert in docker/observability/alerts.yml, so the dashboard answers 'why did that fire' instead of showing whatever Prometheus exposes. The alerts are the contract; this is the view.",
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {
+          "text": "Prometheus",
+          "value": "Prometheus"
+        },
+        "hide": 0
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Feature rows written /s",
+      "type": "timeseries",
+      "description": "NoFeaturesWritten alerts when this is 0 for 15m, or when the series vanishes entirely (a dead TaskManager's metrics stop existing rather than going to zero).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(flink_taskmanager_job_task_operator_numRecordsOut[1m]))",
+          "legendFormat": "{{node}}{{role}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Event-time lag",
+      "type": "timeseries",
+      "description": "KafkaConsumerLagGrowing fires above 2 min for 5m. The measured ceiling is ~8,500 eps; sustained lag means the embedding tier is saturated (SCALING \u00a73).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum(flink_taskmanager_job_task_operator_currentEmitEventTimeLag)",
+          "legendFormat": "{{node}}{{role}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Backpressure",
+      "type": "timeseries",
+      "description": "SustainedBackpressure fires above 500 ms/s for 10m. Averaged deliberately: one hot operator is normal here, the embedding UDF is the expensive stage.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "avg(flink_taskmanager_job_task_backPressuredTimeMsPerSecond)",
+          "legendFormat": "{{node}}{{role}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Checkpoints \u2014 completed vs failed",
+      "type": "timeseries",
+      "description": "CheckpointsFailing fires on >2 failures in 15m. Without checkpoints a restart replays from source and loses window state (ADR-011).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum(flink_jobmanager_job_numberOfCompletedCheckpoints)",
+          "legendFormat": "{{node}}{{role}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Job restarts",
+      "type": "timeseries",
+      "description": "JobRestarting fires above 3 in 10m \u2014 set above one ordinary recovery, which the drills cause deliberately.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 14
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum(flink_jobmanager_job_numRestarts)",
+          "legendFormat": "{{node}}{{role}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Records consumed from Kafka /s",
+      "type": "timeseries",
+      "description": "Compare against feature rows written above. NOTE: these two are ~4x apart on a healthy pipeline, so the gap is NOT a drop counter \u2014 see ADR-018 for why the dropped-record alert was deleted rather than shipped.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 14
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(flink_taskmanager_job_task_operator_KafkaSourceReader_KafkaConsumer_records_consumed_total[1m]))",
+          "legendFormat": "{{node}}{{role}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Failed checkpoints",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum(flink_jobmanager_job_numberOfFailedCheckpoints)",
+          "legendFormat": "failed",
+          "refId": "B"
+        }
+      ]
+    }
+  ]
+}

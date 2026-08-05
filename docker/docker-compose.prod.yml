@@ -29,6 +29,14 @@ secrets:
     file: ./secrets/tls_storepass
   minio_root_password:
     file: ./secrets/minio_root_password
+  redis_flink_password:
+    file: ./secrets/redis_flink_password
+  redis_reader_password:
+    file: ./secrets/redis_reader_password
+  redis_repl_password:
+    file: ./secrets/redis_repl_password
+  redis_sentinel_password:
+    file: ./secrets/redis_sentinel_password
   grafana_password:
     file: ./secrets/grafana_password
 
@@ -220,7 +228,7 @@ services:
       && echo 'buckets ready'"
 
   redis-primary:
-    secrets: [redis_password]
+    secrets: [redis_password, redis_flink_password, redis_reader_password, redis_repl_password, redis_sentinel_password]
     image: redis/redis-stack-server:7.4.0-v8
     container_name: petafs-prod-redis-primary
     restart: unless-stopped
@@ -238,8 +246,6 @@ services:
         CONF=/data/redis.conf
         if [ ! -f "$$CONF" ]; then
           cat > "$$CONF" <<EOF
-        requirepass $$PW
-        masterauth $$PW
         appendonly yes
         dir /data
         # TLS-only: `port 0` disables the plaintext listener entirely, so an
@@ -278,19 +284,27 @@ services:
           echo "replicaof $$PEER 6379" >> "$$CONF.tmp"
           mv "$$CONF.tmp" "$$CONF"
         fi
+        # Same ACL definition as the HA topology, from one file rather than a
+        # second copy: `user default off` plus one user per component, written
+        # on every boot. Until this ran here, prod and multihost were the
+        # "authenticated means root" state ADR-016 exists to close.
+        /usr/local/bin/write-acl.sh "$$CONF"
         exec redis-server "$$CONF"
     volumes:
       - redis-primary-data:/data
       - ./tls/out:/tls:ro
+      - ./redis/write-acl.sh:/usr/local/bin/write-acl.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli --tls --cacert /tls/ca.crt -a \"$$(cat /run/secrets/redis_password)\" ping | grep -q PONG"]
+      # --user is REQUIRED once `default` is off; a bare -a authenticates a
+      # disabled user and the node reports unhealthy forever.
+      test: ["CMD-SHELL", "redis-cli --tls --cacert /tls/ca.crt --user petafs-admin -a \"$$(cat /run/secrets/redis_password)\" ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
       retries: 12
       start_period: 10s
 
   redis-replica:
-    secrets: [redis_password]
+    secrets: [redis_password, redis_flink_password, redis_reader_password, redis_repl_password, redis_sentinel_password]
     image: redis/redis-stack-server:7.4.0-v8
     container_name: petafs-prod-redis-replica
     restart: unless-stopped
@@ -303,8 +317,6 @@ services:
         CONF=/data/redis.conf
         if [ ! -f "$$CONF" ]; then
           cat > "$$CONF" <<EOF
-        requirepass $$PW
-        masterauth $$PW
         appendonly yes
         dir /data
         # TLS-only: `port 0` disables the plaintext listener entirely, so an
@@ -344,22 +356,30 @@ services:
           echo "replicaof $$PEER 6379" >> "$$CONF.tmp"
           mv "$$CONF.tmp" "$$CONF"
         fi
+        # Same ACL definition as the HA topology, from one file rather than a
+        # second copy: `user default off` plus one user per component, written
+        # on every boot. Until this ran here, prod and multihost were the
+        # "authenticated means root" state ADR-016 exists to close.
+        /usr/local/bin/write-acl.sh "$$CONF"
         exec redis-server "$$CONF"
     volumes:
       - redis-replica-data:/data
       - ./tls/out:/tls:ro
+      - ./redis/write-acl.sh:/usr/local/bin/write-acl.sh:ro
     depends_on:
       redis-primary:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli --tls --cacert /tls/ca.crt -a \"$$(cat /run/secrets/redis_password)\" ping | grep -q PONG"]
+      # --user is REQUIRED once `default` is off; a bare -a authenticates a
+      # disabled user and the node reports unhealthy forever.
+      test: ["CMD-SHELL", "redis-cli --tls --cacert /tls/ca.crt --user petafs-admin -a \"$$(cat /run/secrets/redis_password)\" ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
       retries: 12
       start_period: 10s
 
   redis-sentinel-1:
-    secrets: [redis_password]
+    secrets: [redis_password, redis_sentinel_password]
     image: redis/redis-stack-server:7.4.0-v8
     container_name: petafs-prod-redis-sentinel-1
     restart: unless-stopped
@@ -368,6 +388,10 @@ services:
       - -c
       - |
         PW=$$(cat /run/secrets/redis_password)
+        # Two credentials: PW is what a CLIENT presents to this Sentinel;
+        # SENTINEL_PW is the much narrower identity Sentinel presents to the
+        # instances it monitors.
+        SENTINEL_PW=$$(cat /run/secrets/redis_sentinel_password)
         CONF=/data/sentinel.conf
         # REGENERATED ON EVERY BOOT, unlike redis.conf next door — and the
         # asymmetry is deliberate.
@@ -402,7 +426,8 @@ services:
         sentinel resolve-hostnames yes
         sentinel announce-hostnames yes
         sentinel monitor mymaster redis-primary 6379 2
-        sentinel auth-pass mymaster $$PW
+        sentinel auth-user mymaster petafs-sentinel
+        sentinel auth-pass mymaster $$SENTINEL_PW
         sentinel down-after-milliseconds mymaster 5000
         sentinel failover-timeout mymaster 10000
         dir /data
@@ -420,7 +445,7 @@ services:
         condition: service_healthy
 
   redis-sentinel-2:
-    secrets: [redis_password]
+    secrets: [redis_password, redis_sentinel_password]
     image: redis/redis-stack-server:7.4.0-v8
     container_name: petafs-prod-redis-sentinel-2
     restart: unless-stopped
@@ -429,6 +454,10 @@ services:
       - -c
       - |
         PW=$$(cat /run/secrets/redis_password)
+        # Two credentials: PW is what a CLIENT presents to this Sentinel;
+        # SENTINEL_PW is the much narrower identity Sentinel presents to the
+        # instances it monitors.
+        SENTINEL_PW=$$(cat /run/secrets/redis_sentinel_password)
         CONF=/data/sentinel.conf
         # REGENERATED ON EVERY BOOT, unlike redis.conf next door — and the
         # asymmetry is deliberate.
@@ -463,7 +492,8 @@ services:
         sentinel resolve-hostnames yes
         sentinel announce-hostnames yes
         sentinel monitor mymaster redis-primary 6379 2
-        sentinel auth-pass mymaster $$PW
+        sentinel auth-user mymaster petafs-sentinel
+        sentinel auth-pass mymaster $$SENTINEL_PW
         sentinel down-after-milliseconds mymaster 5000
         sentinel failover-timeout mymaster 10000
         dir /data
@@ -481,7 +511,7 @@ services:
         condition: service_healthy
 
   redis-sentinel-3:
-    secrets: [redis_password]
+    secrets: [redis_password, redis_sentinel_password]
     image: redis/redis-stack-server:7.4.0-v8
     container_name: petafs-prod-redis-sentinel-3
     restart: unless-stopped
@@ -490,6 +520,10 @@ services:
       - -c
       - |
         PW=$$(cat /run/secrets/redis_password)
+        # Two credentials: PW is what a CLIENT presents to this Sentinel;
+        # SENTINEL_PW is the much narrower identity Sentinel presents to the
+        # instances it monitors.
+        SENTINEL_PW=$$(cat /run/secrets/redis_sentinel_password)
         CONF=/data/sentinel.conf
         # REGENERATED ON EVERY BOOT, unlike redis.conf next door — and the
         # asymmetry is deliberate.
@@ -524,7 +558,8 @@ services:
         sentinel resolve-hostnames yes
         sentinel announce-hostnames yes
         sentinel monitor mymaster redis-primary 6379 2
-        sentinel auth-pass mymaster $$PW
+        sentinel auth-user mymaster petafs-sentinel
+        sentinel auth-pass mymaster $$SENTINEL_PW
         sentinel down-after-milliseconds mymaster 5000
         sentinel failover-timeout mymaster 10000
         dir /data
@@ -542,7 +577,7 @@ services:
         condition: service_healthy
 
   jobmanager:
-    secrets: [redis_password, kafka_password, tls_storepass, minio_root_password]
+    secrets: [redis_password, redis_flink_password, kafka_password, tls_storepass, minio_root_password]
     image: petafs/flink:2.2.1
     container_name: petafs-prod-jobmanager
     restart: unless-stopped
@@ -567,7 +602,9 @@ services:
       # either gone or a read-only replica, and every write fails with READONLY.
       REDIS_SENTINELS: redis-sentinel-1:26379,redis-sentinel-2:26379,redis-sentinel-3:26379
       REDIS_SENTINEL_MASTER: mymaster
-      REDIS_PASSWORD_FILE: /run/secrets/redis_password
+      REDIS_USER: petafs-flink
+      REDIS_PASSWORD_FILE: /run/secrets/redis_flink_password
+      REDIS_SENTINEL_PASSWORD_FILE: /run/secrets/redis_password
       REDIS_TLS_CA: /tls/ca.crt
       KAFKA_SECURITY_PROTOCOL: SASL_SSL
       KAFKA_SSL_TRUSTSTORE: /tls/kafka.truststore.jks
@@ -618,7 +655,7 @@ services:
       start_period: 30s
 
   taskmanager:
-    secrets: [redis_password, kafka_password, tls_storepass, minio_root_password]
+    secrets: [redis_password, redis_flink_password, kafka_password, tls_storepass, minio_root_password]
     image: petafs/flink:2.2.1
     restart: unless-stopped
     # Flink's S3 filesystem reads AWS_SECRET_ACCESS_KEY from the process
@@ -640,7 +677,9 @@ services:
       # either gone or a read-only replica, and every write fails with READONLY.
       REDIS_SENTINELS: redis-sentinel-1:26379,redis-sentinel-2:26379,redis-sentinel-3:26379
       REDIS_SENTINEL_MASTER: mymaster
-      REDIS_PASSWORD_FILE: /run/secrets/redis_password
+      REDIS_USER: petafs-flink
+      REDIS_PASSWORD_FILE: /run/secrets/redis_flink_password
+      REDIS_SENTINEL_PASSWORD_FILE: /run/secrets/redis_password
       REDIS_TLS_CA: /tls/ca.crt
       KAFKA_SECURITY_PROTOCOL: SASL_SSL
       KAFKA_SSL_TRUSTSTORE: /tls/kafka.truststore.jks
@@ -726,6 +765,11 @@ services:
     secrets: [grafana_password]
     image: grafana/grafana:11.6.0
     container_name: petafs-prod-grafana
+    # Provisioned from disk. A dashboard built by clicking in the UI lives in
+    # Grafana's own database and vanishes with the volume; these are in git.
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
     restart: unless-stopped
     environment:
       GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_password

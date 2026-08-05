@@ -23,7 +23,10 @@ KAFKA_PW=$(_secret kafka_password)
 STOREPASS=$(_secret tls_storepass)
 # Redis and Sentinel are TLS-only in the production topology (`port 0` disables
 # the plaintext listener), so every redis-cli call needs --tls and the CA.
-RCLI="redis-cli --tls --cacert /tls/ca.crt"
+# --user is REQUIRED now that `default` is off on the data nodes: a bare
+# `-a $PW` authenticates a DISABLED user, and every Redis probe would then
+# report the store as unreachable rather than as locked down.
+RCLI="redis-cli --tls --cacert /tls/ca.crt --user petafs-admin"
 
 pass=0; fail=0
 step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }

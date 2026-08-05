@@ -27,7 +27,10 @@ _secret() { [ -f "$SECRETS/$1" ] || { echo "missing $SECRETS/$1 — run 'make se
 PW=$(_secret redis_password)
 KAFKA_PW=$(_secret kafka_password)
 STOREPASS=$(_secret tls_storepass)
-RCLI="redis-cli --tls --cacert /tls/ca.crt"
+# --user is REQUIRED now that `default` is off on the data nodes: a bare
+# `-a $PW` authenticates a DISABLED user, and every Redis probe would then
+# report the store as unreachable rather than as locked down.
+RCLI="redis-cli --tls --cacert /tls/ca.crt --user petafs-admin"
 K1=petafs-mh-kafka1
 TOPIC="${TOPIC:-transactions}"
 

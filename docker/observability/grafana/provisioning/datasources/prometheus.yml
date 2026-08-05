@@ -1,0 +1,15 @@
+# Provisioned so Grafana comes up wired, rather than showing a login screen and
+# an empty datasource list. Until this existed the prod topology ran Grafana and
+# the README counted it as closing the "nothing watched it" gap — with no
+# datasource and no dashboard in it.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    # The service name, not localhost: Grafana resolves this inside the compose
+    # network, and `localhost` would point at the Grafana container itself.
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false

@@ -1,0 +1,13 @@
+# Load dashboards from disk so they are version-controlled and survive a
+# container recreate. A dashboard built by clicking in the UI lives in Grafana's
+# database and disappears with the volume.
+apiVersion: 1
+
+providers:
+  - name: petafs
+    type: file
+    disableDeletion: false
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false
