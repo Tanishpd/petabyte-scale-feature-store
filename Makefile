@@ -30,7 +30,7 @@ endif
 
 .DEFAULT_GOAL := help
 .PHONY: help bootstrap build up down restart ps logs health topics sample tail-topic topic-count \
-        secrets secrets-rotate \
+        secrets secrets-rotate backup restore \
         produce submit apply seed registry read bench test smoke clean nuke \
         verify-seed verify-windows bench-embed similar \
         prod-up prod-down prod-clean prod-ps prod-submit prod-drill prod-tls \
@@ -152,6 +152,19 @@ bench:  ## p50/p95/p99 online read latency + Redis footprint
 
 test:  ## Run pytest (includes the Feast codec round-trip)
 	$(VENV)/bin/pytest -q tests/
+
+backup:  ## Back up the state that cannot be rebuilt (registry + offline store)
+	@# Redis is a cache and Kafka has its own replication; neither is included.
+	@# The registry is the load-bearing one — the Redis field keys are mmh3
+	@# hashes of the feature names it holds, so losing it makes every key
+	@# already in Redis unaddressable (Invariant 1).
+	@# INCLUDE_SECRETS=1 to add docker/secrets (off by default, on purpose).
+	bash scripts/backup.sh
+
+restore:  ## Restore a backup: make restore ARCHIVE=backups/petafs-backup-....tar.gz
+	@# Verifies every checksum BEFORE writing anything, and moves the current
+	@# state aside rather than overwriting it.
+	bash scripts/restore.sh $(ARCHIVE)
 
 alerts-test:  ## Prove each alert rule FIRES on its condition (no stack needed)
 	@# "rules loaded" is not evidence an alert works — the same configured-vs-

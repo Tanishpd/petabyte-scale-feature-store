@@ -61,3 +61,6 @@ docker/tls/out/
 # Never committed. `make secrets` recreates them; the topologies mount them
 # as files so they stay out of `docker inspect` and `docker compose config`.
 docker/secrets/
+
+# Local backups — these contain the offline store and may contain secrets.
+backups/

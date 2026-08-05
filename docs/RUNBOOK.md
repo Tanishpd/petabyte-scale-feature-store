@@ -196,7 +196,62 @@ raw name (Invariant 8).
 | `SustainedBackpressure` | Which operator. Embedding is the expected culprit; anything else is a regression. |
 | `NoFeaturesWritten` | **Most serious.** The pipeline is up and serving increasingly stale features that Feast still reports as `PRESENT`. Check the sink's Redis connection and whether windows are firing at all. |
 
-## 7. Restoring from nothing
+## 7. Backup — what is worth saving, and what is not
+
+Most of this system is derived and disposable, which is why there is so little
+to back up:
+
+| | rebuild from | backed up? |
+|---|---|---|
+| Redis (online store) | replay Kafka — it is a cache, TTL 30 min | **no**, deliberately |
+| Kafka | RF=3, `min.insync.replicas=2` | **no** — its own replication, and retention bounds how far back you can rebuild |
+| Flink checkpoints | the object store's durability | **no** — covered there |
+| `registry.db` | **nothing** | **yes** |
+| `*.parquet` (offline store) | **nothing**, once Kafka retention ages out | **yes** |
+
+`make backup` saves the last two. `make restore ARCHIVE=...` puts them back,
+verifying every checksum **before** it writes and moving the current state aside
+rather than overwriting it.
+
+**The registry is the one that matters, and it is easy to underrate because it
+is a few kilobytes.** Redis field keys are `mmh3("<view>:<feature>")` hashes
+computed from the names the registry holds (Invariant 1). Lose it and every key
+already in Redis becomes unaddressable — the data is all still there and nothing
+can name it. Both files are also **gitignored**, so before `make backup` existed
+they lived on exactly one disk with no copy anywhere.
+
+`docker/secrets/` is **excluded by default**. A restore needs them, but writing
+credentials into a tarball beside the data turns one stolen file into a full
+compromise. `INCLUDE_SECRETS=1 make backup` opts in, and the manifest records
+which choice was made.
+
+### RPO and RTO
+
+| | value | set by |
+|---|---|---|
+| **RPO, registry** | time since the last `make backup` | your backup cadence — the registry only changes on `feast apply`, so back it up as part of deploying a schema change rather than on a timer |
+| **RPO, offline store** | time since the last `make backup` | how often the parquet is regenerated |
+| **RPO, online store** | **0** — nothing to lose | it is derived; replay rebuilds it exactly |
+| **RTO, online store** | one window slide for active users, up to the full 10 min for complete values | §7 below |
+| **RTO, registry + offline** | seconds — `make restore` is a checksum pass and a file copy | archive size |
+
+The binding constraint on recovery is **not** the backup: it is Kafka retention.
+If you need to rebuild the online store from a point earlier than retention
+covers, those features are gone and no backup here changes that. That is the
+argument for the offline store, and it is why the parquet is in the archive.
+
+### Restores are tested, not assumed
+
+A backup you have never restored is not a backup.
+`tests/test_backup_restore.py` runs the real scripts against a real archive on
+every CI run — round trip, byte-for-byte; a **corrupted** archive is refused
+with nothing written; an archive without a manifest is refused; existing state
+is moved aside rather than clobbered; and secrets stay out unless asked for.
+The corruption case is the one that earns its keep: a silently-restored corrupt
+registry does not raise, Feast opens it, and every online read returns `None`
+with nothing logged anywhere.
+
+## 8. Restoring from nothing
 
 Features are derived and TTL'd at 30 minutes, so the online store is a cache,
 not a system of record. Rebuilding:

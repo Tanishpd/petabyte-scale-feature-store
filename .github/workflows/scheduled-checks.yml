@@ -1,0 +1,125 @@
+# Scheduled regression checks — the ones that need no running topology.
+#
+# WHY THIS IS NARROWER THAN "RUN THE DRILLS ON A SCHEDULE"
+# --------------------------------------------------------
+# The obvious version of this job runs `make prod-drill` and `make mh-ha-drill`
+# nightly. That would be worse than nothing here: those suites need ~20
+# containers and several GiB, and on a runner (or on the laptop this was built
+# on) they fail for lack of memory rather than for a regression. A schedule that
+# goes red for environmental reasons trains people to ignore it, and then it
+# catches nothing on the day it matters.
+#
+# So this runs exactly what is deterministic without a cluster:
+#
+#   * the full pytest suite, including the backup/restore round trip and the
+#     dead-letter routing rules
+#   * promtool over the real alerts.yml — every alert asserted to fire on its
+#     condition and stay silent below the threshold
+#   * `docker compose config` on all FOUR topology files
+#
+# That last one is cheap and catches a real class of bug: the compose files are
+# edited far more often than they are booted, and a YAML or interpolation error
+# in the HA file currently surfaces only when someone spends ten minutes
+# bringing it up. It also catches a missing secret reference, which is how the
+# prod stack silently broke once already (ADR-015).
+#
+# The drills stay MANUAL and are documented as such in docs/MULTIHOST.md. They
+# belong on a schedule once there is a persistent environment with room to run
+# them — that is a hardware question, not a CI one.
+name: scheduled-checks
+
+on:
+  schedule:
+    # 04:00 UTC daily. Nothing here depends on the time; it is off-peak for
+    # shared runners.
+    - cron: "0 4 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  deterministic:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install host dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-host.txt
+
+      - name: Generate secrets
+        # The compose files reference docker/secrets/* and those are gitignored,
+        # so `docker compose config` cannot resolve them without this. The
+        # generator is idempotent and writes throwaway values into the runner.
+        run: make secrets
+
+      - name: Seed and apply, so the registry exists
+        run: |
+          python scripts/seed_offline.py --hours 0.2 --users 300 --eps 20
+          cd src/feast_repo && feast apply
+
+      - name: Tests
+        run: |
+          set -o pipefail
+          pytest -q -rs tests/ | tee /tmp/pytest.out
+
+      - name: Fail if any test was skipped
+        # Same reasoning as tests.yml: every test here degrades to a skip when
+        # its infra guard trips, so a broken environment would otherwise produce
+        # a green run that asserted nothing.
+        run: |
+          if grep -qE '[0-9]+ skipped' /tmp/pytest.out; then
+            echo "::error::Tests were SKIPPED — this run proved nothing."
+            grep -E 'SKIPPED|skipped' /tmp/pytest.out
+            exit 1
+          fi
+          echo "no skips — every test actually executed"
+
+      - name: Alert rules fire on their conditions
+        run: |
+          docker run --rm -v "$PWD/docker/observability:/obs:ro" -w /obs \
+            --entrypoint promtool prom/prometheus:v3.2.1 test rules alerts_test.yml
+
+      - name: All four topologies still parse
+        run: |
+          fail=0
+          docker compose -f docker/docker-compose.yml config -q \
+            && echo "  ok  dev" || { echo "  FAIL dev"; fail=1; }
+          docker compose -f docker/docker-compose.prod.yml config -q \
+            && echo "  ok  prod" || { echo "  FAIL prod"; fail=1; }
+          docker compose -f docker/docker-compose.multihost.yml \
+            --env-file docker/multihost/sim.env config -q \
+            && echo "  ok  multihost" || { echo "  FAIL multihost"; fail=1; }
+          docker compose -f docker/docker-compose.multihost-ha.yml \
+            --env-file docker/multihost/sim-ha.env config -q \
+            && echo "  ok  multihost-ha" || { echo "  FAIL multihost-ha"; fail=1; }
+          exit $fail
+
+      - name: No credential may appear in rendered compose output
+        # ADR-015's property, checked continuously rather than only in a drill:
+        # `docker compose config` is what people paste into bug reports.
+        run: |
+          fail=0
+          for f in docker/docker-compose.prod.yml docker/docker-compose.multihost.yml \
+                   docker/docker-compose.multihost-ha.yml; do
+            env_file=""
+            case "$f" in
+              *multihost-ha*) env_file="--env-file docker/multihost/sim-ha.env" ;;
+              *multihost*)    env_file="--env-file docker/multihost/sim.env" ;;
+            esac
+            rendered=$(docker compose -f "$f" $env_file config 2>/dev/null || true)
+            for s in docker/secrets/*; do
+              [ -f "$s" ] || continue
+              val=$(tr -d '\r\n' < "$s")
+              [ ${#val} -ge 16 ] || continue
+              if printf '%s' "$rendered" | grep -qF -- "$val"; then
+                echo "::error::$(basename "$s") leaks into $(basename "$f") config output"
+                fail=1
+              fi
+            done
+          done
+          [ "$fail" -eq 0 ] && echo "no credential appears in any rendered compose output"
+          exit $fail
