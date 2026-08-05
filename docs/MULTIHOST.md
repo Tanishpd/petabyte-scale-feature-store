@@ -342,6 +342,39 @@ retries forever in silence. A two-valued "did we see an exception?" probe reads
 that as *allowed* — reporting a breach that did not happen, after hanging for as
 long as you let it.
 
+### Monitoring, on the node that runs no Flink
+
+Until recently this topology had none. Every Flink process here has always run
+the Prometheus reporter, so `:9250` was exposed on all four of them and scraped
+by nobody — which made the most production-like setup in the repo the only one
+you could not observe. The drills proved it recovered from losing a node;
+nothing would have told you it had.
+
+It now runs `prometheus`, `alertmanager` and `alert-sink` on **node A**, which
+carries no Flink process. That placement is the point: a JobManager and the
+scraper watching it dying together is the blind spot that turns an outage into
+silence, and `make mh-ha-drill` kills node B or node C — so the monitoring
+survives to observe the failover it is meant to record.
+
+Both JobManagers are scraped, not just the leader. Leadership is runtime state
+(§5), so a standby that has never led exposes process metrics and no job series;
+the job-level alerts follow whichever process holds the ZooKeeper latch on their
+own. Scraping only "the primary" would blind the entire rule set the moment a
+failover moved it — which is precisely when you need it.
+
+Cross-node scraping goes through `host.docker.internal` and a published port for
+the same reason every other cross-node client here does: separate Compose
+projects, no shared DNS, so `jobmanager:9250` resolves to nothing (§2).
+
+Verified by `make alerts-verify` — 9/9: every metric the rules reference exists,
+all six rules are loaded, Prometheus has discovered an Alertmanager, and the
+receiver confirms it actually got the `Watchdog` heartbeat. The rules themselves
+are unit-tested separately and in CI ([ADR-017](DECISIONS.md), [ADR-018](DECISIONS.md)).
+
+The cost is measured, not assumed: 18 containers → 21, and the VM from ~3.9 to
+4.5 GiB used with ~3.2 GiB still free. Retention is 2 h here rather than prod's
+6 h, because this topology already fills the box.
+
 ## 6. What still fails
 
 No single node's loss stops this topology any more — Kafka, Redis, ZooKeeper,

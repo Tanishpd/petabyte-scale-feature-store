@@ -1,0 +1,48 @@
+# Prometheus for the HA topology. Separate from prometheus.multihost.yml because
+# the target set is genuinely different: there are TWO JobManagers here, and
+# which one is leading is runtime state.
+#
+# Every Flink process in docker-compose.multihost-ha.yml already ran the
+# Prometheus reporter before this file existed — the endpoints were exposed and
+# scraped by nobody. That made the most production-like topology in the repo the
+# only one with no monitoring at all: the drills proved it recovered from a node
+# loss, and nothing would have told you it had needed to.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  # Cross-node scraping goes through host.docker.internal and a PUBLISHED port,
+  # never a service name: the three nodes are separate Compose projects with no
+  # shared network, so `jobmanager:9250` resolves to nothing from here. Same
+  # constraint every other cross-node client in this topology lives under
+  # (docs/MULTIHOST.md §2), and the reason node identity is carried by the port.
+  - job_name: flink
+    # BOTH JobManagers are scraped, and that is deliberate. Leadership is
+    # runtime state — a standby that has never led exposes the process metrics
+    # but no job series, so the job-level alerts naturally follow whichever one
+    # holds the ZooKeeper latch. Scraping only the "primary" would blind the
+    # whole rule set the moment a failover moved it.
+    static_configs:
+      - targets: ["host.docker.internal:9250"]
+        labels: {role: jobmanager, node: b}
+      - targets: ["host.docker.internal:9260"]
+        labels: {role: jobmanager, node: c}
+
+  - job_name: flink-taskmanagers
+    # The `node` label is what makes these useful: it distinguishes "the
+    # embedding operator is busy" from "everything on node C is gone", which
+    # look identical in an unlabelled aggregate.
+    static_configs:
+      - targets: ["host.docker.internal:19251"]
+        labels: {role: taskmanager, node: b}
+      - targets: ["host.docker.internal:19252"]
+        labels: {role: taskmanager, node: c}

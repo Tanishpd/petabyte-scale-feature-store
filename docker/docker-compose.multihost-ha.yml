@@ -1062,6 +1062,72 @@ services:
       - ../contracts:/opt/project/contracts:ro
       - ./tls/out:/tls:ro
 
+  # --- observability, on node A -------------------------------------------
+  #
+  # Node A carries no Flink process, so putting the monitoring here keeps it off
+  # the nodes it watches: a JobManager and its own scraper dying together is the
+  # blind spot that makes an outage look like silence. It also means the drills,
+  # which kill node B or node C, leave the monitoring running to observe the
+  # failover they cause.
+  #
+  # ⚠️ These are NOT free on this box. The HA topology already runs 18
+  # containers on a 7.75 GiB Docker VM and has been measured hitting the
+  # ceiling; see the note in docs/MULTIHOST.md. Retention is deliberately tiny
+  # and the sink is a stdlib HTTP server rather than anything with a runtime.
+  prometheus:
+    profiles: ["a"]
+    image: prom/prometheus:v3.2.1
+    container_name: petafs-mhha-prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      # 2h, not the 6h prod uses. Long enough to see a failover and its recovery
+      # in one graph, short enough not to compete with Kafka for page cache on a
+      # VM this topology already fills.
+      - --storage.tsdb.retention.time=2h
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./observability/prometheus.multihost-ha.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports: ["${PROM_A_PORT:-9090}:9090"]
+
+  alertmanager:
+    profiles: ["a"]
+    image: prom/alertmanager:v0.28.0
+    container_name: petafs-mhha-alertmanager
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    volumes:
+      - ./observability/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    ports: ["${ALERTMANAGER_A_PORT:-9093}:9093"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9093/-/healthy >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # The receiver, so `make alerts-verify` can assert delivery here too rather
+  # than only on the prod topology.
+  alert-sink:
+    profiles: ["a"]
+    image: python:3.12-slim
+    container_name: petafs-mhha-alert-sink
+    restart: unless-stopped
+    command: ["python", "/app/webhook_sink.py"]
+    volumes:
+      - ./observability/webhook_sink.py:/app/webhook_sink.py:ro
+    ports: ["${ALERT_SINK_A_PORT:-9099}:9099"]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:9099/healthz',timeout=3).status==200 else 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
 volumes:
   minio-a-d1:
   minio-b-d1:

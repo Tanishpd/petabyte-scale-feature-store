@@ -251,19 +251,34 @@ below appears only in the topologies that claim to be production-shaped.
 
 | Service | Image | Port (host) | Role | prod | multihost | multihost-ha |
 |---|---|---|---|---|---|---|
-| `prometheus` | `prom/prometheus:v3.2.1` | 9090 | scrape + rule evaluation | ✓ | ✓ | — |
-| `alertmanager` | `prom/alertmanager:v0.28.0` | 9093 | grouping, inhibition, delivery | ✓ | — | — |
-| `alert-sink` | `python:3.12-slim` | 9099 | webhook receiver, so delivery is assertable | ✓ | — | — |
+| `prometheus` | `prom/prometheus:v3.2.1` | 9090 | scrape + rule evaluation | ✓ | ✓ | ✓ |
+| `alertmanager` | `prom/alertmanager:v0.28.0` | 9093 | grouping, inhibition, delivery | ✓ | — | ✓ |
+| `alert-sink` | `python:3.12-slim` | 9099 | webhook receiver, so delivery is assertable | ✓ | — | ✓ |
 | `grafana` | `grafana/grafana:11.6.0` | 3000 | dashboards | ✓ | — | — |
 
-**That asymmetry is a gap, not a design.** `docker-compose.multihost-ha.yml` is
-the most production-like topology in the repo — three nodes, ZooKeeper, a
-standby JobManager, distributed object storage, per-component authorization —
-and it is the one with **nothing collecting metrics and no alerting at all**.
-Every Flink process there already runs the Prometheus reporter, so the endpoints
-are exposed and simply scraped by no one: the HA drills prove the topology
-recovers, and nothing would tell you it had needed to. Closing this is mostly
-config — a Prometheus, and the same `alerts.yml` — rather than new machinery.
+The HA topology used to be the glaring hole here: the most production-like
+setup in the repo — three nodes, ZooKeeper, a standby JobManager, distributed
+object storage, per-component authorization — was the one with nothing
+collecting metrics at all. Its Flink processes had always run the Prometheus
+reporter, so the endpoints were exposed and scraped by no one; the drills proved
+the topology recovered, and nothing would have told you it had needed to. It now
+runs the same three services as prod, against the same `alerts.yml`, verified
+by the same `make alerts-verify` (9/9).
+
+**`multihost` is now the odd one out**, with a Prometheus but no Alertmanager —
+it evaluates rules and delivers them nowhere, which is the state ADR-018
+describes. It is the lesser gap of the two and is left open deliberately: that
+topology exists to demonstrate cross-node addressing, and the HA file is the one
+you would actually deploy.
+
+**Monitoring lives on node A, which runs no Flink.** A JobManager and the
+scraper watching it dying together is the blind spot that makes an outage look
+like silence, and the drills kill node B or C — so the monitoring stays up to
+observe the failover it is meant to record. The cost is measured rather than
+assumed: three extra containers take the topology from 18 to 21 and the VM from
+~3.9 to 4.5 GiB used, leaving ~3.2 GiB free. Retention is 2 h here rather than
+prod's 6 h, because this topology already fills the box (see the sizing note at
+the top of the compose file).
 
 ### What is scraped
 

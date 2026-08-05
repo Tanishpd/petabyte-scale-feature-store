@@ -499,10 +499,31 @@ except Exception: print('')")
                               || bad "no recent feature writes after failover (max TTL ${T1:-none})"
       # The end-to-end proof that the object store survived: Flink is still
       # completing checkpoints INTO it after losing a node.
-      CP1=$(checkpoints_completed "$OTHER_PORT" "$JOB2")
-      [ "${CP1:-0}" -gt "${CP0:-0}" ] \
-        && ok "checkpoints still completing into the degraded pool ($CP0 -> $CP1)" \
-        || bad "no new checkpoints after the node loss ($CP0 -> $CP1)"
+      # POLLED to a deadline, not sampled after a fixed sleep. A job that has
+      # just recovered has to redeploy, restore state and then reach its next
+      # checkpoint boundary, and on a box this size that regularly exceeds the
+      # 75s wait above — this assertion read "0 -> 0" and called a working
+      # object store broken. What is being asserted is that checkpoints RESUME,
+      # which is a question about eventual progress, not about progress within
+      # an arbitrary window.
+      CP1=$CP0
+      for _ in $(seq 1 30); do
+        CP1=$(checkpoints_completed "$OTHER_PORT" "$JOB2")
+        [ "${CP1:-0}" -gt "${CP0:-0}" ] && break
+        sleep 10
+      done
+      if [ "${CP1:-0}" -gt "${CP0:-0}" ]; then
+        ok "checkpoints still completing into the degraded pool ($CP0 -> $CP1)"
+      else
+        # Distinguish "slow" from "failing": a rising failure count is a real
+        # object-store problem, a flat one with no completions is a pipeline
+        # that has not got there yet.
+        FAILED=$(curl -s -m 5 "http://localhost:$OTHER_PORT/jobs/$JOB2/checkpoints" 2>/dev/null | python3 -c "
+import json,sys
+try: print((json.load(sys.stdin).get('counts') or {}).get('failed',0))
+except Exception: print(-1)")
+        bad "no new checkpoints 300s after the node loss ($CP0 -> $CP1, failed=${FAILED:-?})"
+      fi
     else
       bad "job did not return to RUNNING within 240 s of the failover"
     fi
