@@ -61,9 +61,20 @@ kafka_conf
 
 if [ "${1:-}" = "--create-topic" ]; then
   TOPIC="${2:-transactions}"; PARTS="${3:-6}"
+  # A broker's resident size is dominated by mmap'd log segments, NOT by
+  # KAFKA_HEAP_OPTS. These caps were 1 h / 2 GiB per partition — 64x the HA
+  # topology's, which caps the same topic at 5 min / 32 MiB for exactly this
+  # reason — and under a sustained producer the three brokers grew to 2.1 GiB
+  # EACH, 6.46 GiB of a 7.75 GiB VM, starving the drill they were meant to
+  # support. Measured, twice, on two topologies.
+  #
+  # These are laptop numbers; override them on a real box:
+  #   RETENTION_MS=3600000 RETENTION_BYTES=2147483648 make mh-topics
   kbin kafka-topics.sh --create --if-not-exists --topic "$TOPIC" \
     --partitions "$PARTS" --replication-factor 3 \
-    --config retention.ms=3600000 --config retention.bytes=2147483648 >/dev/null
+    --config retention.ms="${RETENTION_MS:-600000}" \
+    --config retention.bytes="${RETENTION_BYTES:-67108864}" \
+    --config segment.bytes="${SEGMENT_BYTES:-16777216}" >/dev/null
   echo "topic '$TOPIC' at RF=3:"
   kbin kafka-topics.sh --describe --topic "$TOPIC" | sed 's/^/  /'
   echo

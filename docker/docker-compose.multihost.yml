@@ -417,9 +417,21 @@ services:
       retries: 24
       start_period: 30s
 
+  # --- observability, opt-in via the `obs` profile -------------------------
+  #
+  # OFF BY DEFAULT. This topology exists to demonstrate cross-node addressing
+  # and node-loss survival, and the drills assert those without any of this. The
+  # HA file is the one you would actually deploy, and it runs the same three
+  # services unconditionally.
+  #
+  #   docker compose ... --profile a --profile obs up -d
+  #
+  # The original note here said "~200 MB of a tight memory budget". Measured on
+  # the HA topology, the three together are 81 MiB — Prometheus 31, Alertmanager
+  # 27, the sink 22 — so the memory argument was roughly 2.5x overstated. What
+  # remains true is that they are three more containers on a VM this topology
+  # already fills; the reason to keep them opt-in here is scope, not size.
   prometheus:
-    # Off by default — it is ~200 MB of a tight memory budget and proves
-    # nothing about the topology. `--profile a --profile obs` to include it.
     profiles: ["obs"]
     image: prom/prometheus:v3.2.1
     container_name: petafs-mh-prometheus
@@ -433,6 +445,44 @@ services:
       - ./observability/prometheus.multihost.yml:/etc/prometheus/prometheus.yml:ro
       - ./observability/alerts.yml:/etc/prometheus/alerts.yml:ro
     ports: ["${PROM_PORT:-9090}:9090"]
+
+  alertmanager:
+    profiles: ["obs"]
+    image: prom/alertmanager:v0.28.0
+    container_name: petafs-mh-alertmanager
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    volumes:
+      - ./observability/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    ports: ["${ALERTMANAGER_PORT:-9093}:9093"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9093/-/healthy >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # Without a receiver, Prometheus evaluates the rules and drops them — the
+  # state ADR-018 describes. Including it here means `make alerts-verify` can
+  # assert delivery against this topology too, rather than only against prod
+  # and HA.
+  alert-sink:
+    profiles: ["obs"]
+    image: python:3.12-slim
+    container_name: petafs-mh-alert-sink
+    restart: unless-stopped
+    command: ["python", "/app/webhook_sink.py"]
+    volumes:
+      - ./observability/webhook_sink.py:/app/webhook_sink.py:ro
+    ports: ["${ALERT_SINK_PORT:-9099}:9099"]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:9099/healthz',timeout=3).status==200 else 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
 
   # ======================================================================
   # NODE B — Kafka 2, Redis replica, Sentinel 2, TaskManager

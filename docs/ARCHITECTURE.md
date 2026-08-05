@@ -251,9 +251,9 @@ below appears only in the topologies that claim to be production-shaped.
 
 | Service | Image | Port (host) | Role | prod | multihost | multihost-ha |
 |---|---|---|---|---|---|---|
-| `prometheus` | `prom/prometheus:v3.2.1` | 9090 | scrape + rule evaluation | ✓ | ✓ | ✓ |
-| `alertmanager` | `prom/alertmanager:v0.28.0` | 9093 | grouping, inhibition, delivery | ✓ | — | ✓ |
-| `alert-sink` | `python:3.12-slim` | 9099 | webhook receiver, so delivery is assertable | ✓ | — | ✓ |
+| `prometheus` | `prom/prometheus:v3.2.1` | 9090 | scrape + rule evaluation | ✓ | opt-in | ✓ |
+| `alertmanager` | `prom/alertmanager:v0.28.0` | 9093 | grouping, inhibition, delivery | ✓ | opt-in | ✓ |
+| `alert-sink` | `python:3.12-slim` | 9099 | webhook receiver, so delivery is assertable | ✓ | opt-in | ✓ |
 | `grafana` | `grafana/grafana:11.6.0` | 3000 | dashboards | ✓ | — | — |
 
 The HA topology used to be the glaring hole here: the most production-like
@@ -265,11 +265,25 @@ the topology recovered, and nothing would have told you it had needed to. It now
 runs the same three services as prod, against the same `alerts.yml`, verified
 by the same `make alerts-verify` (9/9).
 
-**`multihost` is now the odd one out**, with a Prometheus but no Alertmanager —
-it evaluates rules and delivers them nowhere, which is the state ADR-018
-describes. It is the lesser gap of the two and is left open deliberately: that
-topology exists to demonstrate cross-node addressing, and the HA file is the one
-you would actually deploy.
+`multihost` carries all three too, but **behind an `obs` profile** — off unless
+you ask for it:
+
+```bash
+docker compose -f docker/docker-compose.multihost.yml --env-file docker/multihost/sim.env \
+  -p petafs-a --profile a --profile obs up -d
+```
+
+That topology exists to demonstrate cross-node addressing and node-loss
+survival, and its drills assert both without any monitoring; the HA file is the
+one you would actually deploy. Keeping it opt-in is a scope decision rather than
+a memory one — the three services together measure **81 MiB** (Prometheus 31,
+Alertmanager 27, sink 22), not the "~200 MB" the original comment claimed.
+
+**In `multihost`, losing node A takes the monitoring with it.** Node A holds the
+JobManager, the object store *and* the metrics stack, because that topology has
+no Flink-free node to put them on — so the one node whose loss stops the
+pipeline is also the one whose loss blinds you to it. The HA file does not have
+this problem, and it is one more reason it is the deployable one.
 
 **Monitoring lives on node A, which runs no Flink.** A JobManager and the
 scraper watching it dying together is the blind spot that makes an outage look

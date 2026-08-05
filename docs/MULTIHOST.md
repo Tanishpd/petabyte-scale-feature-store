@@ -375,6 +375,36 @@ The cost is measured, not assumed: 18 containers → 21, and the VM from ~3.9 to
 4.5 GiB used with ~3.2 GiB still free. Retention is 2 h here rather than prod's
 6 h, because this topology already fills the box.
 
+### Monitoring here is opt-in, and node A takes it down with everything else
+
+This topology now carries the same `prometheus`, `alertmanager` and `alert-sink`
+as the HA file, but behind an **`obs` profile** — off unless you ask:
+
+```bash
+docker compose -f docker/docker-compose.multihost.yml --env-file docker/multihost/sim.env \
+  -p petafs-a --profile a --profile obs up -d
+```
+
+Keeping it opt-in is a scope decision, not a memory one. The three together
+measure **81 MiB** (Prometheus 31, Alertmanager 27, sink 22) — the comment that
+used to sit above the service claimed "~200 MB", which was roughly 2.5x over.
+The reason to leave them out by default is that this file exists to demonstrate
+cross-node addressing and node-loss survival, and §4's drills assert both
+without any of it.
+
+**Node A is a worse home for monitoring than in the HA topology, and there is
+nowhere better.** Here node A already holds the JobManager and the object store,
+so the single node whose loss stops the pipeline (§1) is also the node whose
+loss blinds you to it — Drill 3 kills node A and the metrics stack goes with it.
+`docker-compose.multihost-ha.yml` does not have this problem: node A there runs
+no Flink process, so monitoring sits off the nodes it watches and survives the
+failover it is meant to record. One more reason the HA file is the one you would
+actually deploy.
+
+Verified the same way as the others — `make alerts-verify`, 9/9: every metric
+the rules name exists, all six rules are loaded, Prometheus has discovered an
+Alertmanager, and the receiver confirms it received the `Watchdog` heartbeat.
+
 ## 6. What still fails
 
 No single node's loss stops this topology any more — Kafka, Redis, ZooKeeper,

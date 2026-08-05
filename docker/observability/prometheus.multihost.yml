@@ -22,6 +22,13 @@ global:
 rule_files:
   - /etc/prometheus/alerts.yml
 
+# Rules with nowhere to go are rules nobody sees (ADR-018). `alertmanager` is in
+# the same `obs` profile, so it is present exactly when Prometheus is.
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
 scrape_configs:
   - job_name: flink
     # The `node` label is what makes these metrics useful here: it is how you
