@@ -242,3 +242,116 @@ python3.11 package at all. The container therefore runs 3.12 while the host venv
 The base is also JRE-only, with no compiler — which matters more than it sounds. See
 [ADR-009](DECISIONS.md) for why `pip install apache-flink` needs `build-essential` and `python3.12-dev`
 on this platform.
+
+## 8. Observability
+
+None of this runs in the dev stack. `docker-compose.yml` deliberately carries no
+metrics stack — the point of the laptop stack is to start fast — so everything
+below appears only in the topologies that claim to be production-shaped.
+
+| Service | Image | Port (host) | Role | prod | multihost | multihost-ha |
+|---|---|---|---|---|---|---|
+| `prometheus` | `prom/prometheus:v3.2.1` | 9090 | scrape + rule evaluation | ✓ | ✓ | — |
+| `alertmanager` | `prom/alertmanager:v0.28.0` | 9093 | grouping, inhibition, delivery | ✓ | — | — |
+| `alert-sink` | `python:3.12-slim` | 9099 | webhook receiver, so delivery is assertable | ✓ | — | — |
+| `grafana` | `grafana/grafana:11.6.0` | 3000 | dashboards | ✓ | — | — |
+
+**That asymmetry is a gap, not a design.** `docker-compose.multihost-ha.yml` is
+the most production-like topology in the repo — three nodes, ZooKeeper, a
+standby JobManager, distributed object storage, per-component authorization —
+and it is the one with **nothing collecting metrics and no alerting at all**.
+Every Flink process there already runs the Prometheus reporter, so the endpoints
+are exposed and simply scraped by no one: the HA drills prove the topology
+recovers, and nothing would tell you it had needed to. Closing this is mostly
+config — a Prometheus, and the same `alerts.yml` — rather than new machinery.
+
+### What is scraped
+
+Flink's Prometheus reporter exposes **one endpoint per process** on `:9250`,
+which is why there are two scrape jobs rather than one: the JobManager carries
+job-level series (checkpoints, restarts) and the TaskManagers carry throughput
+and backpressure. An alert written against the wrong one silently matches
+nothing — see below for why that failure is easy to ship.
+
+Retention is 6 h. This is a drill rig, not a monitoring system: long enough to
+see a failover and its recovery in the same graph, short enough not to compete
+with Kafka for disk on an 8 GiB VM.
+
+### The alerts
+
+Six rules, in `docker/observability/alerts.yml`. Five describe the pipeline; the
+sixth describes the alerting stack itself.
+
+| Alert | Fires when | Why it is in the set |
+|---|---|---|
+| `KafkaConsumerLagGrowing` | event-time lag > 2 min for 5 m | the measured ceiling is ~8,500 eps ([SCALING §5](SCALING.md)); sustained lag means the embedding tier is saturated |
+| `CheckpointsFailing` | > 2 failures in 15 m | without checkpoints a restart replays from source and loses window state ([ADR-011](DECISIONS.md)) |
+| `JobRestarting` | > 3 restarts in 10 m | flapping rather than running; threshold set above one ordinary recovery, which the drills cause deliberately |
+| `SustainedBackpressure` | mean backpressure > 500 ms/s for 10 m | averaged on purpose — one hot operator is normal here, the embedding UDF is the expensive stage |
+| `NoFeaturesWritten` | no rows written for 15 m | **the failure this design fears most**: the job is up, Feast still answers `PRESENT`, and the values get staler every second |
+| `Watchdog` | always | the dead man's switch — see below |
+
+### Two things worth understanding
+
+**`NoFeaturesWritten` needs `or absent(...)`, and this is not a detail.** The
+obvious expression is `sum(rate(numRecordsOut[10m])) == 0`. But when a
+TaskManager *dies* its metrics do not fall to zero — they stop existing.
+Prometheus marks the series stale, `sum(rate(...))` over nothing is an empty
+vector, and `empty == 0` is empty, not true. The alert covering "the pipeline
+writes nothing" was therefore silent in the most likely way for a pipeline to
+stop writing. See [ADR-017](DECISIONS.md).
+
+**`Watchdog` fires unconditionally, and its silence is the alarm.** Every other
+rule above assumes Prometheus is running, the rules are loaded, and Alertmanager
+is reachable. If any of that is false they all go quiet — and a dead alerting
+stack looks exactly like a healthy system. `Watchdog` is `vector(1)`, so it
+needs no metric to exist and keeps firing even when the pipeline is gone
+entirely. In a real deployment it feeds an external heartbeat monitor that pages
+when the ping **stops**. See [ADR-018](DECISIONS.md).
+
+### How it is verified
+
+Two commands, because they are blind to opposite failures and neither alone is
+evidence:
+
+```bash
+make alerts-test     # promtool, no stack needed — runs in CI
+make alerts-verify   # against a running topology
+```
+
+| | catches | blind to |
+|---|---|---|
+| `alerts-test` | wrong threshold, wrong `for:`, wrong comparison, a rule that can never become true | a metric name that does not exist — it feeds synthetic series named by hand |
+| `alerts-verify` | typo'd or renamed metrics, rules that failed to load, an `alerting:` block that points nowhere, a receiver that never gets anything | whether a rule fires on the condition it is meant to catch |
+
+Every alert is tested in **both directions** — fires on its condition, silent
+below the threshold. The silent half is what makes the first half mean
+something: an expression stuck permanently true passes a fires-only suite while
+telling you nothing.
+
+`alerts-verify` extracts metric names *from the rules file* rather than
+restating them, so a rule that starts watching something new is covered without
+anyone remembering to update a list. It also asserts delivery from the
+**receiving end** — Prometheus discovered an Alertmanager, Alertmanager is up,
+and the sink confirms it actually received the Watchdog. "The rule fires" and
+"somebody finds out" are different claims, and until [ADR-018](DECISIONS.md)
+only the first was true here: `prometheus.yml` had no `alerting:` block at all.
+
+### What is not covered
+
+**Silently dropped records.** Both production topologies pass
+`--on-bad-record skip`, because the measured alternative is one unparseable byte
+putting the job in a permanent restart loop. Flink's JSON format discards those
+records without incrementing any metric and without logging — measured: 5
+malformed records into a running pipeline left `numRecordsInErrors` at 0 and no
+line in any TaskManager log. An alert for this was written and then **deleted**:
+conservation between Kafka records-consumed and source records-out is ~4x apart
+on a healthy pipeline, so a realistic drop rate sits below the noise, and a rule
+that loads cleanly but can never fire makes the gap look covered. The honest fix
+is a dead-letter topic, which is a change to the job rather than to a rule file.
+
+**Delivery stops at a local receiver.** `alert-sink` stands in for Slack or
+PagerDuty, which this repo has no account for. It proves the whole path — rule →
+Prometheus → Alertmanager → receiver — and in a real deployment the receiver is
+swapped and nothing else changes. There is no on-call rotation, no escalation,
+and no silencing workflow.
