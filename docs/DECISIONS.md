@@ -610,3 +610,56 @@ test case asserting the old expression did **not** fire on an absent series. Fix
 **What it is not.** These prove the rules evaluate correctly and watch real metrics. Nothing here proves
 an alert reaches a human — there is no Alertmanager, no routing, and no paging integration. Firing into
 a Prometheus UI nobody is looking at is still an open gap, and it is the next one on this axis.
+
+---
+
+## ADR-018 — Alerts are delivered, and the alerting path has its own dead man's switch
+
+**Decision.** Prometheus now has an `alerting:` block, an Alertmanager, a receiver, and a `Watchdog`
+alert that always fires. `make alerts-verify` asserts delivery from the receiving end.
+
+**The gap.** [ADR-017](#adr-017) proved the rules evaluate correctly against real metrics. It did not
+prove anyone finds out, and they did not: `prometheus.yml` had **no `alerting:` block at all**, so every
+alert was evaluated and dropped. An alert firing into a web page nobody is looking at is
+indistinguishable from having no alerts.
+
+**The Watchdog is the load-bearing part.** Every other rule assumes Prometheus is up, the rules are
+loaded, and Alertmanager is reachable. If any of that is false all of them go quiet — and a silent
+alerting stack looks exactly like a healthy system. `Watchdog` fires unconditionally (`vector(1)`, so it
+needs no metric to exist), routed with a short repeat interval. Its **silence** is the alarm; in a real
+deployment it feeds an external heartbeat monitor that pages when the ping stops. It is unit-tested like
+any other rule, with no input series at all, because "always fires" is a claim that can be wrong and a
+broken heartbeat is invisible until the day you need it.
+
+`inhibit_rules` suppress the symptoms of a cause that is already paging — a restart loop also stops
+feature writes and grows lag, and three notifications for one incident is how people learn to ignore
+alerts.
+
+**Verified from the receiving end**, not from configuration: the drill asserts Prometheus discovered an
+Alertmanager (a typo in the `alerting:` block leaves that list empty and every alert silently
+undeliverable), that Alertmanager is reachable, and that the receiver **actually received** the
+Watchdog. 9/9.
+
+### The dropped-record alert that could not be written
+
+`--on-bad-record skip` is on in both production topologies, because the measured alternative is a
+permanent restart loop from one unparseable byte. The job's docstring claimed the drops were counted —
+"tolerate but count is the only version of this that is safe" — and referred to a `_log_dropped_records`
+helper. **That helper never existed.** Only the tolerate half was ever implemented.
+
+Measured rather than assumed: 5 unparseable records were injected into a running production pipeline.
+The job survived (correct), and the records vanished with **no trace at all** —
+`numRecordsInErrors` stayed at 0 and no TaskManager logged a line. Flink's JSON format discards on
+`json.ignore-parse-errors` without touching a metric.
+
+An alert was written for this and then **deleted**, which is the decision worth recording. Conservation
+between Kafka records-consumed and source records-out is ~4x apart on a healthy pipeline, so a realistic
+drop rate sits far below the noise; the rule would have loaded cleanly, never fired, and made the gap
+look covered — the precise failure ADR-017 exists to prevent. Closing it properly means a dead-letter
+topic, which is a change to the job rather than to a rule file. Until then the gap is named in the
+README and in the job's own docstring.
+
+**What it is not.** The receiver here is a local webhook sink, because this repo has no Slack or
+PagerDuty account. It proves the whole path — rule → Prometheus → Alertmanager → receiver — and in a
+real deployment the receiver is swapped and nothing else changes. There is still no on-call rotation, no
+escalation, and no silencing workflow.

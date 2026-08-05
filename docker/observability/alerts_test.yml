@@ -229,3 +229,24 @@ tests:
               description: >
                 The pipeline is up but producing nothing. Models are reading
                 increasingly stale features and Feast reports them as PRESENT.
+
+  # --- 6. Watchdog: the dead man's switch ---------------------------------
+  #
+  # Tested like any other rule, because "always fires" is a claim that can be
+  # wrong — a typo in `vector(1)` would make the heartbeat silent, and a silent
+  # heartbeat is indistinguishable from a healthy one until the day the
+  # alerting path breaks and nothing tells you.
+  #
+  # NO input_series at all: the point is that it fires with no metrics
+  # whatsoever, i.e. when the pipeline it watches is gone entirely.
+  - interval: 1m
+    name: watchdog fires with no metrics present at all
+    input_series: []
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: Watchdog
+        exp_alerts:
+          - exp_labels:
+              severity: none
+            exp_annotations:
+              summary: "Alerting pipeline is alive (this alert always fires by design)"

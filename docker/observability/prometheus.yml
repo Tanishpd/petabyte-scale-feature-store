@@ -5,6 +5,16 @@ global:
 rule_files:
   - /etc/prometheus/alerts.yml
 
+# Without this block Prometheus evaluates every rule above correctly and then
+# has nowhere to send the result. That was the state of this repo until
+# ADR-018: alerts "fired" into the Prometheus UI and reached nobody, which is
+# indistinguishable from not having alerts at all unless someone happens to be
+# looking at the page.
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
 scrape_configs:
   - job_name: flink
     # Flink's Prometheus reporter exposes one port per process. The JobManager

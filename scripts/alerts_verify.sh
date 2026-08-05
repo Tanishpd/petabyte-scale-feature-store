@@ -61,5 +61,48 @@ EXPECTED=$(grep -cE '^\s+- alert:' "$RULES")
   && ok "all $EXPECTED alert rules are loaded by Prometheus" \
   || bad "Prometheus has ${LOADED:-0} rules loaded, $RULES defines $EXPECTED"
 
+# --- delivery ---------------------------------------------------------------
+#
+# Everything above proves the rules can fire. None of it proves anyone finds
+# out. Prometheus will happily evaluate rules with no `alerting:` block at all,
+# which is exactly the state this repo was in: alerts "fired" into a web page
+# nobody was looking at. These assert the rest of the path —
+# rule -> Prometheus -> Alertmanager -> receiver — from the receiving end.
+AM="${ALERTMANAGER_URL:-http://localhost:9093}"
+SINK="${ALERT_SINK_URL:-http://localhost:9099}"
+
+printf '\n\033[1m== alerts are delivered, not just evaluated ==\033[0m\n'
+
+# Prometheus must have DISCOVERED an Alertmanager. A typo in the `alerting:`
+# block leaves this empty and every alert is silently undeliverable.
+AMS=$(curl -s -m 10 "$PROM/api/v1/alertmanagers" 2>/dev/null | python3 -c "
+import json,sys
+try: print(len(json.load(sys.stdin)['data']['activeAlertmanagers']))
+except Exception: print(0)" 2>/dev/null)
+[ "${AMS:-0}" -ge 1 ] && ok "Prometheus has $AMS active Alertmanager(s)" \
+                      || bad "Prometheus knows of NO Alertmanager — alerts go nowhere"
+
+if ! curl -sf -m 5 "$AM/-/healthy" >/dev/null 2>&1; then
+  bad "Alertmanager is not reachable at $AM"
+else
+  ok "Alertmanager is reachable"
+fi
+
+# The Watchdog is the end-to-end probe: it always fires, so if the path works
+# at all it must arrive. Poll rather than sample once — Prometheus evaluates on
+# its own schedule and Alertmanager batches by group_wait.
+GOT=""
+for _ in $(seq 1 40); do
+  GOT=$(curl -s -m 5 "$SINK/alerts" 2>/dev/null | python3 -c "
+import json,sys
+try: print(sum(1 for a in json.load(sys.stdin) if a.get('alertname')=='Watchdog'))
+except Exception: print(0)" 2>/dev/null)
+  [ "${GOT:-0}" -ge 1 ] && break
+  sleep 5
+done
+[ "${GOT:-0}" -ge 1 ] \
+  && ok "the receiver actually received the Watchdog heartbeat ($GOT notification(s))" \
+  || bad "nothing arrived at the receiver in 200s — the alerting path is broken end to end"
+
 printf '\n\033[1m== %d passed, %d failed ==\033[0m\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

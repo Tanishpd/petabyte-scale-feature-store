@@ -247,8 +247,14 @@ prod-topics:  ## Create `transactions` at RF=3 on the production topology
 	    --topic $(TOPIC) --command-config /tmp/t.properties | head -1'
 
 prod-submit:  ## Submit the pipeline against the production topology
+	@# --on-bad-record skip, same reasoning as mh-ha-submit: this is a
+	@# production topology, and one unparseable byte on the topic otherwise
+	@# puts the job in a permanent restart loop (it re-reads the same offset
+	@# from its checkpoint and dies again). The drops are counted — Flink's
+	@# numRecordsInErrors on the source — and alerted on by RecordsBeingDropped.
 	$(PROD_COMPOSE) exec -T jobmanager flink run -d -py /opt/project/src/flink/streaming_job.py \
 	  --no-wait --sink redis --bootstrap $(PROD_KAFKA) --topic $(TOPIC) \
+	  --on-bad-record $(or $(ON_BAD_RECORD),skip) \
 	  $(if $(FROM_START),--startup-mode earliest-offset,)
 
 prod-drill:  ## Run the failure drills (kill a broker, kill the redis master)

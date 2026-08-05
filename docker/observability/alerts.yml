@@ -71,3 +71,36 @@ groups:
           description: >
             The pipeline is up but producing nothing. Models are reading
             increasingly stale features and Feast reports them as PRESENT.
+
+  # -------------------------------------------------------------------------
+  - name: petafs-meta
+    rules:
+      # 6. The dead man's switch. This alert ALWAYS fires, which is the point:
+      #    it is the only one whose SILENCE is the alarm. Every other rule here
+      #    assumes Prometheus is up, the rules loaded, and Alertmanager
+      #    reachable — and if any of that is false, all of them go quiet and
+      #    look exactly like a healthy system. Route this to an external
+      #    heartbeat monitor that pages when the ping stops.
+      #
+      #    `vector(1)` needs no metric to exist, so it keeps firing even when
+      #    the pipeline is gone entirely.
+      - alert: Watchdog
+        expr: vector(1)
+        labels: {severity: none}
+        annotations:
+          summary: "Alerting pipeline is alive (this alert always fires by design)"
+
+      # There is deliberately NO RecordsBeingDropped alert here, and that is a
+      # finding rather than an omission. `--on-bad-record skip` is on in both
+      # production topologies, and MEASURED behaviour is that Flink's JSON
+      # format discards an unparseable record without incrementing any metric
+      # and without logging: 5 malformed records were injected into a running
+      # prod pipeline and `numRecordsInErrors` stayed at 0, with no line in any
+      # TaskManager log. Conservation (Kafka records consumed vs rows emitted by
+      # the source) does not substitute — the two counters differ by ~4x on a
+      # healthy pipeline, so a realistic drop rate is far below the noise.
+      #
+      # Shipping a rule over metrics that cannot express the condition would be
+      # the exact failure ADR-017 exists to prevent: an alert that loads
+      # cleanly, never fires, and makes the gap look covered. The gap is real
+      # and is named in the README instead.

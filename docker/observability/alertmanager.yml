@@ -1,0 +1,56 @@
+# Alertmanager routing. Until this existed, Prometheus evaluated the rules
+# correctly and then had nowhere to send them: there was no `alerting:` block in
+# prometheus.yml at all, so every alert fired into a UI nobody was looking at.
+# "The rule fires" and "somebody finds out" are different claims, and only the
+# first one was ever true here.
+#
+# The receiver below is a local webhook sink (docker/observability/webhook_sink.py)
+# because this repo has no Slack workspace or PagerDuty account to route to. That
+# is not a stand-in for the routing being untested — the sink records what it
+# receives, and `make alerts-route-verify` asserts the Watchdog arrived, which
+# exercises the whole path: rule -> Prometheus -> Alertmanager -> receiver. In a
+# real deployment you replace the receiver and change nothing else.
+
+global:
+  # How long Alertmanager waits for a resolved notification before assuming an
+  # alert is still firing. Must exceed Prometheus' evaluation_interval by a
+  # comfortable margin or alerts flap resolved/firing.
+  resolve_timeout: 5m
+
+route:
+  receiver: petafs-webhook
+  # Group by alertname so a storm of one condition is one notification. NOT by
+  # instance: the aggregated rules (sum/avg) carry no instance label at all, so
+  # grouping on it would put every one of them in a single unlabelled group.
+  group_by: [alertname]
+  group_wait: 10s
+  group_interval: 30s
+  repeat_interval: 1h
+
+  routes:
+    # The dead man's switch is routed separately and repeated aggressively. Its
+    # job is the OPPOSITE of a normal alert: its presence is the healthy signal.
+    # Silence from Watchdog means the alerting path itself is broken — Prometheus
+    # down, rules unloaded, Alertmanager unreachable — which is exactly the
+    # failure that makes every other alert here worthless without telling you.
+    # In production this feeds an external heartbeat monitor (Dead Man's Snitch,
+    # Healthchecks.io) that pages when the ping STOPS.
+    - receiver: petafs-webhook
+      matchers: [alertname="Watchdog"]
+      group_wait: 0s
+      group_interval: 1m
+      repeat_interval: 2m
+
+receivers:
+  - name: petafs-webhook
+    webhook_configs:
+      - url: http://alert-sink:9099/alert
+        send_resolved: true
+
+# Do not page for the symptom when the cause is already paging. A job that is
+# restart-looping will also stop writing features and fall behind on lag; three
+# notifications for one incident is how people learn to ignore alerts.
+inhibit_rules:
+  - source_matchers: [alertname="JobRestarting"]
+    target_matchers: [alertname=~"NoFeaturesWritten|KafkaConsumerLagGrowing|SustainedBackpressure"]
+    equal: [job]

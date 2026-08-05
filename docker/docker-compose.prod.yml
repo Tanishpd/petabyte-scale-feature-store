@@ -233,6 +233,7 @@ services:
       - sh
       - -c
       - |
+        PEER=redis-replica
         PW=$$(cat /run/secrets/redis_password)
         CONF=/data/redis.conf
         if [ ! -f "$$CONF" ]; then
@@ -256,6 +257,27 @@ services:
         tls-auth-clients no
         EOF
         fi
+        # Refresh a STALE replicaof ADDRESS while preserving the ROLE.
+        #
+        # Redis rewrites `replicaof redis-primary 6379` into the resolved
+        # `replicaof <ip> 6379` (CONFIG REWRITE, which Sentinel triggers on
+        # promotion). `docker compose down` then destroys the network and `up`
+        # recreates it on a new subnet, so that IP is gone forever: the node can
+        # never reconnect, and Sentinel cannot discover it either because the
+        # master never learns it exists. Measured — the replica sat at
+        # `master_link_status:down` against 172.21.0.2 while everything ran on
+        # 172.19.0.x, and all three sentinels reported `num-slaves 0`. The stack
+        # came back permanently one-legged with every healthcheck green.
+        #
+        # The role must survive (that is why redis.conf is a file at all — see
+        # above), so only the address is rewritten. With exactly two data nodes,
+        # "my master is the other one" is always correct, including after a
+        # failover has swapped which is which.
+        if grep -qi '^replicaof ' "$$CONF"; then
+          grep -vi '^replicaof ' "$$CONF" > "$$CONF.tmp"
+          echo "replicaof $$PEER 6379" >> "$$CONF.tmp"
+          mv "$$CONF.tmp" "$$CONF"
+        fi
         exec redis-server "$$CONF"
     volumes:
       - redis-primary-data:/data
@@ -276,6 +298,7 @@ services:
       - sh
       - -c
       - |
+        PEER=redis-primary
         PW=$$(cat /run/secrets/redis_password)
         CONF=/data/redis.conf
         if [ ! -f "$$CONF" ]; then
@@ -299,6 +322,27 @@ services:
         tls-auth-clients no
         replicaof redis-primary 6379
         EOF
+        fi
+        # Refresh a STALE replicaof ADDRESS while preserving the ROLE.
+        #
+        # Redis rewrites `replicaof redis-primary 6379` into the resolved
+        # `replicaof <ip> 6379` (CONFIG REWRITE, which Sentinel triggers on
+        # promotion). `docker compose down` then destroys the network and `up`
+        # recreates it on a new subnet, so that IP is gone forever: the node can
+        # never reconnect, and Sentinel cannot discover it either because the
+        # master never learns it exists. Measured — the replica sat at
+        # `master_link_status:down` against 172.21.0.2 while everything ran on
+        # 172.19.0.x, and all three sentinels reported `num-slaves 0`. The stack
+        # came back permanently one-legged with every healthcheck green.
+        #
+        # The role must survive (that is why redis.conf is a file at all — see
+        # above), so only the address is rewritten. With exactly two data nodes,
+        # "my master is the other one" is always correct, including after a
+        # failover has swapped which is which.
+        if grep -qi '^replicaof ' "$$CONF"; then
+          grep -vi '^replicaof ' "$$CONF" > "$$CONF.tmp"
+          echo "replicaof $$PEER 6379" >> "$$CONF.tmp"
+          mv "$$CONF.tmp" "$$CONF"
         fi
         exec redis-server "$$CONF"
     volumes:
@@ -325,7 +369,27 @@ services:
       - |
         PW=$$(cat /run/secrets/redis_password)
         CONF=/data/sentinel.conf
-        if [ ! -f "$$CONF" ]; then
+        # REGENERATED ON EVERY BOOT, unlike redis.conf next door — and the
+        # asymmetry is deliberate.
+        #
+        # Sentinel REWRITES this file, replacing the hostname we give it with
+        # the address it resolved: `monitor mymaster redis-primary 6379`
+        # becomes `monitor mymaster 172.21.0.2 6379`. `resolve-hostnames yes`
+        # does not prevent that — it only permits a hostname as INPUT.
+        # `docker compose down` removes the network, `up` recreates it on a new
+        # subnet, and the persisted file then points every sentinel at an
+        # address that no longer exists. Measured: all three reported
+        # `flags s_down,master` against 172.21.0.2 while the containers were on
+        # 172.19.0.x, and a kill produced no promotion at all. Nothing looked
+        # wrong — containers up, healthchecks green, failover simply dead.
+        #
+        # Rewriting is safe in a way that rewriting redis.conf is NOT: redis.conf
+        # carries the node's ROLE, which Sentinel owns after a promotion and
+        # which must survive a restart. sentinel.conf carries only addresses and
+        # peers, all of which Sentinel re-derives — it follows `master_host`
+        # from INFO if pointed at a replica, and rediscovers its peers over the
+        # __sentinel__:hello channel within seconds.
+        if true; then
           cat > "$$CONF" <<EOF
         port 0
         tls-port 26379
@@ -366,7 +430,27 @@ services:
       - |
         PW=$$(cat /run/secrets/redis_password)
         CONF=/data/sentinel.conf
-        if [ ! -f "$$CONF" ]; then
+        # REGENERATED ON EVERY BOOT, unlike redis.conf next door — and the
+        # asymmetry is deliberate.
+        #
+        # Sentinel REWRITES this file, replacing the hostname we give it with
+        # the address it resolved: `monitor mymaster redis-primary 6379`
+        # becomes `monitor mymaster 172.21.0.2 6379`. `resolve-hostnames yes`
+        # does not prevent that — it only permits a hostname as INPUT.
+        # `docker compose down` removes the network, `up` recreates it on a new
+        # subnet, and the persisted file then points every sentinel at an
+        # address that no longer exists. Measured: all three reported
+        # `flags s_down,master` against 172.21.0.2 while the containers were on
+        # 172.19.0.x, and a kill produced no promotion at all. Nothing looked
+        # wrong — containers up, healthchecks green, failover simply dead.
+        #
+        # Rewriting is safe in a way that rewriting redis.conf is NOT: redis.conf
+        # carries the node's ROLE, which Sentinel owns after a promotion and
+        # which must survive a restart. sentinel.conf carries only addresses and
+        # peers, all of which Sentinel re-derives — it follows `master_host`
+        # from INFO if pointed at a replica, and rediscovers its peers over the
+        # __sentinel__:hello channel within seconds.
+        if true; then
           cat > "$$CONF" <<EOF
         port 0
         tls-port 26379
@@ -407,7 +491,27 @@ services:
       - |
         PW=$$(cat /run/secrets/redis_password)
         CONF=/data/sentinel.conf
-        if [ ! -f "$$CONF" ]; then
+        # REGENERATED ON EVERY BOOT, unlike redis.conf next door — and the
+        # asymmetry is deliberate.
+        #
+        # Sentinel REWRITES this file, replacing the hostname we give it with
+        # the address it resolved: `monitor mymaster redis-primary 6379`
+        # becomes `monitor mymaster 172.21.0.2 6379`. `resolve-hostnames yes`
+        # does not prevent that — it only permits a hostname as INPUT.
+        # `docker compose down` removes the network, `up` recreates it on a new
+        # subnet, and the persisted file then points every sentinel at an
+        # address that no longer exists. Measured: all three reported
+        # `flags s_down,master` against 172.21.0.2 while the containers were on
+        # 172.19.0.x, and a kill produced no promotion at all. Nothing looked
+        # wrong — containers up, healthchecks green, failover simply dead.
+        #
+        # Rewriting is safe in a way that rewriting redis.conf is NOT: redis.conf
+        # carries the node's ROLE, which Sentinel owns after a promotion and
+        # which must survive a restart. sentinel.conf carries only addresses and
+        # peers, all of which Sentinel re-derives — it follows `master_host`
+        # from INFO if pointed at a replica, and rediscovers its peers over the
+        # __sentinel__:hello channel within seconds.
+        if true; then
           cat > "$$CONF" <<EOF
         port 0
         tls-port 26379
@@ -578,6 +682,45 @@ services:
     depends_on:
       jobmanager:
         condition: service_healthy
+
+  # Alerting DELIVERY. Prometheus decides an alert is firing; Alertmanager is
+  # what turns that into a notification someone receives. Without it the rules
+  # were evaluated and dropped — see ADR-018.
+  alertmanager:
+    image: prom/alertmanager:v0.28.0
+    container_name: petafs-prod-alertmanager
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    volumes:
+      - ./observability/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    ports: ["9093:9093"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9093/-/healthy >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # The receiver, so delivery can be ASSERTED rather than assumed. Stands in for
+  # Slack/PagerDuty, which this repo has no account for — but the path it proves
+  # (rule -> Prometheus -> Alertmanager -> receiver) is the whole path, and
+  # swapping the receiver changes nothing else.
+  alert-sink:
+    image: python:3.12-slim
+    container_name: petafs-prod-alert-sink
+    restart: unless-stopped
+    command: ["python", "/app/webhook_sink.py"]
+    volumes:
+      - ./observability/webhook_sink.py:/app/webhook_sink.py:ro
+    ports: ["9099:9099"]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:9099/healthz',timeout=3).status==200 else 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
 
   grafana:
     secrets: [grafana_password]

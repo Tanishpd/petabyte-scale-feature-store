@@ -119,11 +119,30 @@ def build_source_ddl(
     how the TIMESTAMP_LTZ bug above hid.
 
     In production the trade-off inverts — one malformed record must not stop the
-    pipeline — so `--on-bad-record skip` flips it on. That is a real choice with
-    a real cost: skipped records are silently dropped, so the job also enables
-    a periodic count of them (see `_log_dropped_records`). "Tolerate but count"
-    is the only version of this that is safe; "tolerate" alone is data loss you
-    cannot see.
+    pipeline — so `--on-bad-record skip` flips it on, and both production
+    topologies pass it. That is a real choice with a real cost.
+
+    ⚠️ THE COST IS UNMEASURED, AND THIS DOCSTRING USED TO CLAIM OTHERWISE. It
+    said the job "also enables a periodic count of them (see
+    `_log_dropped_records`)" and called "tolerate but count" the only safe
+    version. There is no `_log_dropped_records`; there never was. Only the
+    tolerate half was ever implemented.
+
+    Measured, because the claim deserved checking: 5 unparseable records were
+    injected into a running production pipeline with `skip` on. The job
+    survived — correct — and the records vanished leaving NO trace at all.
+    `numRecordsInErrors` on the source stayed at 0 and no TaskManager logged a
+    line. Flink's JSON format discards on `json.ignore-parse-errors` without
+    incrementing a metric.
+
+    So drops here are genuinely invisible, and no alert can currently detect
+    them (conservation between Kafka records-consumed and source records-out is
+    ~4x apart on a healthy pipeline, so any realistic drop rate is below the
+    noise). Closing this properly means routing bad records to a dead-letter
+    topic rather than dropping them — a change to this job, not to a rule file.
+    Until then `skip` trades a stalled pipeline for data loss you cannot see,
+    which is the right trade only because the alternative was measured to be a
+    permanent restart loop.
     """
     bounded_opt = (
         "  'scan.bounded.mode' = 'latest-offset',\n" if bounded else ""

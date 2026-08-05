@@ -114,7 +114,7 @@ make mh-drill      # kill a WHOLE node; 24 assertions. See docs/MULTIHOST.md
 make secrets       # generate docker/secrets/* — REQUIRED before mh-ha-up
 make mh-ha-up && make mh-ha-drill   # + ZK/standby JM; 34 assertions (MULTIHOST §5)
 make alerts-test   # promtool: every alert rule fires on its condition (no stack needed)
-make alerts-verify # every metric those rules watch exists in Prometheus (needs a stack)
+make alerts-verify # metrics exist AND alerts reach the receiver (needs a stack)
 # ⚠️ mh and mh-ha must not run at once, and neither alongside the dev stack.
 redis-cli -p 6380 --scan --pattern '*' | head         # raw Feast keys (binary) — note 6380
 open http://localhost:8081                            # Flink UI: watch backpressure + watermarks
@@ -275,6 +275,26 @@ Invariant 4. Override with `REDIS_HOST_PORT=6379`.
   `make alerts-test` replays synthetic series through the real rules; `make alerts-verify` asserts the
   metrics those rules name actually exist. Neither alone is evidence: promtool cannot catch a metric
   that never exists, and the live check cannot catch a wrong threshold.
+- **Sentinel and Redis persist RESOLVED IPs, and `docker compose down` destroys the network.** The
+  compose file writes `sentinel monitor mymaster redis-primary 6379`; Sentinel rewrites its own config
+  to `monitor mymaster 172.21.0.2 6379`, and Redis does the same to `replicaof`. Bring the stack down
+  and up, the network is recreated on a NEW subnet, and both files now name addresses that cannot
+  exist. Every container is up, every healthcheck is green, and failover is dead — measured: all three
+  sentinels at `flags s_down,master` against a 172.21.x address while everything ran on 172.19.x,
+  `num-slaves 0`, and killing the master produced no promotion at all. `sentinel resolve-hostnames yes`
+  does NOT prevent this; it only permits a hostname as *input*. Fix: regenerate `sentinel.conf` on
+  every boot (its contents are all re-derivable), and rewrite the `replicaof` ADDRESS while keeping the
+  ROLE (with two data nodes, "my master is the other one" is always right). Same family as the ZK
+  `clientPort` trap above.
+- **`json.ignore-parse-errors` drops records with NO metric and NO log line.** Measured: 5 unparseable
+  records into a running pipeline left `numRecordsInErrors` at 0 and nothing in any TaskManager log.
+  There is no counter to alert on, and Kafka-consumed vs source-emitted are ~4x apart on a healthy
+  pipeline so conservation cannot detect it either. A dead-letter topic is the only real fix. Do not
+  write an alert for this — one was written and deleted; it would load cleanly, never fire, and make the
+  gap look covered.
+- **Prometheus does not reload alerts.yml on its own** (no `--web.enable-lifecycle` here), so editing a
+  rule and re-running the verifier compares the new file against the old in-memory copy. `docker restart
+  petafs-prod-prometheus` first — `make alerts-verify` catches the mismatch and says so.
 - **A drill assertion whose PRECONDITION was not met must be a note, not a FAIL.** "no keys after
   failover" blamed Redis for an empty database it was handed — the pipeline had not written a feature
   yet. Capture the before-state and say so instead; scoring it either way is a lie.

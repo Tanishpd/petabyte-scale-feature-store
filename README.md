@@ -141,7 +141,7 @@ Both are in [docs/MULTIHOST.md](docs/MULTIHOST.md).
 | State lost on restart | Checkpoints to object storage (MinIO → S3) | Killed the TaskManager: restored from `s3://.../chk-N`, Kafka offsets recovered with it |
 | Single Redis | primary + replica + Sentinel; the sink discovers the master | Killed the master: promotion in ~9 s, 8,018 keys intact, writes resumed |
 | Nothing authenticated | SASL/PLAIN on Kafka; `requirepass` on Redis nodes *and* Sentinel | Authenticated clients work, unauthenticated are refused — on both |
-| Nothing watched it | Prometheus + 5 alerts on lag, checkpoints, restarts, backpressure, feature staleness | **Each rule unit-tested in both directions** — fires on its condition, silent below the threshold — with `promtool test rules` in CI, **plus** a live check that every metric the rules watch actually exists. Found a real bug doing it: `NoFeaturesWritten` could never fire when the writer *died*, because a vanished series is empty, not zero ([ADR-017](docs/DECISIONS.md)) |
+| Nothing watched it | Prometheus + Alertmanager + 6 alerts on lag, checkpoints, restarts, backpressure, feature staleness, and a `Watchdog` dead man's switch | **Each rule unit-tested in both directions** — fires on its condition, silent below the threshold — with `promtool test rules` in CI, **plus** a live check that every metric the rules watch actually exists. Found a real bug doing it: `NoFeaturesWritten` could never fire when the writer *died*, because a vanished series is empty, not zero ([ADR-017](docs/DECISIONS.md)). **Delivery** asserted from the receiving end too — the sink confirms it got the heartbeat, 9/9 ([ADR-018](docs/DECISIONS.md)) |
 | Tests never ran | CI on every push, **fails on any skip** | A skipped round-trip test is the same as no test |
 | Sentinel could split-brain | 3 sentinels, quorum 2, config-file Redis so promotions persist | Killed the master, restarted the old one: it rejoins as a replica, exactly one master, all 3 sentinels agree |
 | Everything in the clear | **TLS everywhere**: Kafka SASL_SSL, Redis + Sentinel TLS-only (`port 0`), replication encrypted | An unencrypted client *with valid credentials* is refused on both; the whole path producer→Kafka→Flink→Redis is encrypted |
@@ -165,10 +165,17 @@ Both are in [docs/MULTIHOST.md](docs/MULTIHOST.md).
   stacks now use them — `prod.yml` and `multihost.yml` were converted and
   re-verified by re-running both drill suites, 17/17 and 24/24
   ([ADR-015](docs/DECISIONS.md)).
-- **Alerts fire into a UI nobody watches.** The rules are now proven to
-  evaluate correctly against real metrics ([ADR-017](docs/DECISIONS.md)), but
-  there is no Alertmanager, no routing and no paging — so "the alert fires" and
-  "somebody finds out" are still different claims.
+- **Skipped records are invisible.** `--on-bad-record skip` keeps one malformed
+  event from stopping the pipeline — measured, the alternative is a permanent
+  restart loop — but the drops leave no trace: 5 unparseable records injected
+  into a running pipeline moved no counter and logged nothing. An alert for it
+  was written and then deleted rather than shipped as decoration; the honest fix
+  is a dead-letter topic ([ADR-018](docs/DECISIONS.md)).
+- **Alert delivery stops at a local receiver.** The full path is proven —
+  rule → Prometheus → Alertmanager → receiver, asserted from the receiving end,
+  with a `Watchdog` dead man's switch whose silence is the alarm. But the
+  receiver is a webhook sink, not Slack or PagerDuty, and there is no on-call
+  rotation, escalation or silencing workflow ([ADR-018](docs/DECISIONS.md)).
 - **File-based secrets are not a secret manager.** Nothing rotates, expires or
   audits; the file sits on a host filesystem. It is the interface one plugs
   into — point the paths at a K8s projected secret or a Vault agent and no
