@@ -161,10 +161,10 @@ Both are in [docs/MULTIHOST.md](docs/MULTIHOST.md).
   for anything demonstrated here, but because running an object store is
   operational work an API call avoids. `s3.endpoint` keeps that a
   credentials-and-URL change.
-- **One of the four stacks still uses env-var credentials.**
-  `docker-compose.multihost.yml` has not been converted;
-  `docker-compose.prod.yml` now has been, re-verified by re-running its drill
-  suite ([ADR-015](docs/DECISIONS.md)).
+- **File-based credentials are not a secret manager** (below), but all four
+  stacks now use them — `prod.yml` and `multihost.yml` were converted and
+  re-verified by re-running both drill suites, 17/17 and 24/24
+  ([ADR-015](docs/DECISIONS.md)).
 - **Alerts fire into a UI nobody watches.** The rules are now proven to
   evaluate correctly against real metrics ([ADR-017](docs/DECISIONS.md)), but
   there is no Alertmanager, no routing and no paging — so "the alert fires" and

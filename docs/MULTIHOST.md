@@ -296,9 +296,17 @@ container rather than declared in `environment:`.
 
 This is **not** a secret manager and does not pretend to be: nothing rotates or
 expires, and the file sits on a host filesystem. It is the interface one plugs
-into. Note also that `docker-compose.prod.yml` and `docker-compose.multihost.yml`
-have *not* been converted — see [ADR-015](DECISIONS.md) for why that is a
-deliberate stopping point rather than an oversight.
+into.
+
+All four topologies now take their credentials this way. `prod.yml` and
+`multihost.yml` were originally left on environment variables as a deliberate
+stopping point ([ADR-015](DECISIONS.md)) — and that turned out to be the wrong
+call for a reason the ADR did not anticipate: `tls_storepass` is baked into the
+JKS keystores that **every** topology shares. Once the HA stack read it from a
+file while prod still read `${TLS_STOREPASS:-petafs-dev-secret}`, prod's brokers
+could not open their own keystore and the stack would not boot. A half-migrated
+credential is worse than either end state whenever the two halves share an
+artefact.
 
 ### Authentication is not authorization
 

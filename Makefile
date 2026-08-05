@@ -322,8 +322,12 @@ mh-topics:  ## Create the transactions topic at RF=3 across the three nodes
 	@bash scripts/multihost_health.sh --create-topic $(TOPIC) $(PARTITIONS)
 
 mh-produce:  ## Produce into the multi-host cluster from this Mac (HOST listeners)
+	@test -f docker/secrets/kafka_password || { echo "No secrets — run 'make secrets'."; exit 1; }
+	@# KAFKA_PASSWORD_FILE, not KAFKA_PASSWORD: the value never enters this
+	@# process's environment, so it cannot leak via `ps -e` or a crash dump.
+	@# contracts/secrets.py resolves it.
 	KAFKA_SECURITY_PROTOCOL=SASL_SSL KAFKA_SASL_MECHANISM=PLAIN \
-	KAFKA_USER=petafs KAFKA_PASSWORD=petafs-dev-secret \
+	KAFKA_USER=petafs KAFKA_PASSWORD_FILE=docker/secrets/kafka_password \
 	KAFKA_SSL_CAFILE=docker/tls/out/ca.crt \
 	$(PY) src/producer/generate_stream.py --bootstrap $(MH_KAFKA_HOST) \
 	  --topic $(TOPIC) --eps $(or $(EPS),400) $(if $(DURATION),--duration $(DURATION),) \

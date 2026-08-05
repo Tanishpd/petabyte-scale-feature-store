@@ -12,7 +12,14 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-PW="${REDIS_PASSWORD:-petafs-dev-secret}"
+# Credentials come from the same files the topology mounts (`make secrets`),
+# never from a dev default. A drill that silently fell back to a hardcoded
+# password would pass against a stack whose real credentials it never touched.
+SECRETS=docker/secrets
+_secret() { [ -f "$SECRETS/$1" ] || { echo "missing $SECRETS/$1 — run 'make secrets'" >&2; exit 1; }; tr -d '\r\n' < "$SECRETS/$1"; }
+PW=$(_secret redis_password)
+KAFKA_PW=$(_secret kafka_password)
+STOREPASS=$(_secret tls_storepass)
 RCLI="redis-cli --tls --cacert /tls/ca.crt"
 K1=petafs-mh-kafka1
 
@@ -24,9 +31,9 @@ kafka_conf() {
   docker exec "$K1" sh -c "cat > /tmp/mh.properties <<'EOF'
 security.protocol=SASL_SSL
 sasl.mechanism=PLAIN
-sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username=\"${KAFKA_USER:-petafs}\" password=\"${KAFKA_PASSWORD:-petafs-dev-secret}\";
+sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username=\"${KAFKA_USER:-petafs}\" password=\"$KAFKA_PW\";
 ssl.truststore.location=/tls/kafka.truststore.jks
-ssl.truststore.password=${TLS_STOREPASS:-petafs-dev-secret}
+ssl.truststore.password=$STOREPASS
 EOF" >/dev/null 2>&1
 }
 

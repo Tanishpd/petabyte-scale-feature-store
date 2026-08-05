@@ -19,7 +19,14 @@ A="$MH -p petafs-a --profile a"
 B="$MH -p petafs-b --profile b"
 C="$MH -p petafs-c --profile c"
 
-PW="${REDIS_PASSWORD:-petafs-dev-secret}"
+# Credentials come from the same files the topology mounts (`make secrets`),
+# never from a dev default. A drill that silently fell back to a hardcoded
+# password would pass against a stack whose real credentials it never touched.
+SECRETS=docker/secrets
+_secret() { [ -f "$SECRETS/$1" ] || { echo "missing $SECRETS/$1 — run 'make secrets'" >&2; exit 1; }; tr -d '\r\n' < "$SECRETS/$1"; }
+PW=$(_secret redis_password)
+KAFKA_PW=$(_secret kafka_password)
+STOREPASS=$(_secret tls_storepass)
 RCLI="redis-cli --tls --cacert /tls/ca.crt"
 K1=petafs-mh-kafka1
 TOPIC="${TOPIC:-transactions}"
@@ -34,9 +41,9 @@ kafka_conf() {
   docker exec "$1" sh -c "cat > /tmp/mh.properties <<'EOF'
 security.protocol=SASL_SSL
 sasl.mechanism=PLAIN
-sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username=\"${KAFKA_USER:-petafs}\" password=\"${KAFKA_PASSWORD:-petafs-dev-secret}\";
+sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username=\"${KAFKA_USER:-petafs}\" password=\"$KAFKA_PW\";
 ssl.truststore.location=/tls/kafka.truststore.jks
-ssl.truststore.password=${TLS_STOREPASS:-petafs-dev-secret}
+ssl.truststore.password=$STOREPASS
 EOF" >/dev/null 2>&1
 }
 kbin() {  # kbin <container> <tool> [args...]
@@ -280,11 +287,32 @@ except Exception: print('')")
       s3://*) ok "state restored from object storage, not from the dead node" ; note "$R" ;;
       *)      bad "no object-storage restore recorded (got '${R:-nothing}')" ;;
     esac
-    # Give the recovered job a moment to close a window and write.
+    # "Features are still being written" is only a claim about the PIPELINE
+    # while events are still arriving. With the producer finished the job has
+    # nothing to write and a falling TTL is correct behaviour — so measure both
+    # and let them distinguish the two cases, instead of asserting a magic
+    # freshness number that silently depends on whether anyone is producing.
+    R0=$(kafka_records)
+    T0=$(max_ttl)
     sleep 60
-    T=$(max_ttl)
-    [ "${T:-0}" -gt 1650 ] && ok "features still being written after the node loss (max TTL ${T}s of 1800)" \
-                           || bad "no recent feature writes (max TTL ${T:-none})"
+    R1=$(kafka_records)
+    T1=$(max_ttl)
+    if [ "${R1:-0}" -le "${R0:-0}" ]; then
+      note "no new events during the check (topic at ${R1:-?} records) — nothing for the"
+      note "  pipeline to write, so feature freshness proves nothing here. Max TTL ${T1:-none}s."
+    elif [ "${T1:-0}" -gt 1650 ]; then
+      # Threshold, NOT a comparison of the two samples. max_ttl() reports the
+      # highest TTL in a SCAN sample, and the sample is a different set of keys
+      # each call, so T1 >= T0 is noise — it reported a failure here at
+      # 1753 -> 1746, a 7s drop across a 60s wait, which is the signature of a
+      # pipeline that IS writing. What the sample does support is an absolute
+      # read: every write re-issues EXPIRE(1800), so any key still near the
+      # ceiling was written in the last ~150s, which covers the HOP window's
+      # 60s slide plus processing.
+      ok "features still being written after the node loss (max TTL ${T1}s of 1800)"
+    else
+      bad "$((R1 - R0)) new events arrived but the newest feature is $((1800 - ${T1:-0}))s old"
+    fi
   else
     bad "job did not return to RUNNING within 300 s"
   fi
@@ -307,6 +335,36 @@ step "Drill 3 — lose node A, the node holding the Redis primary"
 # failure, because node A carries the JobManager and the object store.
 M0=$(sentinel_master petafs-mh-redis-sentinel-2)
 note "master before: ${M0:-unknown}"
+
+# NORMALISE THE STARTING STATE FIRST. This drill kills node A and asserts the
+# master moved off it — which proves nothing if the master was already on node
+# B, and a previous run of this very drill leaves it exactly there. Re-running
+# the suite without a `make mh-clean` in between therefore reported "no
+# cross-host promotion" for a topology that had promoted correctly minutes
+# earlier. A drill has to be repeatable from whatever state the last one left.
+#
+# `SENTINEL FAILOVER` is the supported way to move it, and with two data nodes
+# the only place it can go is node A.
+A_PORT=$(grep -E '^REDIS_A_PORT=' docker/multihost/sim.env | cut -d= -f2 | tr -d '[:space:]')
+A_PORT=${A_PORT:-16379}
+case "${M0:-}" in
+  *:"$A_PORT") ;;
+  *)
+    note "master is not on node A — forcing it back, or killing node A proves nothing"
+    docker exec petafs-mh-redis-sentinel-2 $RCLI -p 26379 -a "$PW" \
+      SENTINEL FAILOVER mymaster >/dev/null 2>&1
+    for _ in $(seq 1 25); do
+      M0=$(sentinel_master petafs-mh-redis-sentinel-2)
+      case "${M0:-}" in *:"$A_PORT") break ;; esac
+      sleep 3
+    done
+    note "master now: ${M0:-unknown}"
+    ;;
+esac
+case "${M0:-}" in
+  *:"$A_PORT") ;;
+  *) note "could not place the master on node A; the promotion assertion below cannot be made" ;;
+esac
 
 $A down -t 0 >/dev/null 2>&1
 note "node A is gone (with it: the JobManager and MinIO)"
