@@ -67,15 +67,21 @@ docker/          docker-compose.yml, docker-compose.prod.yml, flink/Dockerfile,
                  docker-compose.multihost.yml     ← 3 nodes; multihost/sim.env
                  docker-compose.multihost-ha.yml  ← + ZK ensemble & standby JM
                  tls/generate-certs.sh, observability/
+                 redis/write-acl.sh               ← ACL users, shared by prod/mh/ha
+                 observability/  prometheus*.yml, alerts.yml, alerts_test.yml,
+                                 alertmanager.yml, webhook_sink.py, grafana/
 contracts/       schema.py    ← single source of truth for feature names/dtypes
                  secrets.py   ← ${VAR}_FILE beats ${VAR}; used by sink + producer
 src/producer/    generate_stream.py
 src/flink/       streaming_job.py, udfs/embeddings.py, sinks/feast_redis_sink.py
+                 dlq.py           ← --on-bad-record dlq: Flink plumbing
+                 event_parser.py  ← the routing decision; NO pyflink import, so CI covers it
 src/feast_repo/  feature_store.yaml, definitions.py, data/*.parquet
 src/serving/     online_read.py, benchmark.py
 scripts/         bootstrap.sh, seed_offline.py, smoke_test.sh, failure_drills.sh,
                  multihost_health.sh, multihost_drill.sh,
-                 multihost_ha_health.sh, multihost_ha_drill.sh
+                 multihost_ha_health.sh, multihost_ha_drill.sh,
+                 gen_secrets.sh, alerts_verify.sh, backup.sh, restore.sh
 tests/           test_feast_codec_roundtrip.py  ← the load-bearing test
 docs/            ARCHITECTURE.md, DECISIONS.md, SCALING.md, RUNBOOK.md, MULTIHOST.md
 docker/secrets/  generated credentials (gitignored) — `make secrets`
@@ -95,7 +101,7 @@ Makefile
 
 ## CI
 
-`.github/workflows/tests.yml` runs all 61 tests on push/PR with a Redis Stack service and an applied
+`.github/workflows/tests.yml` runs all 89 tests on push/PR with a Redis Stack service and an applied
 registry — no Flink needed. It **fails the build if any test is skipped**: every test here has an infra
 guard that degrades to a skip, so a broken service container would otherwise produce a green run that
 asserted nothing. That matters most for the codec round-trip, which is the only tripwire on the Feast
@@ -115,6 +121,9 @@ make secrets       # generate docker/secrets/* — REQUIRED before mh-ha-up
 make mh-ha-up && make mh-ha-drill   # + ZK/standby JM; 34 assertions (MULTIHOST §5)
 make alerts-test   # promtool: every alert rule fires on its condition (no stack needed)
 make alerts-verify # metrics exist AND alerts reach the receiver (needs a stack)
+make backup        # registry.db + offline parquet — the only unrebuildable state
+make restore ARCHIVE=backups/...   # verifies checksums BEFORE writing anything
+make prod-topics   # prod's `transactions` (auto-create is off there)
 # ⚠️ mh and mh-ha must not run at once, and neither alongside the dev stack.
 redis-cli -p 6380 --scan --pattern '*' | head         # raw Feast keys (binary) — note 6380
 open http://localhost:8081                            # Flink UI: watch backpressure + watermarks

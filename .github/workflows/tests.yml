@@ -4,7 +4,7 @@ name: tests
 # silent break when Feast changes its private Redis codec, which ADR-003
 # knowingly depends on. Until this workflow existed, that mitigation was a test
 # nobody ran. Flink is not needed here — Redis plus an applied registry covers
-# all 61 tests.
+# all 89 tests.
 
 on:
   push:

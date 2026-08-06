@@ -42,7 +42,8 @@ make read          # a "model" pulls features for a user — the payoff
 make similar       # find behaviourally similar users (RediSearch KNN)
 make bench         # p50/p95/p99 read latency + Redis footprint
 make verify-windows  # prove the aggregates match an independent pandas recomputation
-make test          # 61 tests, including the Feast codec round-trip
+make test          # 89 tests, including the Feast codec round-trip
+make backup        # registry + offline store — the only unrebuildable state
 make down          # stop everything
 ```
 
@@ -149,6 +150,8 @@ Both are in [docs/MULTIHOST.md](docs/MULTIHOST.md).
 | Credentials in env vars with dev defaults | **Mounted files, no defaults** — `make secrets`, and the code resolves `${VAR}_FILE` first | Grepped every container's `docker inspect` and `docker compose config` for each secret: **absent**, while the file *is* present inside the container that needs it |
 | **Everything on one host** | **Three nodes, separate failure domains** — routable addressing throughout, mTLS on the KRaft quorum | Killed the whole node running the job: rescheduled onto another node, restored from `s3://.../chk-4`, zero data loss, features still writing. Killed the Redis primary's node: promoted across hosts. **24/24** ([MULTIHOST](docs/MULTIHOST.md)) |
 | **The JobManager and the object store were single points of failure** | **ZooKeeper ensemble + standby JobManager + object store distributed across all three nodes**, each Flink process using its node-local S3 endpoint | Killed the whole node holding the *leading* JobManager: leadership moved automatically, the pipeline recovered **with no resubmission and the same job id**, restored from `s3://.../chk-2`, the pool **kept accepting writes** at 2 of 3 drives, and checkpoints kept completing into it. **18/18** |
+| **Malformed records vanished.** `--on-bad-record skip` kept one bad event from stopping the job, and measured, the drop left no trace at all | **`--on-bad-record dlq`** — payload and reason to `<topic>.dlq`, inspectable and replayable | 4 kinds of malformed record injected into a running pipeline: all four quarantined with accurate reasons, job stayed RUNNING, good records still produced 5,302 feature keys that read back correctly. Found a sink bug doing it — a NULL entity key crashed `int(None)` ([ADR-019](docs/DECISIONS.md)) |
+| **Nothing was backed up.** The registry and offline store are gitignored, so they lived on one disk with no copy | **`make backup` / `make restore`** for the only two things that cannot be rebuilt | Restore verifies every checksum **before** writing and moves existing state aside. 9 tests run the real scripts against real archives, including a **corrupted** one being refused with nothing written; also round-tripped by hand on live state ([ADR-020](docs/DECISIONS.md)) |
 | **Authenticated meant root.** Two shared secrets, each of them unlimited: anything that could produce to `transactions` could delete it, and anything that could write a feature could `FLUSHALL` the store | **Per-component identities with least-privilege rules.** Kafka `StandardAuthorizer`, deny-by-default, four principals; Redis `user default off` and five ACL users | Every boundary attempted with the real credential, not read back from config: producer **denied** read + delete, Flink **denied** write, `petafs-flink` **denied** `FLUSHALL` and `SCAN`, `petafs-reader` **denied** every write — while the pipeline kept running on those same credentials. **34/34** ([ADR-016](docs/DECISIONS.md)) |
 
 **Still open, honestly:**

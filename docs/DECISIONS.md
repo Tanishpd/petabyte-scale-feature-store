@@ -663,3 +663,84 @@ README and in the job's own docstring.
 PagerDuty account. It proves the whole path — rule → Prometheus → Alertmanager → receiver — and in a
 real deployment the receiver is swapped and nothing else changes. There is still no on-call rotation, no
 escalation, and no silencing workflow.
+
+---
+
+## ADR-019 — A dead-letter topic, and why it is a flag rather than the default
+
+**Decision.** `--on-bad-record dlq` writes unparseable records to `<topic>.dlq` with the reason and the
+raw payload, instead of dropping them. `fail` and `skip` are unchanged. Both production topologies still
+default to `skip`; `dlq` is opt-in.
+
+**The gap.** `skip` sets `json.ignore-parse-errors`, which keeps one malformed event from stopping the
+job — and **measured**, discards it without incrementing any metric or logging a line. Five injected
+records left `numRecordsInErrors` at 0 with nothing in any TaskManager log. The job's docstring claimed
+the drops were counted, citing a `_log_dropped_records` helper that never existed. So the production
+default traded a stalled pipeline for data loss nobody could see, and [ADR-018](#adr-018) records why no
+alert can detect it either.
+
+**Why a DataStream source.** PyFlink cannot give the SQL connector a custom Java
+`DeserializationSchema`, so a side output is the only place a deserialization failure is observable.
+That means parsing JSON in **Python, per event** — directly against Invariant 5, which is the reason
+embeddings run on window close rather than per record. Hence a flag: it is a real trade, and the
+docstring says so rather than presenting it as free.
+
+**Measured, twice.** At ordinary rates (~1,600–2,400 eps) there is no measurable difference and both
+paths produce identical output — the embedding stage dominates and parsing disappears behind it. The
+saturation test was inconclusive because both modes drained the backlog inside the measurement window;
+[SCALING §9](SCALING.md) records that rather than presenting the two numbers as a comparison.
+
+**It found a bug in the sink.** A row with a NULL `user_id` survives parsing and the windowed aggregate,
+then kills the sink at `int(None)` in `entity_key()` — a restart loop with the traceback buried in the
+SDK harness. `user_id` is the **entity key**; Feast hashes it into the Redis key, so a NULL has no valid
+encoding and the row can never become a feature. It is now rejected like a missing rowtime.
+`json.fail-on-missing-field = false` makes every other column optional; this one cannot be.
+
+**The parsing logic has no pyflink import** (`src/flink/event_parser.py`) so the routing decision — the
+part worth testing continuously — runs in CI on the host. 19 tests cover what must be dead-lettered and,
+equally, what must **not**: missing optional fields, explicit nulls, an integer for a DOUBLE column,
+unknown fields from a future producer. A parser that quarantined everything would pass the negative half
+alone while stopping the pipeline dead.
+
+**What it is not.** This module's validation is not Flink's JSON format's — two implementations that
+agree on the cases that matter but are not guaranteed identical. The DLQ record carries the raw payload,
+so a disagreement is recoverable rather than silent, which is the whole point.
+
+---
+
+## ADR-020 — Back up only what cannot be rebuilt
+
+**Decision.** `make backup` / `make restore` cover exactly two things: `registry.db` and the offline
+parquet. Redis, Kafka and the Flink checkpoints are deliberately excluded.
+
+**Why so little.** Almost everything here is derived. Redis is a cache, TTL'd at 30 minutes and rebuilt
+by replaying Kafka ([RUNBOOK §8](RUNBOOK.md)); Kafka has its own replication and its retention is the
+real bound on how far back anything can be rebuilt; checkpoints are covered by the object store's
+durability. Backing any of them up would be backing up a projection.
+
+**Why the two exceptions are easy to miss.** The registry is a few kilobytes, which makes it look
+unimportant. It is the opposite: Redis field keys are `mmh3("<view>:<feature>")` hashes of the names it
+holds (Invariant 1), so losing it makes **every key already in Redis unaddressable** — the data intact
+and nothing able to name it. Both files are gitignored, so before this they lived on exactly one disk
+with no copy anywhere.
+
+**Verify before writing, and never clobber.** The restore checksums every file against the manifest and
+a single mismatch aborts the whole operation, because the failure being guarded against is not "the
+restore errored" — it is a half-written registry that Feast opens successfully and that addresses the
+wrong keys, returning `None` with nothing logged. Existing state is moved aside rather than overwritten,
+so restoring the wrong archive is itself reversible.
+
+**Secrets are excluded by default.** A restore needs them, but credentials in a tarball beside the data
+turn one stolen file into a full compromise. `INCLUDE_SECRETS=1` opts in and the manifest records which
+choice was made.
+
+**Restores are tested, not assumed.** `tests/test_backup_restore.py` runs the real scripts against real
+archives on every CI run, including the case that earns its keep: a **corrupted** archive is refused
+with nothing written. Also exercised by hand on this repo's live state — registry byte-identical after a
+round trip, and `make read` still resolving features afterward, which is the real proof the hashes still
+address.
+
+**What it is not.** There is no offsite copy, no retention policy, no encryption at rest, and no
+scheduled job — `make backup` is something a human or a deploy pipeline runs. The RPO is therefore
+"time since someone last ran it", which [RUNBOOK §7](RUNBOOK.md) states plainly rather than implying a
+guarantee that does not exist.
