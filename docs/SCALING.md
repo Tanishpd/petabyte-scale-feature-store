@@ -260,10 +260,30 @@ stage dominates, and per-event JSON parsing disappears behind it. The same key
 count in every run also shows the two source paths agree on what is a valid
 record — they are separate implementations, so that is worth checking.
 
-**The honest caveat.** This drain runs at roughly 1,600–2,400 events/s, which is
-well under the measured ~8,500 eps ceiling. It shows the parse cost is invisible
-at ordinary rates; it does **not** show what happens at saturation, where the
-Python worker could plausibly become the constraint instead of the embedding
-UDF. Anyone planning to run `dlq` near the ceiling should repeat the §5
-saturation test with it enabled. Until then the flag stays opt-in for that
-reason as much as for the principle.
+**The caveat, and the attempt to close it.** That drain runs at roughly
+1,600–2,400 events/s, well under the measured ~8,500 eps ceiling — so it shows
+the parse cost is invisible at ordinary rates, not what happens at saturation.
+
+The saturation test was then run and is **inconclusive**, which is worth
+recording rather than quietly dropping. Three producers at 9k eps each for 120 s
+built a 3,240,540-record backlog; each mode then replayed it from
+`earliest-offset` with a fresh consumer group, 90 s of warm-up, and a 150 s
+measurement window:
+
+| mode | consumed in the window | implied rate | ended at offset |
+|---|---|---|---|
+| `skip` | 1,679,982 | 11,052 eps | 3,240,540 |
+| `dlq` | 1,352,751 | 8,899 eps | 3,240,540 |
+
+**Both finished the entire backlog inside the window** — note the identical end
+offset — so each figure is a lower bound describing how much work happened to be
+left when the clock started, not a throughput. `dlq` was in fact *further along*
+at the start of its window (1,887,789 vs 1,560,558), which is the giveaway that
+these two numbers are not comparable.
+
+What the run does establish: replaying at saturation, both modes sustained
+**≥13,400 eps average** (3.24 M records inside 242 s) and neither collapsed or
+fell behind. Redoing it properly needs a backlog large enough that neither mode
+drains it — several times this one — which is a machine-size question. Until
+someone has that number, `dlq` stays opt-in for the reason above as much as for
+the principle.
