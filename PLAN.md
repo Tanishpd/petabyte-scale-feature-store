@@ -1,8 +1,14 @@
 # Build Plan — Petabyte-Scale Feature Store & Streaming Pipeline
 
 > Status: **All 8 phases complete** (2026-08-03). `make smoke` runs the whole path end to end.
-> Update the status column as phases land.
 > Every phase has a *verifiable* acceptance criterion. A phase is not done until its check passes.
+>
+> **This document is the original build plan and stops where the build did.** Everything since has been
+> production hardening, and it is not tracked here — see [ADR-012 through ADR-020](docs/DECISIONS.md)
+> for the multi-host topology, JobManager HA, distributed object storage, file-based credentials,
+> per-component authorization, alert rules that are proven to fire and be delivered, the dead-letter
+> topic, and backup. [README](README.md#is-this-production-ready) carries the current
+> production-readiness table and, more usefully, the list of what is still open.
 
 ## 0. What we're building, in one paragraph
 
